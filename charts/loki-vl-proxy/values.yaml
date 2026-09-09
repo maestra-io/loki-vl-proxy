@@ -234,7 +234,8 @@ extraArgs:
   # Computed labels joined from other labels (matchers split on sep; = and != only)
   # computed-labels: '[{"loki_label":"job","join":["namespace","app"],"sep":"/"}]'
   # Derived level: VL fields carrying a raw level inside _msg; normalises information->info, warning->warn
-  # derived-level-fields: "level,loglevel,severity"
+  # Field names are CASE-SENSITIVE (they are the JSON/logfmt keys VL unpacks): list every casing you emit
+  # derived-level-fields: "loglevel,LogLevel,level,Level,severity,severity_text,lvl"
   # derived-level-group-by: "true"   # materialise `level` server-side so `sum by (level)` groups (costs a full _msg unpack)
   # Log line source: "" (default) re-encodes the whole VL record as JSON; "_msg" returns the original message
   # line-field: "_msg"

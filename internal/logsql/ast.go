@@ -589,8 +589,11 @@ type PipeReplace struct {
 	New   string
 }
 
+// Syntax: | replace ("old", "new") at <field>
+// VictoriaLogs rejects the three-argument form `replace (field, "old", "new")`
+// with `missing ')' after 'replace("field", "old"'` (verified against v1.52.0).
 func (p PipeReplace) String() string {
-	return fmt.Sprintf(`| replace (%s, %q, %q)`, p.Field, p.Old, p.New)
+	return fmt.Sprintf(`| replace (%q, %q) at %s`, p.Old, p.New, p.Field)
 }
 func (p PipeReplace) pipe() {}
 
@@ -601,8 +604,11 @@ type PipeReplaceRegexp struct {
 	Replacement string
 }
 
+// Syntax: | replace_regexp ("<regex>", "<replacement>") at <field>
+// Same argument order as replace; the three-argument form is a parse error in
+// VictoriaLogs (verified against v1.52.0).
 func (p PipeReplaceRegexp) String() string {
-	return fmt.Sprintf("| replace_regexp (%s, `%s`, %q)", p.Field, p.Regex, p.Replacement)
+	return fmt.Sprintf("| replace_regexp (`%s`, %q) at %s", p.Regex, p.Replacement, p.Field)
 }
 func (p PipeReplaceRegexp) pipe() {}
 
@@ -781,6 +787,12 @@ func (p PipeCopy) String() string {
 func (p PipeCopy) pipe() {}
 
 // PipeCoalesce returns the first non-empty value across the listed fields.
+//
+// WARNING: VictoriaLogs has no `coalesce` PIPE — v1.52.0 answers
+// `unexpected pipe "coalesce"` (verified 09.09.2026). Do not emit this into a
+// generated query; chain `| format if (<field>:*) "<<field>>" as <result>` from
+// the lowest-priority field to the highest instead, so the highest-priority
+// non-empty field wins.
 // Syntax: | coalesce(f1, f2, ...) [default "val"] as result
 type PipeCoalesce struct {
 	Fields  []string

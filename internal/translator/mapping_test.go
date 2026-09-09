@@ -301,12 +301,16 @@ func TestDerivedLevelMaterialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	// Golden strings: every stage below was accepted by VictoriaLogs v1.52.0.
+	// The forms this replaced (`| coalesce(...) as level`, and replace_regexp with
+	// the field as the FIRST argument) are both parse errors there.
 	for _, part := range []string{
 		"| unpack_json",
 		"| unpack_logfmt",
-		"| coalesce(level, loglevel) as level",
-		"| replace_regexp (level, `(?i)^(err|error|errors|fatal|critical|crit|emerg|panic|alert)$`, \"error\")",
-		"| replace_regexp (level, `(?i)^(info|information|informational|notice)$`, \"info\")",
+		`| format if (loglevel:*) "<loglevel>" as level`,
+		`| format if (level:*) "<level>" as level`,
+		"| replace_regexp (`(?i)^(err|error|errors|fatal|critical|crit|emerg|panic|alert)$`, \"error\") at level",
+		"| replace_regexp (`(?i)^(info|information|informational|notice)$`, \"info\") at level",
 	} {
 		if !strings.Contains(got, part) {
 			t.Fatalf("got %s\nmissing %q", got, part)
@@ -326,10 +330,10 @@ func TestDerivedLevelMaterialization(t *testing.T) {
 		if strings.Count(got2, "unpack_json") != 1 {
 			t.Fatalf("%s: expected a single unpack_json, got %s", q, got2)
 		}
-		if !strings.Contains(got2, "| coalesce(level, loglevel) as level") {
-			t.Fatalf("%s: missing the coalesce pipe: %s", q, got2)
+		if !strings.Contains(got2, `| format if (loglevel:*) "<loglevel>" as level`) {
+			t.Fatalf("%s: missing the level format chain: %s", q, got2)
 		}
-		if !strings.Contains(got2, "| replace_regexp (level,") {
+		if !strings.Contains(got2, `") at level`) {
 			t.Fatalf("%s: missing the normalisation pipes: %s", q, got2)
 		}
 	}
@@ -341,10 +345,10 @@ func TestDerivedLevelMaterialization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got3, "| coalesce(level, loglevel) as level") {
-		t.Fatalf("line filter suppressed the coalesce pipe: %s", got3)
+	if !strings.Contains(got3, `| format if (loglevel:*) "<loglevel>" as level`) {
+		t.Fatalf("line filter suppressed the level format chain: %s", got3)
 	}
-	if strings.Count(got3, "| replace_regexp (level,") != 4 {
+	if strings.Count(got3, `") at level`) != 4 {
 		t.Fatalf("expected four normalisation pipes, got %s", got3)
 	}
 	if !strings.Contains(got3, `~" as level"`) {
@@ -372,5 +376,53 @@ func TestSplitComputedValue(t *testing.T) {
 				t.Fatalf("splitComputedValue(%q) = %v, want %v", tt.in, got, tt.want)
 			}
 		}
+	}
+}
+
+// TestLevelPipesUseVLAcceptedSyntax guards the two constructs VictoriaLogs
+// v1.52.0 rejects outright — they shipped in 1.63.1-maestra.2 and turned every
+// level query on omicron into an HTTP 400:
+//
+//	| coalesce(a, b) as level          → unexpected pipe "coalesce"
+//	| replace_regexp (level, `re`, "x") → missing ')' after 'replace_regexp("level", "re"'
+//
+// Both parse fine in this repo's own logsql parser, so only a golden-string
+// assertion (or a live VL) catches them.
+func TestLevelPipesUseVLAcceptedSyntax(t *testing.T) {
+	mapping := &MappingOptions{
+		DerivedLevelFields: []string{"loglevel", "LogLevel", "level"},
+		MaterializeLevel:   true,
+	}
+	got, err := TranslateLogQLWithMapping(
+		`sum by (level) (count_over_time({namespace="flux-system"}[10m]))`,
+		nil, nil, logsql.Capabilities{}, mapping)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, forbidden := range []string{"| coalesce(", "replace_regexp (level,", "replace (level,"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("generated LogsQL contains %q, which VictoriaLogs rejects: %s", forbidden, got)
+		}
+	}
+	// Priority order: the chain runs lowest-priority first so the highest-priority
+	// present field is the last writer.
+	wantOrder := []string{
+		`| format if (level:*) "<level>" as level`,
+		`| format if (LogLevel:*) "<LogLevel>" as level`,
+		`| format if (loglevel:*) "<loglevel>" as level`,
+	}
+	pos := -1
+	for _, stage := range wantOrder {
+		idx := strings.Index(got, stage)
+		if idx < 0 {
+			t.Fatalf("missing %q in %s", stage, got)
+		}
+		if idx <= pos {
+			t.Fatalf("stage %q out of priority order in %s", stage, got)
+		}
+		pos = idx
+	}
+	if !strings.Contains(got, "| replace_regexp (`(?i)^(warn|warning|warnings)$`, \"warn\") at level") {
+		t.Fatalf("normalisation pipe has the wrong argument order: %s", got)
 	}
 }

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Derived-level queries returned HTTP 400 from VictoriaLogs.** Two generated
+  constructs are not valid LogsQL: there is no `coalesce` PIPE (`unexpected pipe
+  "coalesce"`), and `replace`/`replace_regexp` take the field LAST
+  (`| replace_regexp ("<re>", "<repl>") at <field>`), not first — the
+  three-argument form fails with `missing ')' after 'replace_regexp("level", …'`.
+  Both parse cleanly in this repo's own LogsQL parser, so unit tests passed while
+  every `{…, level="error"}` and `sum by (level)` query failed against a real
+  backend. `PipeReplace` / `PipeReplaceRegexp` now emit the accepted syntax, and
+  level materialisation is built from a `| format if (<field>:*) "<<field>>" as
+  level` chain applied lowest-priority-first. Verified against VictoriaLogs
+  v1.52.0.
+- **Level materialisation now fires only on queries that GROUP by level**
+  (`by (level)` / `without (detected_level)`), not on any query mentioning the
+  word. A matcher is already served by the filter pipes, so the unpack + format +
+  replace chain was pure cost on plain log queries.
+
 ### Added
 
 - **`-field-mapping` fallback chains.** A `loki_label` may map to an ordered
