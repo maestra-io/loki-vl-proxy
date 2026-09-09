@@ -17,6 +17,12 @@ permissions:
   contents: read
   id-token: write
 
+# One publish at a time: parallel runs race on create-repository and on the
+# `latest` tag; the newest commit wins.
+concurrency:
+  group: ecr-publish-loki-vl-proxy
+  cancel-in-progress: true
+
 env:
   ECR_REGISTRY: 515260921971.dkr.ecr.us-west-2.amazonaws.com
   AWS_REGION: us-west-2
