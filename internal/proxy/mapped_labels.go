@@ -100,21 +100,24 @@ func applyLabelPromotions(proms []labelPromotion, labels map[string]string, get 
 	return changed
 }
 
-// promoteStreamLabels returns a stream label set extended with the promoted
-// labels for this entry, plus its canonical key. When nothing is promoted the
-// input map and key are returned unchanged (no allocation).
-func (p *Proxy) promoteStreamLabels(labels map[string]string, key string, get func(string) string) (map[string]string, string) {
-	if p == nil || len(p.labelPromotions) == 0 {
-		return labels, key
+// withPromotedLabels returns the stream label set extended with promoted labels
+// and a normalised level for this entry, plus its canonical key. The stream is
+// re-keyed so entries differing only in a promoted label stay separate series.
+// When nothing changes the input map and key are returned unchanged.
+func (p *Proxy) withPromotedLabels(key string, labels map[string]string, msg string, rawLabels map[string]string, val *fj.Value) (string, map[string]string) {
+	if p == nil || (len(p.labelPromotions) == 0 && len(p.derivedLevelFields) == 0) {
+		return key, labels
 	}
-	extended := make(map[string]string, len(labels)+len(p.labelPromotions))
+	extended := make(map[string]string, len(labels)+len(p.labelPromotions)+1)
 	for k, v := range labels {
 		extended[k] = v
 	}
-	if !applyLabelPromotions(p.labelPromotions, extended, get) {
-		return labels, key
+	applyLabelPromotions(p.labelPromotions, extended, fjFieldGetter(rawLabels, val))
+	p.applyDerivedLevel(extended, msg)
+	if sameStringMap(extended, labels) {
+		return key, labels
 	}
-	return extended, canonicalLabelsKey(extended)
+	return canonicalLabelsKey(extended), extended
 }
 
 // entryFieldGetter resolves a VL field name against the raw stream labels first

@@ -687,18 +687,7 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 		// Lift mapped/computed labels into the stream label set and normalise the
 		// derived level, then re-key the stream so entries that differ only in a
 		// promoted label do not collapse into one series.
-		if len(p.labelPromotions) > 0 || len(p.derivedLevelFields) > 0 {
-			extended := make(map[string]string, len(streamLabels)+len(p.labelPromotions)+1)
-			for k, v := range streamLabels {
-				extended[k] = v
-			}
-			applyLabelPromotions(p.labelPromotions, extended, fjFieldGetter(desc.rawLabels, fjVal))
-			p.applyDerivedLevel(extended, msg)
-			if len(extended) != len(streamLabels) || !sameStringMap(extended, streamLabels) {
-				streamLabels = extended
-				streamKey = canonicalLabelsKey(extended)
-			}
-		}
+		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, msg, desc.rawLabels, fjVal)
 		se, ok := streamMap[streamKey]
 		if !ok {
 			se = &streamEntry{

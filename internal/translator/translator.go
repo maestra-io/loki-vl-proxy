@@ -1676,10 +1676,6 @@ func tryTranslateLabelJoin(logql string, labelFn LabelTranslateFunc, mapping *Ma
 }
 
 // tryTranslateMetricQuery attempts to translate a metric/aggregation query.
-func tryTranslateMetricQuery(logql string, labelFn LabelTranslateFunc) (string, bool) {
-	return tryTranslateMetricQueryM(logql, labelFn, nil)
-}
-
 func tryTranslateMetricQueryM(logql string, labelFn LabelTranslateFunc, mapping *MappingOptions) (string, bool) { //nolint:gocyclo // multi-function metric dispatcher: quantile, rate, unwrap, stdvar, outer-agg, recursive nested — each branch is a distinct translation rule
 	// Match patterns like: sum(rate({...}[5m])) by (label)
 	// or: count_over_time({...}[5m])

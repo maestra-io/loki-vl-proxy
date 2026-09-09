@@ -885,18 +885,7 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 		streamKey, streamLabels := applyStreamLabelMutations(
 			desc, dropConditions, keepConditions, bareDropFields, bareKeepFields, p.labelTranslator,
 		)
-		if len(p.labelPromotions) > 0 || len(p.derivedLevelFields) > 0 {
-			extended := make(map[string]string, len(streamLabels)+len(p.labelPromotions)+1)
-			for k, v := range streamLabels {
-				extended[k] = v
-			}
-			applyLabelPromotions(p.labelPromotions, extended, fjFieldGetter(desc.rawLabels, fjVal))
-			p.applyDerivedLevel(extended, msg)
-			if !sameStringMap(extended, streamLabels) {
-				streamLabels = extended
-				streamKey = canonicalLabelsKey(extended)
-			}
-		}
+		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, msg, desc.rawLabels, fjVal)
 
 		entries = append(entries, queryRangeWindowEntry{
 			Stream: streamLabels,
