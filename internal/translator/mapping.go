@@ -237,12 +237,16 @@ func (m *MappingOptions) levelNormalizePipes() []string {
 		return nil
 	}
 	var pipes []string
-	if len(m.DerivedLevelFields) > 1 || m.DerivedLevelFields[0] != "level" {
-		fields := make([]string, len(m.DerivedLevelFields))
-		for i, f := range m.DerivedLevelFields {
-			fields[i] = quoteVLField(f)
-		}
-		pipes = append(pipes, logsql.PipeCoalesce{Fields: fields, Result: "level"}.String())
+	// VictoriaLogs has no `coalesce` pipe, so first-non-empty-wins is built from
+	// `| format if (<field>:*)` stages applied from the LOWEST priority field to
+	// the highest: each matching stage overwrites `level`, so the last one to run
+	// — the highest-priority field that is present — is the value that survives.
+	for i := len(m.DerivedLevelFields) - 1; i >= 0; i-- {
+		field := m.DerivedLevelFields[i]
+		quoted := quoteVLField(field)
+		// `level` itself stays in the chain: dropping it would let a
+		// lower-priority field overwrite a level that was already present.
+		pipes = append(pipes, "| format if ("+quoted+":*) \"<"+field+">\" as level")
 	}
 	for _, canonical := range []string{"error", "warn", "info", "debug"} {
 		pipes = append(pipes, logsql.PipeReplaceRegexp{

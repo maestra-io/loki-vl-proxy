@@ -49,8 +49,8 @@ See [Translation Modes Guide](translation-modes.md) for mode-selection profiles 
 | `-patterns-startup-peer-warm-timeout` | — | `5s` | Startup timeout for peer warm merge of pattern snapshots |
 | `-field-mapping` | `FIELD_MAPPING` | — | JSON custom field mappings. `vl_field` maps one VL field; `vl_fields` maps an ordered fallback chain |
 | `-computed-labels` | — | — | JSON Loki labels joined from other labels, e.g. `[{"loki_label":"job","join":["namespace","app"],"sep":"/"}]` |
-| `-derived-level-fields` | — | — | Comma-separated VL fields carrying a raw level inside `_msg` (e.g. `level,loglevel,severity`). Enables `level`/`detected_level` matchers and value normalisation |
-| `-derived-level-group-by` | — | `false` | Materialise `level` server-side (unpack + coalesce + normalise) so `sum by (level)` groups. Costs a full `_msg` unpack per matched entry |
+| `-derived-level-fields` | — | — | Comma-separated VL fields carrying a raw level inside `_msg` (e.g. `loglevel,LogLevel,level,severity`). **Case-sensitive** — see below. Enables `level`/`detected_level` matchers and value normalisation |
+| `-derived-level-group-by` | — | `false` | Materialise `level` server-side so `sum by (level)` / `sum by (detected_level)` groups. Applies only to queries that GROUP by level; costs a full `_msg` unpack per matched entry |
 | `-line-field` | — | — | VL field returned as the Loki log line. Empty re-encodes the whole VL record as JSON; `_msg` returns the original message |
 | `-stream-fields` | — | — | Comma-separated `_stream_fields` labels used for stream selector optimization and label-surface hints |
 | `-extra-label-fields` | `EXTRA_LABEL_FIELDS` | — | Comma-separated additional VL fields to expose on label-facing APIs and alias resolution paths (for example `host.id,k8s.cluster.name`) |
@@ -126,14 +126,24 @@ When no structured level key is found it falls back to the first of `debug`/`war
 occurring in the line.
 
 ```bash
--derived-level-fields='level,loglevel,severity' -derived-level-group-by=true
+-derived-level-fields='loglevel,LogLevel,level,Level,severity,severity_text,lvl' \
+  -derived-level-group-by=true
 ```
 
+**Field names are case-sensitive.** They are matched against the keys VictoriaLogs produces
+when it unpacks `_msg`, and those keys are verbatim JSON/logfmt keys. .NET writes
+`"LogLevel":"Warning"`, Go's slog writes `"level"`, Serilog writes `"@l"` — list every casing
+your fleet actually emits. Order is priority order: the first listed field that is present
+supplies the value.
+
 - `{level="error"}` and `| level="error"` translate to
-  `| unpack_json | unpack_logfmt | filter (level:~"(?i)^(err|error|…)$" OR loglevel:~"…")`.
-- `-derived-level-group-by` additionally appends `| coalesce(<fields>) as level` plus
-  `| replace_regexp` normalisation to any query mentioning `level`, so `sum by (level)`
-  groups on canonical values.
+  `| unpack_json from _msg | unpack_logfmt | filter (loglevel:~"(?i)^(err|error|…)$" OR …)`,
+  one alternative per configured field.
+- `-derived-level-group-by` appends, to queries that **group** by `level`/`detected_level`,
+  a `| format if (<field>:*) "<<field>>" as level` chain (lowest priority first, so the
+  highest-priority present field is the last writer) followed by four
+  `| replace_regexp (…) at level` stages that fold the raw values onto
+  `error`/`warn`/`info`/`debug`.
 
 **Performance caveat**: both paths unpack `_msg` for every entry the base filters match.
 The stream selector still prunes first, but a level filter is never an index lookup. Keep the

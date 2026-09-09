@@ -2498,9 +2498,27 @@ func writeTranslatedStatsItemsFJ(buf *bytes.Buffer, items []*fj.Value, changedMe
 	buf.WriteByte(']')
 }
 
-// levelReferenceRE matches a bare `level` / `detected_level` identifier anywhere
-// in a LogQL query (matcher, label filter, by-clause).
-var levelReferenceRE = regexp.MustCompile(`\b(?:detected_)?level\b`)
+// levelGroupingRE matches a `by (...)` / `without (...)` clause that names
+// `level` or `detected_level`.
+//
+// Materialisation only exists so VL can GROUP on a derived level; a matcher is
+// already served by the filter pipes. Triggering on any mention of the word
+// appended the whole unpack + format + replace chain to plain log queries like
+// {namespace="x", level="error"}, which is pure cost.
+var levelGroupingRE = regexp.MustCompile(`\b(?:by|without)\s*\(([^)]*)\)`)
+
+// logqlGroupsByLevel reports whether the query aggregates by the level label.
+func logqlGroupsByLevel(logql string) bool {
+	for _, m := range levelGroupingRE.FindAllStringSubmatch(logql, -1) {
+		for _, label := range strings.Split(m[1], ",") {
+			switch strings.TrimSpace(label) {
+			case "level", "detected_level":
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // buildMappingOptions assembles the per-query translator mapping options from the
 // proxy configuration. Returns nil when no fork-specific mapping is configured,
@@ -2518,7 +2536,7 @@ func (p *Proxy) buildMappingOptions(logql string) *translator.MappingOptions {
 	}
 	opts := &translator.MappingOptions{
 		DerivedLevelFields: p.derivedLevelFields,
-		MaterializeLevel:   p.derivedLevelGroupBy && levelReferenceRE.MatchString(logql),
+		MaterializeLevel:   p.derivedLevelGroupBy && logqlGroupsByLevel(logql),
 	}
 	if hasChains {
 		opts.Expand = func(lokiLabel string) []string {

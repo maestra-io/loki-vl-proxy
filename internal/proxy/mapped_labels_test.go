@@ -421,3 +421,28 @@ func TestMutatePromotedLabels(t *testing.T) {
 		})
 	}
 }
+
+func TestLogqlGroupsByLevel(t *testing.T) {
+	tests := []struct {
+		query string
+		want  bool
+	}{
+		// Materialisation only pays for itself when VL has to GROUP on level.
+		{`sum by (level) (count_over_time({ns="x"}[5m]))`, true},
+		{`sum by (detected_level) (count_over_time({ns="x"}[5m]))`, true},
+		{`sum by (pod, level) (rate({ns="x"}[5m]))`, true},
+		{`sum without (level) (rate({ns="x"}[5m]))`, true},
+		{`sum by ( detected_level ) (rate({ns="x"}[5m]))`, true},
+		// A matcher is served by the filter pipes — no materialisation needed.
+		{`{namespace="flux-system", level="error"}`, false},
+		{`{ns="x"} | level="error"`, false},
+		{`sum by (pod) (rate({ns="x"}[5m]))`, false},
+		{`{ns="x"} |= "level"`, false},
+		{`sum by (level_name) (rate({ns="x"}[5m]))`, false},
+	}
+	for _, tt := range tests {
+		if got := logqlGroupsByLevel(tt.query); got != tt.want {
+			t.Fatalf("logqlGroupsByLevel(%q) = %v, want %v", tt.query, got, tt.want)
+		}
+	}
+}
