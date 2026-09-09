@@ -3,6 +3,8 @@ package proxy
 import (
 	"reflect"
 	"testing"
+
+	"github.com/ReliablyObserve/Loki-VL-proxy/internal/translator"
 )
 
 var omicronMappings = []FieldMapping{
@@ -349,5 +351,73 @@ func TestReloadFieldMappingsShrinksDeclaredSurface(t *testing.T) {
 	p.ReloadFieldMappings(omicronMappings)
 	if len(p.declaredLabelFields) != 5 {
 		t.Fatalf("declared fields after re-adding = %v", p.declaredLabelFields)
+	}
+}
+
+func TestMutatePromotedLabels(t *testing.T) {
+	lt := NewLabelTranslator(LabelStyleUnderscores, omicronMappings)
+	p := &Proxy{
+		labelTranslator: lt,
+		labelPromotions: buildLabelPromotions(lt, []ComputedLabel{{LokiLabel: "job", Join: []string{"namespace", "app"}, Sep: "/"}}),
+	}
+	dropJobValue, err := translator.NewDropCondition("job", "=", "ns/noisy")
+	if err != nil {
+		t.Fatalf("NewDropCondition: %v", err)
+	}
+	keepAppValue, err := translator.NewDropCondition("app", "=", "trow")
+	if err != nil {
+		t.Fatalf("NewDropCondition: %v", err)
+	}
+
+	base := map[string]string{"namespace": "ns", "app": "noisy", "product": "cdp", "job": "ns/noisy"}
+	tests := []struct {
+		name string
+		mut  streamLabelMutations
+		want map[string]string
+	}{
+		{
+			name: "no mutations leaves promoted labels alone",
+			mut:  streamLabelMutations{},
+			want: map[string]string{"namespace": "ns", "app": "noisy", "product": "cdp", "job": "ns/noisy"},
+		},
+		{
+			// | drop job — the raw-driven mutation pass cannot see job at all.
+			name: "bare drop removes a computed label",
+			mut:  streamLabelMutations{bareDropFields: []string{"job"}},
+			want: map[string]string{"namespace": "ns", "app": "noisy", "product": "cdp"},
+		},
+		{
+			name: "bare drop removes a mapped label",
+			mut:  streamLabelMutations{bareDropFields: []string{"app"}},
+			want: map[string]string{"namespace": "ns", "product": "cdp", "job": "ns/noisy"},
+		},
+		{
+			// | keep namespace — every promoted label outside the keep list goes.
+			name: "bare keep strips every other promoted label",
+			mut:  streamLabelMutations{bareKeepFields: []string{"namespace"}},
+			want: map[string]string{"namespace": "ns"},
+		},
+		{
+			name: "conditional drop only fires on a matching value",
+			mut:  streamLabelMutations{dropConditions: []translator.DropCondition{dropJobValue}},
+			want: map[string]string{"namespace": "ns", "app": "noisy", "product": "cdp"},
+		},
+		{
+			name: "conditional keep strips a non-matching value",
+			mut:  streamLabelMutations{keepConditions: []translator.DropCondition{keepAppValue}},
+			want: map[string]string{"namespace": "ns", "product": "cdp", "job": "ns/noisy"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			labels := map[string]string{}
+			for k, v := range base {
+				labels[k] = v
+			}
+			p.mutatePromotedLabels(labels, tt.mut)
+			if !reflect.DeepEqual(labels, tt.want) {
+				t.Fatalf("labels = %v, want %v", labels, tt.want)
+			}
+		})
 	}
 }

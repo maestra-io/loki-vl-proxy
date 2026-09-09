@@ -175,6 +175,7 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 
 	exposureCache := make(map[string][]metadataFieldExposure, 16)
 	dropConditions, keepConditions, bareDropFields, bareKeepFields := extractDropKeepFromAST(originalQuery)
+	streamMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields, bareKeepFields}
 	// Constant for the whole response — parsing the query per entry would re-run a
 	// full LogQL parse for every streamed line.
 	skipLogLineReconstruction := hasTextExtractionParser(originalQuery)
@@ -233,6 +234,7 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 			applyLabelPromotions(p.labelPromotions, translatedLabels, entryFieldGetter(streamLabels, entry))
 		}
 		p.applyDerivedLevel(translatedLabels, asString(entry["_msg"]))
+		p.mutatePromotedLabels(translatedLabels, streamMutations)
 		// Apply drop conditions to stream labels: Loki | drop field=value removes the
 		// field from the label set when the value matches, even for stream labels.
 		if len(dropConditions) > 0 {
@@ -548,6 +550,7 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 	// stream label set (matching Loki behaviour) so Grafana's unwrap field picker can see them.
 	needsClassification := emitStructuredMetadata || categorizedLabels || mergeParsedIntoLabels
 	dropConditions, keepConditions, bareDropFields2, bareKeepFields2 := extractDropKeepFromAST(originalQuery)
+	labelMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields2, bareKeepFields2}
 
 	var (
 		miner        *patternMiner
@@ -694,7 +697,7 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 		// Lift mapped/computed labels into the stream label set and normalise the
 		// derived level, then re-key the stream so entries that differ only in a
 		// promoted label do not collapse into one series.
-		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, rawMsg, desc.rawLabels, fjVal)
+		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, rawMsg, desc.rawLabels, fjVal, labelMutations)
 		se, ok := streamMap[streamKey]
 		if !ok {
 			se = &streamEntry{

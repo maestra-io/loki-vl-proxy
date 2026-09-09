@@ -333,6 +333,23 @@ func TestDerivedLevelMaterialization(t *testing.T) {
 			t.Fatalf("%s: missing the normalisation pipes: %s", q, got2)
 		}
 	}
+
+	// A LINE FILTER whose value contains the stage text must not be mistaken for
+	// an already-emitted normalisation stage — a substring search over the joined
+	// query would drop the whole chain here.
+	got3, err := TranslateLogQLWithMapping(`{namespace="ns"} |= " as level"`, nil, nil, logsql.Capabilities{}, levelMapping(true))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got3, "| coalesce(level, loglevel) as level") {
+		t.Fatalf("line filter suppressed the coalesce pipe: %s", got3)
+	}
+	if strings.Count(got3, "| replace_regexp (level,") != 4 {
+		t.Fatalf("expected four normalisation pipes, got %s", got3)
+	}
+	if !strings.Contains(got3, `~" as level"`) {
+		t.Fatalf("line filter lost: %s", got3)
+	}
 }
 
 func TestSplitComputedValue(t *testing.T) {

@@ -855,20 +855,21 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 	}
 
 	if normalize := mapping.levelNormalizePipes(); len(normalize) > 0 {
-		joined := strings.Join(parts, " ")
 		var pipes []string
-		// Only the unpack pipes are skippable when the query already has them;
-		// dropping the coalesce/normalise chain too would leave `sum by (level)`
-		// grouping on the raw stored field for every parser query.
+		// Deduplicate STRUCTURALLY, stage by stage: a substring search over the
+		// joined query is fooled by a line filter such as `|= " as level"`, which
+		// would silently drop the whole normalisation chain.
 		for _, unpack := range levelUnpackPipes() {
 			// Match the pipe NAME: the query may already carry the bare form
 			// (`| unpack_json`) while levelUnpackPipes emits `| unpack_json from _msg`.
-			if !strings.Contains(joined, unpackPipeName(unpack)) {
+			if !hasPipeStage(parts, unpackPipeName(unpack)) {
 				pipes = append(pipes, unpack)
 			}
 		}
-		if !strings.Contains(joined, " as level") {
-			pipes = append(pipes, normalize...)
+		for _, stage := range normalize {
+			if !hasExactStage(parts, stage) {
+				pipes = append(pipes, stage)
+			}
 		}
 		if len(pipes) > 0 {
 			if len(parts) == 0 && len(streamParts) == 0 {

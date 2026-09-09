@@ -808,6 +808,7 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 	forceParsedFields := namedCaptureFields(originalQuery)
 	needsClassification := categorizedLabels && emitStructuredMetadata
 	dropConditions, keepConditions, bareDropFields, bareKeepFields := extractDropKeepFromAST(originalQuery)
+	labelMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields, bareKeepFields}
 
 	scanBufPtr := scannerBufPool.Get().(*[]byte)
 	scanner := bufio.NewScanner(r)
@@ -889,7 +890,7 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 		streamKey, streamLabels := applyStreamLabelMutations(
 			desc, dropConditions, keepConditions, bareDropFields, bareKeepFields, p.labelTranslator,
 		)
-		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, rawMsg, desc.rawLabels, fjVal)
+		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, rawMsg, desc.rawLabels, fjVal, labelMutations)
 
 		entries = append(entries, queryRangeWindowEntry{
 			Stream: streamLabels,

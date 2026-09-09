@@ -382,9 +382,35 @@ func stageIsDerivedLevelFilter(stage string, mapping *MappingOptions) bool {
 // that already carries `| unpack_json` is recognised as having it even though
 // levelUnpackPipes emits the explicit `| unpack_json from _msg` form.
 func unpackPipeName(pipe string) string {
-	name := strings.TrimPrefix(strings.TrimSpace(pipe), "| ")
+	name := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(pipe), "|"))
 	if idx := strings.Index(name, " "); idx > 0 {
 		name = name[:idx]
 	}
 	return name
+}
+
+// hasPipeStage reports whether any already-emitted part is a pipe stage with the
+// given name. Unlike a substring search over the joined query it cannot be
+// fooled by a line filter whose VALUE happens to contain the stage text.
+func hasPipeStage(parts []string, name string) bool {
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if !strings.HasPrefix(part, "|") {
+			continue
+		}
+		if unpackPipeName(part) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExactStage reports whether an identical pipe stage was already emitted.
+func hasExactStage(parts []string, stage string) bool {
+	for _, part := range parts {
+		if strings.TrimSpace(part) == stage {
+			return true
+		}
+	}
+	return false
 }

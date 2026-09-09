@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/ReliablyObserve/Loki-VL-proxy/internal/translator"
+
 	fj "github.com/valyala/fastjson"
 )
 
@@ -104,7 +106,7 @@ func applyLabelPromotions(proms []labelPromotion, labels map[string]string, get 
 // and a normalised level for this entry, plus its canonical key. The stream is
 // re-keyed so entries differing only in a promoted label stay separate series.
 // When nothing changes the input map and key are returned unchanged.
-func (p *Proxy) withPromotedLabels(key string, labels map[string]string, msg string, rawLabels map[string]string, val *fj.Value) (string, map[string]string) {
+func (p *Proxy) withPromotedLabels(key string, labels map[string]string, msg string, rawLabels map[string]string, val *fj.Value, mut streamLabelMutations) (string, map[string]string) {
 	if p == nil || (len(p.labelPromotions) == 0 && len(p.derivedLevelFields) == 0) {
 		return key, labels
 	}
@@ -114,10 +116,65 @@ func (p *Proxy) withPromotedLabels(key string, labels map[string]string, msg str
 	}
 	applyLabelPromotions(p.labelPromotions, extended, fjFieldGetter(rawLabels, val))
 	p.applyDerivedLevel(extended, msg)
+	p.mutatePromotedLabels(extended, mut)
 	if sameStringMap(extended, labels) {
 		return key, labels
 	}
 	return canonicalLabelsKey(extended), extended
+}
+
+// streamLabelMutations carries the `| drop` / `| keep` state of one response.
+// It is parsed once per request and reused for every entry.
+type streamLabelMutations struct {
+	dropConditions []translator.DropCondition
+	keepConditions []translator.DropCondition
+	bareDropFields []string
+	bareKeepFields []string
+}
+
+func (m streamLabelMutations) empty() bool {
+	return len(m.dropConditions) == 0 && len(m.keepConditions) == 0 &&
+		len(m.bareDropFields) == 0 && len(m.bareKeepFields) == 0
+}
+
+// mutatePromotedLabels applies `| drop` / `| keep` to promoted labels.
+//
+// The regular stream-label mutation pass is driven by the RAW VL label set, and a
+// promoted label (job, app, product) has no raw counterpart there — so without
+// this pass `| drop job` and `| keep namespace` would leave it in the response.
+func (p *Proxy) mutatePromotedLabels(labels map[string]string, mut streamLabelMutations) {
+	if p == nil || labels == nil || mut.empty() || len(p.labelPromotions) == 0 {
+		return
+	}
+	for _, prom := range p.labelPromotions {
+		value, present := labels[prom.label]
+		if !present {
+			continue
+		}
+		if containsString(mut.bareDropFields, prom.label) {
+			delete(labels, prom.label)
+			continue
+		}
+		if len(mut.bareKeepFields) > 0 && !containsString(mut.bareKeepFields, prom.label) {
+			delete(labels, prom.label)
+			continue
+		}
+		for _, dc := range mut.dropConditions {
+			if dc.Field == prom.label && dc.Matches(value) {
+				delete(labels, prom.label)
+				break
+			}
+		}
+		if _, still := labels[prom.label]; !still {
+			continue
+		}
+		for _, kc := range mut.keepConditions {
+			if kc.Field == prom.label && !kc.Matches(value) {
+				delete(labels, prom.label)
+				break
+			}
+		}
+	}
 }
 
 // entryFieldGetter resolves a VL field name against the raw stream labels first
