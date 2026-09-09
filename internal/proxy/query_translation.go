@@ -2498,26 +2498,100 @@ func writeTranslatedStatsItemsFJ(buf *bytes.Buffer, items []*fj.Value, changedMe
 	buf.WriteByte(']')
 }
 
-// levelGroupingRE matches a `by (...)` / `without (...)` clause that names
-// `level` or `detected_level`.
-//
-// Materialisation only exists so VL can GROUP on a derived level; a matcher is
-// already served by the filter pipes. Triggering on any mention of the word
-// appended the whole unpack + format + replace chain to plain log queries like
-// {namespace="x", level="error"}, which is pure cost.
+// levelGroupingRE matches a `by (...)` / `without (...)` clause. It is the
+// FALLBACK used only when the query does not parse — the structural check below
+// is the primary one, because raw text cannot tell a grouping clause from the
+// same characters inside a string literal.
 var levelGroupingRE = regexp.MustCompile(`\b(?:by|without)\s*\(([^)]*)\)`)
 
-// logqlGroupsByLevel reports whether the query aggregates by the level label.
-func logqlGroupsByLevel(logql string) bool {
-	for _, m := range levelGroupingRE.FindAllStringSubmatch(logql, -1) {
+// isLevelLabel reports whether a grouping label is served by the derived level.
+func isLevelLabel(label string) bool {
+	switch strings.TrimSpace(label) {
+	case "level", "detected_level":
+		return true
+	}
+	return false
+}
+
+// groupingUsesLevel walks a parsed LogQL expression and reports whether any
+// aggregation groups by (or without) the level label.
+func groupingUsesLevel(expr logqlpkg.Expr) bool {
+	switch e := expr.(type) {
+	case *logqlpkg.VectorAggregation:
+		if groupingHasLevel(e.Grouping) {
+			return true
+		}
+		return e.Inner != nil && groupingUsesLevel(e.Inner)
+	case *logqlpkg.RangeAggregation:
+		if groupingHasLevel(e.Grouping) {
+			return true
+		}
+		return e.Inner != nil && groupingUsesLevel(e.Inner)
+	case *logqlpkg.BinOpExpr:
+		return (e.Left != nil && groupingUsesLevel(e.Left)) ||
+			(e.Right != nil && groupingUsesLevel(e.Right))
+	case *logqlpkg.OpaqueMetricExpr:
+		// The parser did not understand this call (label_replace, label_join, …);
+		// fall back to the text scan over its raw form.
+		return textGroupsByLevel(e.Raw)
+	}
+	return false
+}
+
+func groupingHasLevel(g *logqlpkg.Grouping) bool {
+	if g == nil {
+		return false
+	}
+	for _, label := range g.Labels {
+		if isLevelLabel(label) {
+			return true
+		}
+	}
+	return false
+}
+
+// textGroupsByLevel is the fallback for queries the LogQL parser rejects. It
+// blanks out quoted spans first, so `|= "sum by (level)"` cannot be mistaken for
+// a grouping clause.
+func textGroupsByLevel(logql string) bool {
+	for _, m := range levelGroupingRE.FindAllStringSubmatch(stripQuotedSpans(logql), -1) {
 		for _, label := range strings.Split(m[1], ",") {
-			switch strings.TrimSpace(label) {
-			case "level", "detected_level":
+			if isLevelLabel(label) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// stripQuotedSpans replaces the CONTENTS of "…", '…' and `…` spans with spaces,
+// preserving offsets. Backslash escapes are honoured inside "" and ”.
+func stripQuotedSpans(s string) string {
+	out := []byte(s)
+	for i := 0; i < len(out); i++ {
+		q := out[i]
+		if q != '"' && q != '\'' && q != '`' {
+			continue
+		}
+		i++
+		for i < len(out) && out[i] != q {
+			if q != '`' && out[i] == '\\' && i+1 < len(out) {
+				out[i] = ' '
+				i++
+			}
+			out[i] = ' '
+			i++
+		}
+	}
+	return string(out)
+}
+
+// logqlGroupsByLevel reports whether the query aggregates by the level label.
+func logqlGroupsByLevel(logql string) bool {
+	if expr, err := logqlpkg.Parse(logql); err == nil && expr != nil {
+		return groupingUsesLevel(expr)
+	}
+	return textGroupsByLevel(logql)
 }
 
 // buildMappingOptions assembles the per-query translator mapping options from the

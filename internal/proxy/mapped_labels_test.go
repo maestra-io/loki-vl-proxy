@@ -439,6 +439,14 @@ func TestLogqlGroupsByLevel(t *testing.T) {
 		{`sum by (pod) (rate({ns="x"}[5m]))`, false},
 		{`{ns="x"} |= "level"`, false},
 		{`sum by (level_name) (rate({ns="x"}[5m]))`, false},
+		// Grouping TEXT inside a string literal is not a grouping clause.
+		{`{ns="x"} |= "sum by (level)"`, false},
+		{`{ns="x"} |~ "by (detected_level)"`, false},
+		{`{ns="x"} != "without (level)"`, false},
+		{`{ns="x"} | line_format "sum by (level)"`, false},
+		{"{ns=\"x\"} |= `by (level)`", false},
+		// …but a real grouping clause alongside such a literal still counts.
+		{`sum by (level) (count_over_time({ns="x"} |= "by (pod)" [5m]))`, true},
 	}
 	for _, tt := range tests {
 		if got := logqlGroupsByLevel(tt.query); got != tt.want {
