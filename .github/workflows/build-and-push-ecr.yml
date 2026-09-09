@@ -1,0 +1,119 @@
+# Maestra fork: build the Dockerfile and push to the maestra ECR (us-west-2).
+# Copied from maestra-io/mcp-victorialogs build-and-push-ecr.yml; no release
+# numbering here (IMAGE_VERSION below is bumped by hand) and no secondary-ECR
+# mirror. Needs Teleport token image-push-github-actions-loki-vl-proxy
+# (maestra-io/fluxcd#14268).
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ECR_REGISTRY: 515260921971.dkr.ecr.us-west-2.amazonaws.com
+  AWS_REGION: us-west-2
+  TELEPORT_FQDN: teleport.maestra.io:443
+  TELEPORT_TOKEN: image-push-github-actions-loki-vl-proxy
+  AWS_ROLE_ARN: "arn:aws:iam::515260921971:role/teleport-image-push"
+  IMAGE_NAME: loki-vl-proxy
+  # <upstream tag without the v>-maestra.<fork revision>. Bump the left half on
+  # every rebase onto a new upstream tag, the right half on every fork-only
+  # change. Quoted: an unquoted version scalar is a YAML float trap.
+  IMAGE_VERSION: "1.63.1-maestra.1"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_BUILDKIT: 1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # No git operations downstream — don't leave a `GITHUB_TOKEN`
+          # in `.git/config` for the rest of the job to find.
+          persist-credentials: false
+
+      - name: Get Teleport version
+        id: tp-version
+        run: |
+          VERSION=$(curl -sf "https://${{ env.TELEPORT_FQDN }}/webapi/find" | jq -r '.auto_update.tools_version // .server_version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Failed to resolve Teleport version from /webapi/find"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Teleport binaries
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.tool_cache }}/teleport
+          key: teleport-${{ steps.tp-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install Teleport
+        uses: teleport-actions/setup@v1
+        with:
+          version: ${{ steps.tp-version.outputs.version }}
+          proxy: ${{ env.TELEPORT_FQDN }}
+
+      - name: ECR login via Teleport Workload Identity
+        run: |
+          cat > /tmp/tbot.yaml << EOF_TBOT
+          version: v2
+          proxy_server: ${{ env.TELEPORT_FQDN }}
+          onboarding:
+            join_method: github
+            token: ${{ env.TELEPORT_TOKEN }}
+          oneshot: true
+          storage:
+            type: memory
+          services:
+            - type: workload-identity-jwt
+              destination:
+                type: directory
+                path: /tmp/tbot-output
+              selector:
+                name: image-push
+              audiences: ["sts.amazonaws.com"]
+          EOF_TBOT
+
+          mkdir -p /tmp/tbot-output
+          tbot start -c /tmp/tbot.yaml
+
+          export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/tbot-output/jwt_svid
+          export AWS_ROLE_ARN="${{ env.AWS_ROLE_ARN }}"
+          export AWS_DEFAULT_REGION=${{ env.AWS_REGION }}
+
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+            docker login ${{ env.ECR_REGISTRY }} --username AWS --password-stdin
+
+          # Image-build ECR repositories are not terraform-managed (aws-infra
+          # ecr-eu-forget.tf: "the rest were only ever created by CI pushes");
+          # the registry-wide scanning config already covers them.
+          aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Build and push
+        run: |
+          IMAGE="${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}"
+          SHA_TAG="${GITHUB_SHA::12}"
+
+          docker build \
+            --build-arg VERSION="${{ env.IMAGE_VERSION }}" \
+            --build-arg REVISION="$GITHUB_SHA" \
+            --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "$IMAGE:${{ env.IMAGE_VERSION }}" \
+            -t "$IMAGE:$SHA_TAG" \
+            -t "$IMAGE:latest" \
+            .
+
+          docker push "$IMAGE:${{ env.IMAGE_VERSION }}"
+          docker push "$IMAGE:$SHA_TAG"
+          docker push "$IMAGE:latest"
