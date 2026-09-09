@@ -848,6 +848,10 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 			continue
 		}
 		msg := string(fjVal.GetStringBytes("_msg"))
+		// Level detection must read the ORIGINAL message: after reconstruction msg is
+		// the whole VL record as JSON, where a pod label containing "warn" would be
+		// mistaken for a level.
+		rawMsg := msg
 		desc := p.logQueryStreamDescriptorBytes(
 			fjVal.GetStringBytes("_stream"),
 			fjVal.GetStringBytes("level"),
@@ -885,7 +889,7 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 		streamKey, streamLabels := applyStreamLabelMutations(
 			desc, dropConditions, keepConditions, bareDropFields, bareKeepFields, p.labelTranslator,
 		)
-		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, msg, desc.rawLabels, fjVal)
+		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, rawMsg, desc.rawLabels, fjVal)
 
 		entries = append(entries, queryRangeWindowEntry{
 			Stream: streamLabels,

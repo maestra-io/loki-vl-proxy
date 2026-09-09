@@ -600,6 +600,10 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 			continue
 		}
 		msg := string(fjVal.GetStringBytes("_msg"))
+		// Level detection must read the ORIGINAL message: after reconstruction msg is
+		// the whole VL record as JSON, where a pod label containing "warn" would be
+		// mistaken for a level.
+		rawMsg := msg
 
 		// Pass raw bytes to avoid string allocation on descriptor cache hits.
 		// logQueryStreamDescriptorBytes uses m[string([]byte)] (zero-alloc lookup)
@@ -687,7 +691,7 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 		// Lift mapped/computed labels into the stream label set and normalise the
 		// derived level, then re-key the stream so entries that differ only in a
 		// promoted label do not collapse into one series.
-		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, msg, desc.rawLabels, fjVal)
+		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, rawMsg, desc.rawLabels, fjVal)
 		se, ok := streamMap[streamKey]
 		if !ok {
 			se = &streamEntry{
