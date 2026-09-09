@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`-field-mapping` fallback chains.** A `loki_label` may map to an ordered
+  `vl_fields` list instead of a single `vl_field`. Positive matchers become a
+  LogsQL disjunction, negative matchers a conjunction of negations, label values
+  the union over the chain, and the value in results the first non-empty field.
+  Reproduces an ingest-time coalesce (`app` = pod label `app`, else
+  `app.kubernetes.io/name`) at query time.
+- **`-computed-labels`.** Synthesises a Loki label by joining others, e.g.
+  `job = "<namespace>/<app>"`. `=`/`!=` split on the separator; `=~` returns 400
+  with a message naming the joined labels to match instead.
+- **`-derived-level-fields` / `-derived-level-group-by`.** Serves
+  `level`/`detected_level` from the message body over the configured raw level
+  fields, normalising `information` → `info`, `warning` → `warn`,
+  `err`/`fatal`/`critical` → `error`, with a `debug`/`warn`/`error` substring
+  fallback. Opt-in group-by materialises `level` server-side.
+- **`-line-field=_msg`.** Returns the original message as the Loki log line
+  instead of the whole VL record re-encoded as JSON, falling back to the JSON
+  form for records VL ingested without a `_msg` field.
+
+### Fixed
+
+- **`/loki/api/v1/label/<name>/values` was empty for field-mapped labels.**
+  `stream_field_values` only knows VL's stream index, so a mapped label backed by
+  a plain column answered 200 with an empty list — indistinguishable from "no
+  values". The lookup now retries that candidate through `field_values`.
+- **Mapped and computed labels are exposed as stream labels** in query results
+  (previously structured metadata only), so `sum by (app)` and `| label_format`
+  can see them, and mapped VL fields are added to the declared label surface so
+  `/loki/api/v1/labels` lists them.
+- **`| regexp` / `| pattern` capture groups never became labels.** Fields named by
+  a query-time parser cannot be found in the log body, so the response classifier
+  filed them as structured metadata; they are now classified as parsed fields and
+  merged into the stream label set, which restores `sum by (<name>)`,
+  `unwrap <name>` and `| label_format` on them.
+
 ### Security
 
 - **Closed the last two code-scanning findings.**

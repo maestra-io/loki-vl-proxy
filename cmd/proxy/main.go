@@ -160,6 +160,10 @@ type proxyRuntimeConfig struct {
 	fieldMappingJSON                    string
 	streamFieldsCSV                     string
 	extraLabelFieldsCSV                 string
+	computedLabelsJSON                  string
+	derivedLevelFieldsCSV               string
+	derivedLevelGroupBy                 bool
+	lineField                           string
 	labelValuesIndexedCache             bool
 	labelValuesHotLimit                 int
 	labelValuesIndexMaxEntries          int
@@ -578,6 +582,10 @@ func run(
 	fieldMappingJSON := fs.String("field-mapping", "", `JSON custom field mappings: [{"vl_field":"service.name","loki_label":"service_name"}]`)
 	streamFieldsCSV := fs.String("stream-fields", "", `Comma-separated VL _stream_fields labels for stream selector optimization (e.g., "app,env,namespace")`)
 	extraLabelFieldsCSV := fs.String("extra-label-fields", "", `Comma-separated additional VL field names exposed on /labels and eligible for alias resolution (for example "host.id,custom.pipeline.processing")`)
+	computedLabelsJSON := fs.String("computed-labels", "", `JSON Loki labels joined from other labels: [{"loki_label":"job","join":["namespace","app"],"sep":"/"}]. Matchers on a computed label are split on the separator (= and != only); its value in results is the concatenation.`)
+	derivedLevelFieldsCSV := fs.String("derived-level-fields", "", `Comma-separated VL fields carrying a raw log level inside _msg (for example "level,loglevel,severity"). Enables level/detected_level matchers and normalises information->info, warning->warn. Empty keeps the upstream behaviour where level is a stored field.`)
+	derivedLevelGroupBy := fs.Bool("derived-level-group-by", false, "Append the unpack+coalesce+normalise pipe chain to queries that mention level, so `sum by (level)` groups server-side. Costs a full _msg unpack per matched entry.")
+	lineField := fs.String("line-field", "", `VL field returned as the Loki log line. Empty (default) re-encodes the whole VL record as JSON, matching upstream. "_msg" returns the original message and falls back to the JSON form when _msg is absent.`)
 	labelValuesIndexedCache := fs.Bool("label-values-indexed-cache", false, "Enable indexed browse cache for /loki/api/v1/label/{name}/values (hot subset first for empty-query requests)")
 	labelValuesHotLimit := fs.Int("label-values-hot-limit", 200, "Default number of label values returned for empty-query browse requests when indexed cache is enabled")
 	labelValuesIndexMaxEntries := fs.Int("label-values-index-max-entries", 200000, "Maximum indexed values retained per tenant+label when indexed label-values cache is enabled")
@@ -833,6 +841,10 @@ func run(
 			fieldMappingJSON:                    envCfg.fieldMappingJSON,
 			streamFieldsCSV:                     *streamFieldsCSV,
 			extraLabelFieldsCSV:                 envCfg.extraLabelFields,
+			computedLabelsJSON:                  *computedLabelsJSON,
+			derivedLevelFieldsCSV:               *derivedLevelFieldsCSV,
+			derivedLevelGroupBy:                 *derivedLevelGroupBy,
+			lineField:                           *lineField,
 			labelValuesIndexedCache:             *labelValuesIndexedCache,
 			labelValuesHotLimit:                 *labelValuesHotLimit,
 			labelValuesIndexMaxEntries:          *labelValuesIndexMaxEntries,
@@ -1668,6 +1680,34 @@ func parseFieldMappingsJSON(raw string) ([]proxy.FieldMapping, error) {
 	return fieldMappings, nil
 }
 
+// parseComputedLabelsJSON parses -computed-labels and rejects specs that cannot
+// be split back into matchers.
+func parseComputedLabelsJSON(raw string) ([]proxy.ComputedLabel, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var computed []proxy.ComputedLabel
+	if err := json.Unmarshal([]byte(raw), &computed); err != nil {
+		return nil, err
+	}
+	for _, c := range computed {
+		if !c.Valid() {
+			return nil, fmt.Errorf("computed label %q: loki_label and at least two join labels are required", c.LokiLabel)
+		}
+	}
+	return computed, nil
+}
+
+// validateLineField rejects a -line-field value the proxy cannot serve.
+func validateLineField(v string) error {
+	switch strings.TrimSpace(v) {
+	case "", "_msg":
+		return nil
+	default:
+		return fmt.Errorf("invalid -line-field %q: only \"\" (upstream JSON reconstruction) and \"_msg\" are supported", v)
+	}
+}
+
 func parseDerivedFieldsJSON(raw string) ([]proxy.DerivedField, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
@@ -1864,6 +1904,13 @@ func buildProxyConfig(cfg proxyRuntimeConfig) (proxy.Config, error) {
 	if err != nil {
 		return proxy.Config{}, fmt.Errorf("parse field mappings: %w", err)
 	}
+	computedLabels, err := parseComputedLabelsJSON(cfg.computedLabelsJSON)
+	if err != nil {
+		return proxy.Config{}, fmt.Errorf("parse computed labels: %w", err)
+	}
+	if err := validateLineField(cfg.lineField); err != nil {
+		return proxy.Config{}, err
+	}
 	ls, mfm, err := parseLabelModes(cfg.labelStyle, cfg.metadataFieldMode)
 	if err != nil {
 		return proxy.Config{}, err
@@ -2005,6 +2052,10 @@ func buildProxyConfig(cfg proxyRuntimeConfig) (proxy.Config, error) {
 		FieldMappings:                      fieldMappings,
 		StreamFields:                       parseCSV(cfg.streamFieldsCSV),
 		ExtraLabelFields:                   parseCSV(cfg.extraLabelFieldsCSV),
+		ComputedLabels:                     computedLabels,
+		DerivedLevelFields:                 parseCSV(cfg.derivedLevelFieldsCSV),
+		DerivedLevelGroupBy:                cfg.derivedLevelGroupBy,
+		LineField:                          strings.TrimSpace(cfg.lineField),
 		LabelValuesIndexedCache:            cfg.labelValuesIndexedCache,
 		LabelValuesHotLimit:                cfg.labelValuesHotLimit,
 		LabelValuesIndexMaxEntries:         cfg.labelValuesIndexMaxEntries,

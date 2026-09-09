@@ -175,6 +175,10 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 
 	exposureCache := make(map[string][]metadataFieldExposure, 16)
 	dropConditions, keepConditions, bareDropFields, bareKeepFields := extractDropKeepFromAST(originalQuery)
+	streamMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields, bareKeepFields}
+	// Constant for the whole response — parsing the query per entry would re-run a
+	// full LogQL parse for every streamed line.
+	skipLogLineReconstruction := hasTextExtractionParser(originalQuery)
 	smBuf2 := metadataMapPool.Get().(map[string]string)
 	pfBuf2 := metadataMapPool.Get().(map[string]string)
 	defer func() {
@@ -206,7 +210,7 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 		}
 		msg, _ := stringifyEntryValue(entry["_msg"])
 		streamLabels := parseStreamLabels(asString(entry["_stream"]))
-		msg = reconstructLogLine(msg, entry, streamLabels, originalQuery)
+		msg = reconstructLogLineWithFlag(msg, entry, streamLabels, p.lineFieldSkip(msg, skipLogLineReconstruction))
 
 		tsNanos, ok := formatEntryTimestamp(timeStr)
 		if !ok {
@@ -226,6 +230,11 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 		}
 		ensureDetectedLevel(translatedLabels)
 		ensureSyntheticServiceName(translatedLabels)
+		if len(p.labelPromotions) > 0 {
+			applyLabelPromotions(p.labelPromotions, translatedLabels, entryFieldGetter(streamLabels, entry))
+		}
+		p.applyDerivedLevel(translatedLabels, asString(entry["_msg"]))
+		p.mutatePromotedLabels(translatedLabels, streamMutations)
 		// Apply drop conditions to stream labels: Loki | drop field=value removes the
 		// field from the label set when the value matches, even for stream labels.
 		if len(dropConditions) > 0 {
@@ -533,12 +542,15 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 	streamLabelCache := make(map[string]map[string]string, 16)
 	exposureCache := make(map[string][]metadataFieldExposure, 16)
 	classifyAsParsed := hasParserStage(originalQuery, "json") || hasParserStage(originalQuery, "logfmt")
+	forceParsedFields := namedCaptureFields(originalQuery)
+	mergeParsedIntoLabels := classifyAsParsed || len(forceParsedFields) > 0
 	skipLogLineReconstruction := hasTextExtractionParser(originalQuery)
 	// classifyAsParsed is included so | json / | logfmt parsed fields are classified even
 	// without emitStructuredMetadata or categorizedLabels. Parsed fields are merged into the
 	// stream label set (matching Loki behaviour) so Grafana's unwrap field picker can see them.
-	needsClassification := emitStructuredMetadata || categorizedLabels || classifyAsParsed
+	needsClassification := emitStructuredMetadata || categorizedLabels || mergeParsedIntoLabels
 	dropConditions, keepConditions, bareDropFields2, bareKeepFields2 := extractDropKeepFromAST(originalQuery)
+	labelMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields2, bareKeepFields2}
 
 	var (
 		miner        *patternMiner
@@ -594,6 +606,10 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 			continue
 		}
 		msg := string(fjVal.GetStringBytes("_msg"))
+		// Level detection must read the ORIGINAL message: after reconstruction msg is
+		// the whole VL record as JSON, where a pod label containing "warn" would be
+		// mistaken for a level.
+		rawMsg := msg
 
 		// Pass raw bytes to avoid string allocation on descriptor cache hits.
 		// logQueryStreamDescriptorBytes uses m[string([]byte)] (zero-alloc lookup)
@@ -616,7 +632,7 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 			fjObj = obj
 		}
 
-		if !skipLogLineReconstruction {
+		if fjObj != nil && !p.lineFieldSkip(msg, skipLogLineReconstruction) {
 			msg = reconstructLogLineWithFlagFJ(msg, fjObj, desc.rawLabels, false)
 		}
 
@@ -627,7 +643,7 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 		// so skip the per-field visit entirely — buildStreamValue discards these maps anyway.
 		var structuredMetadata, parsedFields map[string]string
 		if needsClassification {
-			structuredMetadata, parsedFields = p.classifyEntryMetadataFieldsFJ(fjObj, desc.rawLabels, classifyAsParsed, exposureCache, smBuf, pfBuf)
+			structuredMetadata, parsedFields = p.classifyEntryMetadataFieldsFJ(fjObj, desc.rawLabels, classifyAsParsed, exposureCache, smBuf, pfBuf, forceParsedFields)
 			if len(dropConditions) > 0 {
 				applyDropConditions(dropConditions, structuredMetadata, parsedFields)
 			}
@@ -665,7 +681,7 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 		// Grafana's unwrap field picker (extractUnwrapLabelKeysFromDataFrame) can find
 		// numeric/duration/bytes fields. Without this, the proxy only returns _stream
 		// labels and the picker stays empty.
-		if classifyAsParsed && len(parsedFields) > 0 {
+		if mergeParsedIntoLabels && len(parsedFields) > 0 {
 			// Capacity hint uses only one operand to avoid CodeQL's integer-overflow
 			// warning on len(a)+len(b); the map grows automatically for parsedFields.
 			extLabels := make(map[string]string, len(streamLabels))
@@ -678,6 +694,10 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 			streamKey = canonicalLabelsKey(extLabels)
 			streamLabels = extLabels
 		}
+		// Lift mapped/computed labels into the stream label set and normalise the
+		// derived level, then re-key the stream so entries that differ only in a
+		// promoted label do not collapse into one series.
+		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, rawMsg, desc.rawLabels, fjVal, labelMutations)
 		se, ok := streamMap[streamKey]
 		if !ok {
 			se = &streamEntry{
@@ -882,7 +902,11 @@ func (p *Proxy) classifyEntryMetadataFields(entry map[string]interface{}, stream
 //
 // This matches Loki's behavior: Loki stores structured metadata separately and only
 // JSON/logfmt parser stages produce parsed fields, regardless of the query parser stage.
-func (p *Proxy) classifyEntryMetadataFieldsFJ(obj *fj.Object, streamLabels map[string]string, classifyAsParsed bool, exposureCache map[string][]metadataFieldExposure, smBuf, pfBuf map[string]string) (map[string]string, map[string]string) {
+func (p *Proxy) classifyEntryMetadataFieldsFJ(obj *fj.Object, streamLabels map[string]string, classifyAsParsed bool, exposureCache map[string][]metadataFieldExposure, smBuf, pfBuf map[string]string, forceParsed ...map[string]struct{}) (map[string]string, map[string]string) {
+	var forced map[string]struct{}
+	if len(forceParsed) > 0 {
+		forced = forceParsed[0]
+	}
 	for k := range smBuf {
 		delete(smBuf, k)
 	}
@@ -935,6 +959,13 @@ func (p *Proxy) classifyEntryMetadataFieldsFJ(obj *fj.Object, streamLabels map[s
 		if msgKeys != nil {
 			_, inMsg := msgKeys[f.key]
 			isParsed = inMsg
+		}
+		// A field named by a `| regexp` / `| pattern` capture group was produced by
+		// a query-time parser, not by the log body — the _msg key test above can
+		// never see it, so it would land in structured metadata and stay invisible
+		// to `sum by (<name>)`, `unwrap <name>` and `| label_format`.
+		if _, ok := forced[f.key]; ok {
+			isParsed = true
 		}
 		for _, exposure := range p.metadataFieldExposuresCached(f.key, exposureCache) {
 			if _, exists := streamLabels[exposure.name]; exists && !exposure.isAlias {

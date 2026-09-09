@@ -47,7 +47,11 @@ See [Translation Modes Guide](translation-modes.md) for mode-selection profiles 
 | `-patterns-persist-interval` | — | `30s` | Periodic flush interval for in-memory patterns snapshot |
 | `-patterns-startup-stale-threshold` | — | `60s` | Freshness threshold used by startup warm logic/peer snapshot cache |
 | `-patterns-startup-peer-warm-timeout` | — | `5s` | Startup timeout for peer warm merge of pattern snapshots |
-| `-field-mapping` | `FIELD_MAPPING` | — | JSON custom field mappings |
+| `-field-mapping` | `FIELD_MAPPING` | — | JSON custom field mappings. `vl_field` maps one VL field; `vl_fields` maps an ordered fallback chain |
+| `-computed-labels` | — | — | JSON Loki labels joined from other labels, e.g. `[{"loki_label":"job","join":["namespace","app"],"sep":"/"}]` |
+| `-derived-level-fields` | — | — | Comma-separated VL fields carrying a raw level inside `_msg` (e.g. `level,loglevel,severity`). Enables `level`/`detected_level` matchers and value normalisation |
+| `-derived-level-group-by` | — | `false` | Materialise `level` server-side (unpack + coalesce + normalise) so `sum by (level)` groups. Costs a full `_msg` unpack per matched entry |
+| `-line-field` | — | — | VL field returned as the Loki log line. Empty re-encodes the whole VL record as JSON; `_msg` returns the original message |
 | `-stream-fields` | — | — | Comma-separated `_stream_fields` labels used for stream selector optimization and label-surface hints |
 | `-extra-label-fields` | `EXTRA_LABEL_FIELDS` | — | Comma-separated additional VL fields to expose on label-facing APIs and alias resolution paths (for example `host.id,k8s.cluster.name`) |
 
@@ -64,6 +68,94 @@ See [Translation Modes Guide](translation-modes.md) for mode-selection profiles 
 ./loki-vl-proxy -label-style=underscores \
   -field-mapping='[{"vl_field":"my_trace_id","loki_label":"traceID"}]'
 ```
+
+#### Fallback Chains
+
+A Loki label may map to an **ordered list** of VL fields with `vl_fields`. Use it when a
+label was computed at ingest by coalescing several source fields and that ingest step is
+gone — for example `app` = pod label `app`, else pod label `app.kubernetes.io/name`.
+
+```bash
+./loki-vl-proxy -label-style=underscores -translate-otel-attributes=false \
+  -field-mapping='[
+    {"vl_fields":["kubernetes.pod_labels.app","kubernetes.pod_labels.app.kubernetes.io/name"],"loki_label":"app"},
+    {"vl_fields":["kubernetes.pod_labels.product","kubernetes.namespace_labels.product"],"loki_label":"product"}]'
+```
+
+Semantics:
+
+| Aspect | Behaviour |
+|---|---|
+| `{app="x"}`, `{app=~"x.*"}` | LogsQL **disjunction**: `("f1":="x" OR "f2":="x")` — matches when ANY field matches |
+| `{app!="x"}`, `{app!~"x.*"}` | LogsQL **conjunction of negations**: `(-"f1":="x" -"f2":="x")` — every field must fail to match |
+| `{app=""}` / `{app!=""}` | none of the fields is set / at least one is set |
+| `/loki/api/v1/label/app/values` | union of the values of every field in the chain |
+| Value in results | first **non-empty** field, in configured order |
+| Stream selector optimisation | disabled for chained labels — a native `{app="x"}` VL stream selector would match neither field |
+
+Dotted and slashed VL field names are quoted for LogsQL automatically
+(`"kubernetes.pod_labels.app.kubernetes.io/name"`).
+
+### Computed Labels
+
+`-computed-labels` synthesises a Loki label by joining others, reproducing what an ingest
+pipeline used to precompute:
+
+```bash
+-computed-labels='[{"loki_label":"job","join":["namespace","app"],"sep":"/"}]'
+```
+
+- `{job="ns/app"}` splits on the FIRST separator and becomes `namespace="ns"` AND `app="app"`
+  (each expanded through its own mapping, chains included).
+- `{job!="ns/app"}` becomes `-namespace:="ns" OR -app:="app"` (De Morgan).
+- `{job=~"..."}` returns **HTTP 400**: the joined value is not stored anywhere, so a regexp
+  over it cannot be split into per-label regexps without changing semantics. Match the
+  joined labels individually instead.
+- With more than two join labels the LAST component absorbs remaining separators
+  (`job="ns/team/app"` with `join:["namespace","app"]` → `namespace="ns"`, `app="team/app"`).
+- In results the label is the concatenation, present whenever every joined label is non-empty.
+- The label appears on `/loki/api/v1/labels`. `/loki/api/v1/label/job/values` returns nothing:
+  no VL field holds the joined value.
+
+### Derived Level
+
+With `-derived-level-fields` the proxy serves `level` / `detected_level` from the message
+body rather than from a stored VL field, and normalises values the way Loki's own ingest
+detection does: `information` → `info`, `warning` → `warn`, `err`/`fatal`/`critical` → `error`.
+When no structured level key is found it falls back to the first of `debug`/`warn`/`error`
+occurring in the line.
+
+```bash
+-derived-level-fields='level,loglevel,severity' -derived-level-group-by=true
+```
+
+- `{level="error"}` and `| level="error"` translate to
+  `| unpack_json | unpack_logfmt | filter (level:~"(?i)^(err|error|…)$" OR loglevel:~"…")`.
+- `-derived-level-group-by` additionally appends `| coalesce(<fields>) as level` plus
+  `| replace_regexp` normalisation to any query mentioning `level`, so `sum by (level)`
+  groups on canonical values.
+
+**Performance caveat**: both paths unpack `_msg` for every entry the base filters match.
+The stream selector still prunes first, but a level filter is never an index lookup. Keep the
+base selector narrow, and leave `-derived-level-group-by` off unless a dashboard needs
+`sum by (level)`.
+
+### Log Line Source
+
+By default the proxy re-encodes the whole VL record as a JSON object for the Loki `line`,
+because VL splits an ingested JSON log into top-level fields and keeps only the message text
+in `_msg`. When the record's non-`_msg` fields are ingest metadata rather than log content
+(Kubernetes pod labels, node name), that JSON is noise and breaks
+`| json | line_format "{{.message}}"`.
+
+```bash
+-line-field=_msg
+```
+
+returns `_msg` verbatim as the line. Records ingested without a `_msg` field — VL substitutes
+the `missing _msg field; see …` placeholder — fall back to the default JSON reconstruction of
+the remaining non-stream fields, so those entries stay readable. Only `""` (default) and
+`_msg` are accepted.
 
 ### Custom Drilldown Patterns
 
@@ -124,6 +216,8 @@ When to also use `-field-mapping`:
 
 - Use `-extra-label-fields` to extend discovery and alias resolution.
 - Use `-field-mapping` when you need a non-default alias name (for example `custom.pipeline.processing` &lt;-&gt; `pipeline_proc`).
+- Fields named by `-field-mapping` are added to the declared label surface automatically, so a
+  mapped label shows up on `/loki/api/v1/labels` even when its VL field is not a stream field.
 
 ### Indexed Label Values Browse Cache (Optional)
 

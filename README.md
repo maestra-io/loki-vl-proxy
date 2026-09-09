@@ -320,6 +320,8 @@ Loki-VL-proxy is validated continuously in CI against three separate tracks: Lok
 
 Default flags: `-label-style=underscores`, `-metadata-field-mode=translated`. Grafana query builder works best with underscore aliases; code mode accepts dotted expressions and translates them to VL-native field matching.
 
+**Reconstructing ingest-time labels:** when the pipeline that computed a Loki label is gone, the proxy can rebuild it at query time — `-field-mapping` accepts an ordered `vl_fields` fallback chain (`app` = pod label `app`, else `app.kubernetes.io/name`), `-computed-labels` joins labels (`job` = `<namespace>/<app>`), `-derived-level-fields` serves `level`/`detected_level` from the message body, and `-line-field=_msg` returns the original message as the log line instead of the whole VL record as JSON. See [Configuration](docs/configuration.md#custom-field-mappings).
+
 **Tuple safety:** Default responses return strict `[timestamp, line]` 2-tuples. 3-tuple metadata mode activates only when the client sends `X-Loki-Response-Encoding-Flags: categorize-labels`. Cache keys are segregated by tuple mode.
 
 ### LogQL Compatibility

@@ -425,6 +425,7 @@ func (p *Proxy) translateQueryWithContext(ctx context.Context, logql string) (st
 		p.configMu.RLock()
 		labelFn := p.labelTranslator.ToVL
 		streamFieldsMap := p.streamFieldsMap
+		mapping := p.buildMappingOptions(normalized)
 		p.configMu.RUnlock()
 
 		p.backendVersionMu.RLock()
@@ -432,7 +433,7 @@ func (p *Proxy) translateQueryWithContext(ctx context.Context, logql string) (st
 		p.backendVersionMu.RUnlock()
 		caps := logsql.CapabilitiesFor(semver)
 
-		translated, err := translator.TranslateLogQLWithCapabilities(normalized, labelFn, streamFieldsMap, caps)
+		translated, err := translator.TranslateLogQLWithMapping(normalized, labelFn, streamFieldsMap, caps, mapping)
 		if err != nil {
 			return translationResult{err: err}, nil
 		}
@@ -2495,4 +2496,46 @@ func writeTranslatedStatsItemsFJ(buf *bytes.Buffer, items []*fj.Value, changedMe
 		}
 	}
 	buf.WriteByte(']')
+}
+
+// levelReferenceRE matches a bare `level` / `detected_level` identifier anywhere
+// in a LogQL query (matcher, label filter, by-clause).
+var levelReferenceRE = regexp.MustCompile(`\b(?:detected_)?level\b`)
+
+// buildMappingOptions assembles the per-query translator mapping options from the
+// proxy configuration. Returns nil when no fork-specific mapping is configured,
+// which makes the translation byte-identical to upstream.
+//
+// Caller must hold p.configMu at least for reading.
+func (p *Proxy) buildMappingOptions(logql string) *translator.MappingOptions {
+	if p == nil {
+		return nil
+	}
+	lt := p.labelTranslator
+	hasChains := lt.HasFallbackChains()
+	if !hasChains && len(p.computedLabels) == 0 && len(p.derivedLevelFields) == 0 {
+		return nil
+	}
+	opts := &translator.MappingOptions{
+		DerivedLevelFields: p.derivedLevelFields,
+		MaterializeLevel:   p.derivedLevelGroupBy && levelReferenceRE.MatchString(logql),
+	}
+	if hasChains {
+		opts.Expand = func(lokiLabel string) []string {
+			chain := lt.ToVLFields(lokiLabel)
+			if len(chain) < 2 {
+				// Single-field mappings keep the upstream translation path.
+				return nil
+			}
+			return chain
+		}
+	}
+	for _, c := range p.computedLabels {
+		opts.Computed = append(opts.Computed, translator.ComputedLabel{
+			LokiLabel: c.LokiLabel,
+			Join:      c.Join,
+			Sep:       c.Sep,
+		})
+	}
+	return opts
 }
