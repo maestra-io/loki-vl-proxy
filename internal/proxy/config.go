@@ -35,6 +35,10 @@ type HandlerConfig struct {
 	metadataFieldMode                     MetadataFieldMode
 	streamFieldsMap                       map[string]bool
 	declaredLabelFields                   []string
+	computedLabels                        []ComputedLabel
+	derivedLevelFields                    []string
+	derivedLevelGroupBy                   bool
+	lineFieldMsg                          bool
 	registerInstrumentation               bool
 	enablePprof                           bool
 	enableQueryAnalytics                  bool

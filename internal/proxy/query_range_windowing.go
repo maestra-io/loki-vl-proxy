@@ -805,6 +805,7 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 
 	skipLogLineReconstruction := hasTextExtractionParser(originalQuery)
 	classifyAsParsed := hasParserStage(originalQuery, "json") || hasParserStage(originalQuery, "logfmt")
+	forceParsedFields := namedCaptureFields(originalQuery)
 	needsClassification := categorizedLabels && emitStructuredMetadata
 	dropConditions, keepConditions, bareDropFields, bareKeepFields := extractDropKeepFromAST(originalQuery)
 
@@ -864,13 +865,13 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 			fjObj = obj
 		}
 
-		if !skipLogLineReconstruction {
+		if fjObj != nil && !p.lineFieldSkip(msg, skipLogLineReconstruction) {
 			msg = reconstructLogLineWithFlagFJ(msg, fjObj, desc.rawLabels, false)
 		}
 
 		var sm, parsed map[string]string
 		if needsClassification {
-			structuredMetadata, parsedFields := p.classifyEntryMetadataFieldsFJ(fjObj, desc.rawLabels, classifyAsParsed, exposureCache, smBuf, pfBuf)
+			structuredMetadata, parsedFields := p.classifyEntryMetadataFieldsFJ(fjObj, desc.rawLabels, classifyAsParsed, exposureCache, smBuf, pfBuf, forceParsedFields)
 			sm = metadataFieldMap(structuredMetadata)
 			parsed = metadataFieldMap(parsedFields)
 			if len(dropConditions) > 0 {
@@ -884,6 +885,18 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 		streamKey, streamLabels := applyStreamLabelMutations(
 			desc, dropConditions, keepConditions, bareDropFields, bareKeepFields, p.labelTranslator,
 		)
+		if len(p.labelPromotions) > 0 || len(p.derivedLevelFields) > 0 {
+			extended := make(map[string]string, len(streamLabels)+len(p.labelPromotions)+1)
+			for k, v := range streamLabels {
+				extended[k] = v
+			}
+			applyLabelPromotions(p.labelPromotions, extended, fjFieldGetter(desc.rawLabels, fjVal))
+			p.applyDerivedLevel(extended, msg)
+			if !sameStringMap(extended, streamLabels) {
+				streamLabels = extended
+				streamKey = canonicalLabelsKey(extended)
+			}
+		}
 
 		entries = append(entries, queryRangeWindowEntry{
 			Stream: streamLabels,

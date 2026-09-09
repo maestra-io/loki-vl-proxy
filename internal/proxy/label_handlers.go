@@ -66,6 +66,7 @@ func (p *Proxy) handleLabels(w http.ResponseWriter, r *http.Request) {
 	// Apply label name translation (e.g., dots → underscores)
 	labels = p.labelTranslator.TranslateLabelsList(filtered)
 	labels = appendSyntheticLabels(labels)
+	labels = p.appendComputedLabelNames(labels)
 
 	result := lokiLabelsResponse(labels)
 	p.mergeLabelsIntoCache("labels", cacheKey, labels, labelsTTL)
@@ -676,4 +677,18 @@ func (p *Proxy) detectedLabelValuesForField(ctx context.Context, fieldName, quer
 	}
 	sort.Strings(values)
 	return values
+}
+
+// appendComputedLabelNames adds configured computed labels (e.g. job) to a label
+// name list. They have no VL field of their own, so backend discovery can never
+// return them.
+func (p *Proxy) appendComputedLabelNames(labels []string) []string {
+	if p == nil || len(p.computedLabels) == 0 {
+		return labels
+	}
+	for _, c := range p.computedLabels {
+		labels = appendUniqueString(labels, c.LokiLabel)
+	}
+	sort.Strings(labels)
+	return labels
 }

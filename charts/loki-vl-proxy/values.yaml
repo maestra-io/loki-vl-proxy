@@ -228,6 +228,16 @@ extraArgs:
   # label-style: "underscores"  # convert VL dotted fields (service.name) to Loki underscores (service_name)
   # translate-otel-attributes: "true"  # rewrite known OTel labels to dotted form in upstream queries (set "false" for underscore storage)
   # field-mapping: '[{"vl_field":"custom.field","loki_label":"custom_label"}]'
+  # field-mapping with an ordered fallback chain — the label matches when ANY field matches,
+  # and its value in results is the first non-empty field in order:
+  # field-mapping: '[{"vl_fields":["kubernetes.pod_labels.app","kubernetes.pod_labels.app.kubernetes.io/name"],"loki_label":"app"}]'
+  # Computed labels joined from other labels (matchers split on sep; = and != only)
+  # computed-labels: '[{"loki_label":"job","join":["namespace","app"],"sep":"/"}]'
+  # Derived level: VL fields carrying a raw level inside _msg; normalises information->info, warning->warn
+  # derived-level-fields: "level,loglevel,severity"
+  # derived-level-group-by: "true"   # materialise `level` server-side so `sum by (level)` groups (costs a full _msg unpack)
+  # Log line source: "" (default) re-encodes the whole VL record as JSON; "_msg" returns the original message
+  # line-field: "_msg"
   # Derived fields (trace linking)
   # derived-fields: '[{"name":"traceID","matcherRegex":"trace_id=([a-f0-9]+)","url":"http://tempo/trace/${__value.raw}"}]'
   # stream-response: "true"  # chunked transfer encoding for large results

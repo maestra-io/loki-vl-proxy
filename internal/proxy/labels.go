@@ -38,9 +38,54 @@ const (
 )
 
 // FieldMapping defines a custom field name mapping between VL and Loki.
+//
+// A Loki label may map to a single VL field (vl_field) or to an ORDERED
+// fallback chain (vl_fields). With a chain, the label matches when ANY field
+// matches, and its value in results is the first non-empty field in order —
+// which is how an ingest-time coalesce (app = pod label `app` else
+// `app.kubernetes.io/name`) is reproduced at query time.
 type FieldMapping struct {
-	VLField   string `json:"vl_field" yaml:"vl_field"`     // field name as stored in VictoriaLogs
-	LokiLabel string `json:"loki_label" yaml:"loki_label"` // label name exposed via Loki API
+	VLField   string   `json:"vl_field" yaml:"vl_field"`     // field name as stored in VictoriaLogs
+	VLFields  []string `json:"vl_fields" yaml:"vl_fields"`   // ordered fallback chain; takes precedence over vl_field
+	LokiLabel string   `json:"loki_label" yaml:"loki_label"` // label name exposed via Loki API
+}
+
+// Fields returns the ordered VL field chain for the mapping, collapsing the
+// single-field and chain forms.
+func (m FieldMapping) Fields() []string {
+	out := make([]string, 0, len(m.VLFields)+1)
+	for _, f := range m.VLFields {
+		if f = strings.TrimSpace(f); f != "" {
+			out = appendUniqueString(out, f)
+		}
+	}
+	if len(out) == 0 {
+		if f := strings.TrimSpace(m.VLField); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// ComputedLabel describes a Loki label built by joining other Loki labels,
+// e.g. job = "<namespace>/<app>".
+type ComputedLabel struct {
+	LokiLabel string   `json:"loki_label" yaml:"loki_label"`
+	Join      []string `json:"join" yaml:"join"`
+	Sep       string   `json:"sep" yaml:"sep"`
+}
+
+// Separator returns the join separator, defaulting to "/".
+func (c ComputedLabel) Separator() string {
+	if c.Sep == "" {
+		return "/"
+	}
+	return c.Sep
+}
+
+// Valid reports whether the spec is usable.
+func (c ComputedLabel) Valid() bool {
+	return strings.TrimSpace(c.LokiLabel) != "" && len(c.Join) >= 2
 }
 
 type metadataFieldExposure struct {
@@ -61,6 +106,13 @@ type LabelTranslator struct {
 
 	// learnedLokiToVL keeps runtime-learned underscore -> dotted mappings for
 	// custom attributes discovered from backend field inventory.
+	// fallbacks holds the ordered VL field chain for Loki labels configured with
+	// more than one source field. Labels with a single field are not listed here.
+	fallbacks map[string][]string
+	// mappedFields is the flattened, de-duplicated list of every VL field named
+	// by a custom mapping, in configuration order.
+	mappedFields []string
+
 	learnedMu        sync.RWMutex
 	learnedLokiToVL  map[string]string
 	learnedAmbiguous map[string]struct{}
@@ -80,15 +132,57 @@ func NewLabelTranslator(style LabelStyle, mappings []FieldMapping) *LabelTransla
 		translateOTel:    true,
 	}
 
-	// Register custom mappings (bidirectional)
+	// Register custom mappings (bidirectional). For a fallback chain every field
+	// maps forward to the same Loki label; the reverse mapping points at the
+	// first (primary) field so single-field call sites keep working.
 	for _, m := range mappings {
-		if m.VLField != "" && m.LokiLabel != "" {
-			lt.vlToLoki[m.VLField] = m.LokiLabel
-			lt.lokiToVL[m.LokiLabel] = m.VLField
+		fields := m.Fields()
+		if m.LokiLabel == "" || len(fields) == 0 {
+			continue
+		}
+		for _, f := range fields {
+			lt.vlToLoki[f] = m.LokiLabel
+			lt.mappedFields = appendUniqueString(lt.mappedFields, f)
+		}
+		lt.lokiToVL[m.LokiLabel] = fields[0]
+		if len(fields) > 1 {
+			if lt.fallbacks == nil {
+				lt.fallbacks = make(map[string][]string, 4)
+			}
+			lt.fallbacks[m.LokiLabel] = fields
 		}
 	}
 
 	return lt
+}
+
+// ToVLFields returns the ordered VL field chain backing a Loki label. It returns
+// nil when the label has no custom mapping, and a single-element slice when the
+// mapping names exactly one field.
+func (lt *LabelTranslator) ToVLFields(lokiLabel string) []string {
+	if lt == nil {
+		return nil
+	}
+	if chain, ok := lt.fallbacks[lokiLabel]; ok {
+		return chain
+	}
+	if mapped, ok := lt.lokiToVL[lokiLabel]; ok {
+		return []string{mapped}
+	}
+	return nil
+}
+
+// MappedVLFields returns every VL field named by a custom mapping.
+func (lt *LabelTranslator) MappedVLFields() []string {
+	if lt == nil {
+		return nil
+	}
+	return append([]string(nil), lt.mappedFields...)
+}
+
+// HasFallbackChains reports whether any label maps to more than one VL field.
+func (lt *LabelTranslator) HasFallbackChains() bool {
+	return lt != nil && len(lt.fallbacks) > 0
 }
 
 // ToLoki translates a VL field name to a Loki-compatible label name (response direction).
@@ -266,6 +360,9 @@ func (lt *LabelTranslator) ResolveLabelCandidates(lokiLabel string, available []
 		if lt == nil {
 			return fieldResolution{candidates: []string{label}}
 		}
+		if chain, ok := lt.fallbacks[label]; ok {
+			return fieldResolution{candidates: append([]string(nil), chain...)}
+		}
 		return fieldResolution{candidates: []string{lt.ToVL(label)}}
 	}
 
@@ -279,6 +376,14 @@ func (lt *LabelTranslator) ResolveLabelCandidates(lokiLabel string, available []
 	}
 
 	if lt != nil {
+		if chain, ok := lt.fallbacks[label]; ok {
+			for _, f := range chain {
+				addIfAvailable(f)
+			}
+			if len(candidates) > 0 {
+				return fieldResolution{candidates: candidates}
+			}
+		}
 		if mapped, ok := lt.lokiToVL[label]; ok && addIfAvailable(mapped) {
 			return fieldResolution{candidates: candidates}
 		}

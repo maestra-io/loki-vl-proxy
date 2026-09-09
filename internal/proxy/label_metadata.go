@@ -641,6 +641,18 @@ func (p *Proxy) fetchPreferredLabelValues(ctx context.Context, labelName string,
 			endpoint = "/select/logsql/field_values"
 			fieldValues, fieldErr = p.fetchVLFieldValues(ctx, endpoint, queryParams)
 		}
+		// stream_field_values only knows about fields in VL's stream index. A
+		// field-mapped label whose VL field is a plain column (kubernetes.pod_labels.app,
+		// kubernetes.namespace_labels.product) is NOT in that index, so VL answers
+		// 200 with an EMPTY list — indistinguishable from "this label has no values"
+		// and the reason /label/app/values came back empty while the data was there.
+		// Retry the same candidate through field_values, which reads the column index.
+		if fieldErr == nil && len(fieldValues) == 0 && endpoint == "/select/logsql/stream_field_values" {
+			fieldValues, fieldErr = p.fetchVLFieldValues(ctx, "/select/logsql/field_values", queryParams)
+			if fieldErr != nil && shouldFallbackToGenericMetadata(fieldErr) {
+				fieldValues, fieldErr = nil, nil
+			}
+		}
 		if fieldErr != nil {
 			return nil, fieldErr
 		}

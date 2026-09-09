@@ -234,6 +234,20 @@ type Config struct {
 	MetadataFieldMode MetadataFieldMode // how to expose non-label VL fields through field-oriented APIs
 	FieldMappings     []FieldMapping    // custom VL↔Loki field name mappings
 	TranslateOTel     *bool
+	// ComputedLabels are Loki labels synthesised by joining other labels
+	// (e.g. job = "<namespace>/<app>"). Empty disables the feature.
+	ComputedLabels []ComputedLabel
+	// DerivedLevelFields lists the VL fields that may carry a raw log level once
+	// _msg has been unpacked (e.g. level, loglevel, severity). Empty keeps the
+	// upstream behaviour where `level` is looked up as a stored VL field.
+	DerivedLevelFields []string
+	// DerivedLevelGroupBy appends the unpack + coalesce + normalise pipe chain to
+	// queries that reference level, so `sum by (level)` groups on VL's side.
+	DerivedLevelGroupBy bool
+	// LineField selects the VL field returned as the Loki log line. Empty keeps
+	// upstream behaviour (the whole VL record re-encoded as JSON). "_msg" returns
+	// the original message, falling back to the JSON form when _msg is absent.
+	LineField string
 
 	// Stream optimization
 	StreamFields []string // VL _stream_fields labels — use native stream selectors for these (faster)
@@ -474,6 +488,11 @@ type Proxy struct {
 	metadataFieldMode                     MetadataFieldMode
 	streamFieldsMap                       map[string]bool  // known _stream_fields for VL stream selector optimization
 	declaredLabelFields                   []string         // configured VL-native label fields (stream_fields + extras)
+	computedLabels                        []ComputedLabel  // Loki labels joined from other labels (e.g. job)
+	labelPromotions                       []labelPromotion // mapped/computed labels lifted into result stream labels
+	derivedLevelFields                    []string         // VL fields carrying a raw level inside _msg
+	derivedLevelGroupBy                   bool             // materialise `level` server-side for group-by
+	lineFieldMsg                          bool             // return _msg as the Loki log line
 	peerCache                             *cache.PeerCache // L3 fleet peer cache
 	peerAuthToken                         string
 	peerInsecureIPAllowlist               bool // gate the legacy IP-allowlist fallback (default false: token required)
@@ -1021,6 +1040,10 @@ func New(cfg Config) (*Proxy, error) {
 		labelTranslator.SetTranslateOTel(*cfg.TranslateOTel)
 	}
 	declaredLabelFields := buildDeclaredLabelFields(cfg.StreamFields, cfg.ExtraLabelFields, labelTranslator)
+	// Custom-mapped VL fields are label surface by definition: without them the
+	// /labels response omits every mapped label whose VL field is not a stream
+	// field, and label-value candidate resolution has nothing to resolve against.
+	declaredLabelFields = appendUniqueStrings(declaredLabelFields, labelTranslator.MappedVLFields()...)
 	patternsEnabled := true
 	if cfg.PatternsEnabled != nil {
 		patternsEnabled = *cfg.PatternsEnabled
@@ -1095,6 +1118,11 @@ func New(cfg Config) (*Proxy, error) {
 		metadataFieldMode:                     metadataFieldMode,
 		streamFieldsMap:                       buildStreamFieldsMap(cfg.StreamFields),
 		declaredLabelFields:                   declaredLabelFields,
+		computedLabels:                        validComputedLabels(cfg.ComputedLabels),
+		labelPromotions:                       buildLabelPromotions(labelTranslator, validComputedLabels(cfg.ComputedLabels)),
+		derivedLevelFields:                    normalizeDerivedLevelFields(cfg.DerivedLevelFields),
+		derivedLevelGroupBy:                   cfg.DerivedLevelGroupBy,
+		lineFieldMsg:                          strings.TrimSpace(cfg.LineField) == "_msg",
 		peerCache:                             cfg.PeerCache,
 		peerAuthToken:                         cfg.PeerAuthToken,
 		peerInsecureIPAllowlist:               cfg.PeerInsecureIPAllowlist,
@@ -1233,6 +1261,10 @@ func New(cfg Config) (*Proxy, error) {
 			metadataFieldMode:                     p.metadataFieldMode,
 			streamFieldsMap:                       p.streamFieldsMap,
 			declaredLabelFields:                   p.declaredLabelFields,
+			computedLabels:                        p.computedLabels,
+			derivedLevelFields:                    p.derivedLevelFields,
+			derivedLevelGroupBy:                   p.derivedLevelGroupBy,
+			lineFieldMsg:                          p.lineFieldMsg,
 			registerInstrumentation:               p.registerInstrumentation,
 			enablePprof:                           p.enablePprof,
 			enableQueryAnalytics:                  p.enableQueryAnalytics,
@@ -1423,6 +1455,34 @@ func ensureWritableSnapshotPath(path string) error {
 	return f.Close()
 }
 
+// validComputedLabels drops malformed computed-label specs.
+func validComputedLabels(in []ComputedLabel) []ComputedLabel {
+	out := make([]ComputedLabel, 0, len(in))
+	for _, c := range in {
+		if c.Valid() {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normalizeDerivedLevelFields trims and de-duplicates the raw level field list.
+func normalizeDerivedLevelFields(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, f := range in {
+		if f = strings.TrimSpace(f); f != "" {
+			out = appendUniqueString(out, f)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func buildDeclaredLabelFields(streamFields, extraLabelFields []string, lt *LabelTranslator) []string {
 	if len(streamFields) == 0 && len(extraLabelFields) == 0 {
 		return nil
@@ -1553,6 +1613,8 @@ func (p *Proxy) ReloadFieldMappings(mappings []FieldMapping) {
 	prevTranslateOTel := p.labelTranslator.translateOTel
 	p.labelTranslator = NewLabelTranslator(p.labelTranslator.style, mappings)
 	p.labelTranslator.SetTranslateOTel(prevTranslateOTel)
+	p.labelPromotions = buildLabelPromotions(p.labelTranslator, p.computedLabels)
+	p.declaredLabelFields = appendUniqueStrings(p.declaredLabelFields, p.labelTranslator.MappedVLFields()...)
 	if p.translationCache != nil {
 		p.translationCache.InvalidatePrefix("")
 	}
