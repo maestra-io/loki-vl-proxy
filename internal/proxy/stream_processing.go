@@ -175,6 +175,9 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 
 	exposureCache := make(map[string][]metadataFieldExposure, 16)
 	dropConditions, keepConditions, bareDropFields, bareKeepFields := extractDropKeepFromAST(originalQuery)
+	// Constant for the whole response — parsing the query per entry would re-run a
+	// full LogQL parse for every streamed line.
+	skipLogLineReconstruction := hasTextExtractionParser(originalQuery)
 	smBuf2 := metadataMapPool.Get().(map[string]string)
 	pfBuf2 := metadataMapPool.Get().(map[string]string)
 	defer func() {
@@ -206,7 +209,7 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 		}
 		msg, _ := stringifyEntryValue(entry["_msg"])
 		streamLabels := parseStreamLabels(asString(entry["_stream"]))
-		msg = reconstructLogLineWithFlag(msg, entry, streamLabels, p.lineFieldSkip(msg, hasTextExtractionParser(originalQuery)))
+		msg = reconstructLogLineWithFlag(msg, entry, streamLabels, p.lineFieldSkip(msg, skipLogLineReconstruction))
 
 		tsNanos, ok := formatEntryTimestamp(timeStr)
 		if !ok {

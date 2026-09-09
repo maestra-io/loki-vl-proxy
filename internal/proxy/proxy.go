@@ -487,7 +487,8 @@ type Proxy struct {
 	labelTranslator                       *LabelTranslator
 	metadataFieldMode                     MetadataFieldMode
 	streamFieldsMap                       map[string]bool  // known _stream_fields for VL stream selector optimization
-	declaredLabelFields                   []string         // configured VL-native label fields (stream_fields + extras)
+	declaredLabelFields                   []string         // configured VL-native label fields (stream_fields + extras + mapped)
+	baseDeclaredLabelFields               []string         // stream_fields + extras only — the reload rebuild base
 	computedLabels                        []ComputedLabel  // Loki labels joined from other labels (e.g. job)
 	labelPromotions                       []labelPromotion // mapped/computed labels lifted into result stream labels
 	derivedLevelFields                    []string         // VL fields carrying a raw level inside _msg
@@ -1039,11 +1040,11 @@ func New(cfg Config) (*Proxy, error) {
 	if cfg.TranslateOTel != nil {
 		labelTranslator.SetTranslateOTel(*cfg.TranslateOTel)
 	}
-	declaredLabelFields := buildDeclaredLabelFields(cfg.StreamFields, cfg.ExtraLabelFields, labelTranslator)
+	baseDeclaredLabelFields := buildDeclaredLabelFields(cfg.StreamFields, cfg.ExtraLabelFields, labelTranslator)
 	// Custom-mapped VL fields are label surface by definition: without them the
 	// /labels response omits every mapped label whose VL field is not a stream
 	// field, and label-value candidate resolution has nothing to resolve against.
-	declaredLabelFields = appendUniqueStrings(declaredLabelFields, labelTranslator.MappedVLFields()...)
+	declaredLabelFields := appendUniqueStrings(append([]string(nil), baseDeclaredLabelFields...), labelTranslator.MappedVLFields()...)
 	patternsEnabled := true
 	if cfg.PatternsEnabled != nil {
 		patternsEnabled = *cfg.PatternsEnabled
@@ -1118,6 +1119,7 @@ func New(cfg Config) (*Proxy, error) {
 		metadataFieldMode:                     metadataFieldMode,
 		streamFieldsMap:                       buildStreamFieldsMap(cfg.StreamFields),
 		declaredLabelFields:                   declaredLabelFields,
+		baseDeclaredLabelFields:               baseDeclaredLabelFields,
 		computedLabels:                        validComputedLabels(cfg.ComputedLabels),
 		labelPromotions:                       buildLabelPromotions(labelTranslator, validComputedLabels(cfg.ComputedLabels)),
 		derivedLevelFields:                    normalizeDerivedLevelFields(cfg.DerivedLevelFields),
@@ -1614,7 +1616,9 @@ func (p *Proxy) ReloadFieldMappings(mappings []FieldMapping) {
 	p.labelTranslator = NewLabelTranslator(p.labelTranslator.style, mappings)
 	p.labelTranslator.SetTranslateOTel(prevTranslateOTel)
 	p.labelPromotions = buildLabelPromotions(p.labelTranslator, p.computedLabels)
-	p.declaredLabelFields = appendUniqueStrings(p.declaredLabelFields, p.labelTranslator.MappedVLFields()...)
+	// Rebuild from the base: appending would keep the fields of every mapping ever
+	// loaded, so a removed mapping would linger on /labels until restart.
+	p.declaredLabelFields = appendUniqueStrings(append([]string(nil), p.baseDeclaredLabelFields...), p.labelTranslator.MappedVLFields()...)
 	if p.translationCache != nil {
 		p.translationCache.InvalidatePrefix("")
 	}

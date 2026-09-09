@@ -146,7 +146,17 @@ func fjFieldGetter(rawLabels map[string]string, val *fj.Value) func(string) stri
 		if val == nil {
 			return ""
 		}
-		return string(val.GetStringBytes(field))
+		// GetStringBytes returns nil for a non-string JSON value, which would drop a
+		// numeric or boolean mapped field and desync this path from streamLogQuery.
+		v := val.Get(field)
+		if v == nil {
+			return ""
+		}
+		s, ok := stringifyFJValue(v)
+		if !ok {
+			return ""
+		}
+		return s
 	}
 }
 

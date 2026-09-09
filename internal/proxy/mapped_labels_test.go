@@ -317,3 +317,37 @@ func TestBuildMappingOptions(t *testing.T) {
 		t.Fatal("query without a level reference must not materialise level")
 	}
 }
+
+func TestReloadFieldMappingsShrinksDeclaredSurface(t *testing.T) {
+	base := []string{"kubernetes.pod_namespace"}
+	lt := NewLabelTranslator(LabelStyleUnderscores, omicronMappings)
+	p := &Proxy{
+		labelTranslator:         lt,
+		baseDeclaredLabelFields: base,
+		declaredLabelFields:     appendUniqueStrings(append([]string(nil), base...), lt.MappedVLFields()...),
+	}
+	if len(p.declaredLabelFields) != 5 {
+		t.Fatalf("initial declared fields = %v", p.declaredLabelFields)
+	}
+
+	// SIGHUP with a smaller mapping set must DROP the fields of the removed
+	// mappings; appending would keep them on /labels until restart.
+	p.ReloadFieldMappings([]FieldMapping{{VLField: "kubernetes.pod_namespace", LokiLabel: "namespace"}})
+
+	want := []string{"kubernetes.pod_namespace"}
+	if !reflect.DeepEqual(p.declaredLabelFields, want) {
+		t.Fatalf("declared fields after reload = %v, want %v", p.declaredLabelFields, want)
+	}
+	if p.labelTranslator.HasFallbackChains() {
+		t.Fatal("fallback chains survived a reload that removed them")
+	}
+	if len(p.labelPromotions) != 1 || p.labelPromotions[0].label != "namespace" {
+		t.Fatalf("promotions after reload = %+v", p.labelPromotions)
+	}
+
+	// Reloading a larger set grows it back.
+	p.ReloadFieldMappings(omicronMappings)
+	if len(p.declaredLabelFields) != 5 {
+		t.Fatalf("declared fields after re-adding = %v", p.declaredLabelFields)
+	}
+}

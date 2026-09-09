@@ -228,14 +228,15 @@ func levelUnpackPipes() []string {
 	}
 }
 
-// levelMaterializePipes returns the pipe chain that turns the raw level fields
+// levelNormalizePipes returns the pipe chain that turns the raw level fields
 // into a single normalised `level` field so `sum by (level)` groups the way the
-// read path labels entries.
-func (m *MappingOptions) levelMaterializePipes() []string {
+// read path labels entries. It does NOT include the unpack pipes — the caller
+// adds only the ones the query does not already have.
+func (m *MappingOptions) levelNormalizePipes() []string {
 	if !m.derivesLevel() || !m.MaterializeLevel {
 		return nil
 	}
-	pipes := levelUnpackPipes()
+	var pipes []string
 	if len(m.DerivedLevelFields) > 1 || m.DerivedLevelFields[0] != "level" {
 		fields := make([]string, len(m.DerivedLevelFields))
 		for i, f := range m.DerivedLevelFields {
@@ -311,6 +312,13 @@ func computedMatcherToFieldFilter(matcher string, labelFn LabelTranslateFunc, ma
 	}
 	negate := opStr == "!="
 	values := splitComputedValue(value, spec)
+	if len(values) != len(spec.Join) {
+		// Emitting only the leading matchers would MATCH MORE than asked
+		// ({job="ns"} would return every app in ns), while Loki returns nothing.
+		return true, "", &ParseError{Msg: fmt.Sprintf(
+			"computed label %q expects %d components separated by %q (joined from %s), got %q",
+			label, len(spec.Join), spec.Separator(), strings.Join(spec.Join, "+"), value), Pos: -1}
+	}
 	parts := make([]string, 0, len(spec.Join))
 	for i, joined := range spec.Join {
 		if i >= len(values) {
@@ -368,4 +376,15 @@ func stageIsDerivedLevelFilter(stage string, mapping *MappingOptions) bool {
 		}
 	}
 	return false
+}
+
+// unpackPipeName returns the bare pipe name of an unpack pipe string, so a query
+// that already carries `| unpack_json` is recognised as having it even though
+// levelUnpackPipes emits the explicit `| unpack_json from _msg` form.
+func unpackPipeName(pipe string) string {
+	name := strings.TrimPrefix(strings.TrimSpace(pipe), "| ")
+	if idx := strings.Index(name, " "); idx > 0 {
+		name = name[:idx]
+	}
+	return name
 }

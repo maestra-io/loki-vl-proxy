@@ -187,6 +187,13 @@ func TestComputedLabelSelectors(t *testing.T) {
 			logql:   `{job=~"trow-system/.*"}`,
 			wantErr: `computed label "job" supports only = and !=`,
 		},
+		{
+			// Emitting only namespace:="trow-system" would match EVERY app in the
+			// namespace, while Loki matches nothing for this selector.
+			name:    "too few components is rejected, never widened",
+			logql:   `{job="trow-system"}`,
+			wantErr: `computed label "job" expects 2 components separated by "/"`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -305,13 +312,26 @@ func TestDerivedLevelMaterialization(t *testing.T) {
 			t.Fatalf("got %s\nmissing %q", got, part)
 		}
 	}
-	// A query that already unpacks must not be unpacked twice.
-	got2, err := TranslateLogQLWithMapping(`{namespace="ns"} | json`, nil, nil, logsql.Capabilities{}, levelMapping(true))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if strings.Count(got2, "unpack_json") != 1 {
-		t.Fatalf("expected a single unpack_json, got %s", got2)
+	// A query that already unpacks must not be unpacked twice — but it must still
+	// get the coalesce/normalise chain, or `sum by (level)` over a parser query
+	// silently groups on the raw stored field.
+	for _, q := range []string{
+		`{namespace="ns"} | json`,
+		`sum by (level) (count_over_time({namespace="ns"} | json [5m]))`,
+	} {
+		got2, err := TranslateLogQLWithMapping(q, nil, nil, logsql.Capabilities{}, levelMapping(true))
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", q, err)
+		}
+		if strings.Count(got2, "unpack_json") != 1 {
+			t.Fatalf("%s: expected a single unpack_json, got %s", q, got2)
+		}
+		if !strings.Contains(got2, "| coalesce(level, loglevel) as level") {
+			t.Fatalf("%s: missing the coalesce pipe: %s", q, got2)
+		}
+		if !strings.Contains(got2, "| replace_regexp (level,") {
+			t.Fatalf("%s: missing the normalisation pipes: %s", q, got2)
+		}
 	}
 }
 
