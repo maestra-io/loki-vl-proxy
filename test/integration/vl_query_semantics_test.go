@@ -812,39 +812,55 @@ func testInstantGrouping(t *testing.T, p *proxyProc, ns, slowNS string, now time
 	})
 }
 
-// testCountValues asserts count_values() is served instead of rejected, with
-// Prometheus/Loki semantics: one series per distinct SAMPLE VALUE of the inner
-// query, labelled with the requested name, valued by how many input series
-// carried it.
+// testCountValues asserts count_values() is REJECTED with 400, matching Loki.
+//
+// count_values is a PromQL operator, not a LogQL one: real Loki (3.7.1) answers
+// `parse error at line 1, col 1: syntax error: unexpected IDENTIFIER` for it.
+// An earlier revision of this branch implemented it as a post-aggregation; the
+// e2e error-parity suite caught that as a SILENT FAIL, because returning data
+// for a query the reference implementation rejects is a worse compatibility bug
+// than the missing feature. To count entries grouped by a log field, the LogQL
+// spelling is `sum by (<field>) (count_over_time(...))`, which is supported.
 func testCountValues(t *testing.T, p *proxyProc, ns, tieNS string, now time.Time) {
 	sel := fmt.Sprintf(`{namespace=%q}`, ns)
-	// The two together give apps svc-a=9, svc-b=6, svc-d=9 — a tie at 9.
-	bothNS := fmt.Sprintf(`{namespace=~"%s|%s"}`, ns, tieNS)
 
-	// Inner query: sum by (level) -> error=5, warn=3, info=7. All distinct, so
-	// every bucket counts exactly one series.
-	inner := `sum by (level) (count_over_time(` + sel + `[1h]))`
-	wantDistinct := map[string]string{"{c=5}": "1", "{c=3}": "1", "{c=7}": "1"}
+	queries := []string{
+		`count_values("c", sum by (level) (count_over_time(` + sel + `[1h])))`,
+		`count_values("c", count_over_time(` + sel + `[1h]))`,
+	}
 
-	t.Run("instant", func(t *testing.T) {
-		assertVectorEquals(t, queryInstant(t, p, `count_values("c", `+inner+`)`, now), wantDistinct)
-	})
+	for _, q := range queries {
+		t.Run("rejected: "+q, func(t *testing.T) {
+			params := url.Values{}
+			params.Set("query", q)
+			params.Set("time", strconv.FormatInt(now.Unix(), 10))
 
-	t.Run("range", func(t *testing.T) {
-		resp := queryRange(t, p, `count_values("c", `+inner+`)`, now.Add(-time.Hour), now, time.Hour)
-		if resp.Data.ResultType != "matrix" {
-			t.Fatalf("resultType = %q, want matrix", resp.Data.ResultType)
-		}
-		assertVectorEquals(t, resp, wantDistinct)
-	})
+			resp, err := http.PostForm("http://"+p.listenAddr+"/loki/api/v1/query", params)
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
 
-	t.Run("tied values collapse into one bucket", func(t *testing.T) {
-		// svc-a=9 and svc-d=9 tie, svc-b=6 does not. This is the case that
-		// separates count_values from "group by a field": three input series
-		// must produce TWO buckets, one of them worth 2.
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("expected HTTP 400 (Loki parity), got %d: %s", resp.StatusCode, body)
+			}
+			if !strings.Contains(string(body), "count_values") {
+				t.Errorf("error body should name the operator, got: %s", body)
+			}
+		})
+	}
+
+	// The supported spelling must still work, so the rejection above is a
+	// statement about count_values and not about grouping in general.
+	t.Run("supported alternative groups by the field", func(t *testing.T) {
 		assertVectorEquals(t,
-			queryInstant(t, p, `count_values("n", sum by (app) (count_over_time(`+bothNS+`[1h])))`, now),
-			map[string]string{"{n=9}": "2", "{n=6}": "1"})
+			queryInstant(t, p, `sum by (level) (count_over_time(`+sel+`[1h]))`, now),
+			map[string]string{
+				"{level=error}": "5",
+				"{level=warn}":  "3",
+				"{level=info}":  "7",
+			})
 	})
 }
 

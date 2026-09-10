@@ -488,9 +488,13 @@ func translateLogQLFull(logql string, labelFn LabelTranslateFunc, streamFields m
 	// returns 1/0 for comparisons, so "bool" is a no-op — just strip it.
 	logql = boolModifierRE.ReplaceAllString(logql, " ")
 
-	// count_values groups by the VALUES of the inner metric — VL cannot compute this.
+	// count_values is PromQL, not LogQL: Loki itself answers `parse error at
+	// line 1, col 1: syntax error: unexpected IDENTIFIER` (verified against
+	// grafana/loki 3.7.1). Accepting it here would make the proxy return data
+	// for a query the reference implementation rejects — a silent divergence,
+	// which the e2e error-parity suite treats as a failure. Keep the 400.
 	if outerAgg, _, _ := extractOuterAggregation(logql); outerAgg == "count_values" {
-		return "", &UnsupportedError{Msg: "count_values is not translatable to LogsQL", Func: "count_values"}
+		return "", &UnsupportedError{Msg: `count_values is not a LogQL aggregation operator; to count entries grouped by a field use sum by (<field>) (count_over_time(...))`, Func: "count_values"}
 	}
 
 	// Check binary metric expressions FIRST — they may contain metric sub-expressions.

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`count_values()` stays rejected with 400 — it is not a LogQL operator.** An
+  earlier revision of this branch implemented it as a post-aggregation; real
+  Loki 3.7.1 answers `parse error at line 1, col 1: syntax error: unexpected
+  IDENTIFIER` for `count_values("app", count_over_time({app="x"}[5m]))`, so
+  serving it made the proxy return data for a query the reference implementation
+  rejects. The e2e error-parity suite classes that as a SILENT FAIL, and it is
+  the worse compatibility bug. The 400 message now names the LogQL spelling that
+  does work: `sum by (<field>) (count_over_time(...))`.
+
 - **`=~` / `!~` label matchers reached VictoriaLogs UNANCHORED.** Loki anchors a
   label-matcher regexp to the whole label value, so `{namespace=~"nch"}` matches
   only the exact value `nch`. VL's `field:~"re"` is a substring match, so the
@@ -65,19 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`count_values("<label>", <inner>)` is now served instead of rejected with
-  400 `count_values is not translatable to LogsQL`.** It runs as a
-  post-aggregation — the inner query executes, then the proxy buckets the
-  RESULT SERIES by their sample value — the same execute-inner-then-aggregate
-  shape already used for `stddev`/`stdvar`. Output follows Prometheus/Loki
-  semantics: one series per distinct sample value, labelled
-  `{<label>="<value>"}`, valued by how many input series carried that value;
-  input labels are dropped. Instant and range both supported.
-
-  Note this is NOT `| stats by (<field>) count()`: that groups by a log FIELD's
-  values and is spelled `sum by (<field>) (count_over_time(...))` in LogQL.
-  `count_values` groups by the inner expression's computed VALUES, which no
-  LogsQL construct can express — hence the client-side bucketing.
 - **`-field-mapping` fallback chains.** A `loki_label` may map to an ordered
   `vl_fields` list instead of a single `vl_field`. Positive matchers become a
   LogsQL disjunction, negative matchers a conjunction of negations, label values
