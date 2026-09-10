@@ -41,7 +41,7 @@ jobs:
     env:
       DOCKER_BUILDKIT: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # No git operations downstream — don't leave a `GITHUB_TOKEN`
           # in `.git/config` for the rest of the job to find.
@@ -58,7 +58,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Cache Teleport binaries
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ runner.tool_cache }}/teleport
           key: teleport-${{ steps.tp-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}
