@@ -31,7 +31,22 @@ updates:
       - dependencies
       - go
 
-  # Keep the builder base image up to date.
+  # bench/ is its own module (stdlib-only today, so this usually stays quiet).
+  - package-ecosystem: gomod
+    directory: /bench
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      go-minor:
+        update-types: ["minor", "patch"]
+    labels:
+      - dependencies
+      - go
+
+  # Keep the Dockerfile's builder and runtime base images up to date.
   - package-ecosystem: docker
     directory: /
     schedule:
@@ -39,6 +54,9 @@ updates:
       day: monday
     cooldown:
       default-days: 7
+    groups:
+      docker-images:
+        patterns: ["*"]
     labels:
       - dependencies
       - docker

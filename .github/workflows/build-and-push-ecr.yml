@@ -33,7 +33,7 @@ env:
   # <upstream tag without the v>-maestra.<fork revision>. Bump the left half on
   # every rebase onto a new upstream tag, the right half on every fork-only
   # change. Quoted: an unquoted version scalar is a YAML float trap.
-  IMAGE_VERSION: "1.63.1-maestra.4"
+  IMAGE_VERSION: "1.63.1-maestra.5"
 
 jobs:
   build-and-push:
@@ -41,7 +41,7 @@ jobs:
     env:
       DOCKER_BUILDKIT: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # No git operations downstream — don't leave a `GITHUB_TOKEN`
           # in `.git/config` for the rest of the job to find.
@@ -58,7 +58,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Cache Teleport binaries
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ runner.tool_cache }}/teleport
           key: teleport-${{ steps.tp-version.outputs.version }}-${{ runner.os }}-${{ runner.arch }}

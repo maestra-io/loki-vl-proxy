@@ -163,6 +163,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   All `-fuzz` patterns are now anchored (`^...$`), and the previously-uncovered
   window-entries target is now fuzzed too.
 
+### Changed
+
+- **Maintenance sweep to current versions.** Go modules (`go get -u ./...` +
+  `go mod tidy`): klauspost/compress 1.19.0 → 1.20.0, golang.org/x/sync 0.22.0
+  → 0.23.0, golang.org/x/sys 0.45.0 → 0.48.0. No major-version jumps, no
+  replace directives; `bench/` is stdlib-only and produced no diff.
+- **Runtime base image `gcr.io/distroless/static-debian12:nonroot` →
+  `static-debian13:nonroot`.** `distroless/static:nonroot` resolves to the same
+  digest as debian13, which is upstream's current line (debian12 is the trailing
+  one), and the debian13 index also ships riscv64. The binary is
+  `CGO_ENABLED=0` static, so nothing in the image links against the distro.
+  Builder stays `golang:1.27.1-alpine3.24`: alpine3.24 is the newest alpine
+  variant for any golang 1.27.x tag.
+- **CI pins to latest**: `docker/setup-buildx-action` v4.2.0 → v4.3.0,
+  govulncheck v1.1.4 → v1.8.0, golangci-lint v2.11.4 → v2.13.2, and in the
+  tag-pinned ECR workflow `actions/checkout` v4 → v7 and `actions/cache` v5 →
+  v6. Every other `uses:` was already at its latest release.
+- **Dependabot covers `bench/`** (a second go module, previously unwatched) and
+  groups docker updates so the Dockerfile's two base images arrive in one PR.
+  Dependabot alerts and security updates — disabled by default on a fork, so
+  the inherited config was producing nothing — are now enabled on the repo.
+
 ## [1.63.0] - 2026-07-22
 
 ### Fixed
