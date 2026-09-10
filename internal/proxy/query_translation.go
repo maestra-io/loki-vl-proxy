@@ -2280,6 +2280,11 @@ func (p *Proxy) translateStatsResponseLabelsWithContext(ctx context.Context, bod
 		return body
 	}
 
+	// Did the client group by the raw `level` label rather than by
+	// `detected_level`? Both translate to VL's `level` column, so the response
+	// alone cannot tell them apart — the original query can.
+	wantsRawLevelLabel := groupsByRawLevelLabel(originalQuery)
+
 	// Reuse maps across iterations (same pattern as original).
 	translated := make(map[string]string, 8)
 	syntheticLabels := make(map[string]string, 8)
@@ -2358,9 +2363,18 @@ func (p *Proxy) translateStatsResponseLabelsWithContext(ctx context.Context, bod
 			// translates to VL's "sum by (level)" and back. In that case level must be
 			// replaced by detected_level. When _stream IS present, level is a genuine
 			// stream label that Loki also returns alongside detected_level — keep both.
-			if hadLevel && !hadStream && syntheticLabels["detected_level"] != "" {
+			//
+			// Which of the two the client asked for is knowable — it is in the
+			// original LogQL — so ask, instead of assuming detected_level. A
+			// `sum by (level)` that reaches this path (VL groups by `level`
+			// either way) must come back as `level`, not renamed.
+			if hadLevel && !hadStream && syntheticLabels["detected_level"] != "" && !wantsRawLevelLabel {
 				delete(syntheticLabels, "level")
 				delete(translated, "level")
+			}
+			if wantsRawLevelLabel && syntheticLabels["level"] != "" {
+				delete(syntheticLabels, "detected_level")
+				delete(translated, "detected_level")
 			}
 			// A level grouping dimension VL could not fill comes back as "".
 			// Loki emits no label at all in that case.
@@ -2590,6 +2604,41 @@ func stripQuotedSpans(s string) string {
 	return string(out)
 }
 
+// groupsByRawLevelLabel reports whether the query's grouping names `level`
+// itself rather than the synthetic `detected_level`. Loki returns exactly the
+// label the client asked for; VL groups by its `level` column for both, so the
+// distinction has to come from the query text.
+func groupsByRawLevelLabel(logql string) bool {
+	for _, label := range logqlGroupingLabels(logql) {
+		if label == "level" {
+			return true
+		}
+	}
+	return false
+}
+
+// logqlGroupingLabels returns the labels named in the query's by()/without()
+// clauses. Quoted spans are blanked first so a line filter containing the same
+// characters is not read as a grouping clause.
+func logqlGroupingLabels(logql string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, m := range levelGroupingRE.FindAllStringSubmatch(stripQuotedSpans(logql), -1) {
+		for _, label := range strings.Split(m[len(m)-1], ",") {
+			label = strings.TrimSpace(label)
+			if label == "" {
+				continue
+			}
+			if _, dup := seen[label]; dup {
+				continue
+			}
+			seen[label] = struct{}{}
+			out = append(out, label)
+		}
+	}
+	return out
+}
+
 // logqlGroupsByLevel reports whether the query aggregates by the level label.
 func logqlGroupsByLevel(logql string) bool {
 	if expr, err := logqlpkg.Parse(logql); err == nil && expr != nil {
@@ -2615,6 +2664,16 @@ func (p *Proxy) buildMappingOptions(logql string) *translator.MappingOptions {
 	opts := &translator.MappingOptions{
 		DerivedLevelFields: p.derivedLevelFields,
 		MaterializeLevel:   p.derivedLevelGroupBy && logqlGroupsByLevel(logql),
+	}
+	// A grouping by a fallback-chain label needs the chain coalesced into a real
+	// field first — VL cannot group by a Loki label that is backed by several
+	// VL fields, and silently returns an empty value instead.
+	if hasChains {
+		for _, label := range logqlGroupingLabels(logql) {
+			if len(lt.ToVLFields(label)) > 1 {
+				opts.MaterializeChainLabels = append(opts.MaterializeChainLabels, label)
+			}
+		}
 	}
 	if hasChains {
 		opts.Expand = func(lokiLabel string) []string {

@@ -457,6 +457,13 @@ func TranslateLogQLWithMapping(logql string, labelFn LabelTranslateFunc, streamF
 }
 
 func translateLogQLFull(logql string, labelFn LabelTranslateFunc, streamFields map[string]bool, caps logsql.Capabilities, mapping *MappingOptions) (string, error) {
+	// A fallback-chain label that this query GROUPS BY is materialised into a
+	// real field of that exact name by chainCoalescePipes. The by-clause must
+	// then name the materialised field, not the chain's first VL field — which
+	// is what labelFn would map it to, and which does not exist on records that
+	// only carry a later field in the chain (the whole point of a fallback).
+	labelFn = mapping.groupingLabelFn(labelFn)
+
 	logql = strings.TrimSpace(logql)
 	if logql == "" {
 		return "*", nil
@@ -855,6 +862,21 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			} else {
 				parts = append(parts, translated)
 			}
+		}
+	}
+
+	if coalesce := mapping.chainCoalescePipes(); len(coalesce) > 0 {
+		var pipes []string
+		for _, stage := range coalesce {
+			if !hasExactStage(parts, stage) {
+				pipes = append(pipes, stage)
+			}
+		}
+		if len(pipes) > 0 {
+			if len(parts) == 0 && len(streamParts) == 0 {
+				parts = append(parts, "*")
+			}
+			parts = append(parts, pipes...)
 		}
 	}
 

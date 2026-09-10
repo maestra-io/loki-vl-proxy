@@ -226,8 +226,14 @@ func TestTranslateStatsResponseLabels_LevelPreservedWithStream(t *testing.T) {
 }
 
 // TestTranslateStatsResponseLabels_LevelRemovedWithoutStream checks the complementary
-// case: when _stream is absent (VL returned only explicit by-group keys), level must
-// be replaced by detected_level for Loki compatibility.
+// case: when _stream is absent (VL returned only explicit by-group keys), the
+// response must carry the label the client GROUPED BY.
+//
+// Updated 10.09.2026: this asserted that `sum by (level)` comes back as
+// detected_level. Real Loki returns `level` for `sum by (level)` and
+// `detected_level` for `sum by (detected_level)` — measured side by side on the
+// same data (panel-compare S4/S5). Both translate to VL's `level` column, so the
+// original query is the only thing that distinguishes them.
 func TestTranslateStatsResponseLabels_LevelRemovedWithoutStream(t *testing.T) {
 	p := newTestProxy(t, "http://unused")
 	p.labelTranslator = NewLabelTranslator(LabelStyleUnderscores, nil)
@@ -248,12 +254,43 @@ func TestTranslateStatsResponseLabels_LevelRemovedWithoutStream(t *testing.T) {
 	}
 	metric := resp.Results[0].Metric
 
-	// Without _stream, level came from VL grouping and must be replaced by detected_level
-	if _, ok := metric["level"]; ok {
-		t.Errorf("level must be removed when _stream is absent; got %#v", metric)
+	// The query grouped by `level`, so `level` is what comes back — and the
+	// synthetic twin must not be added alongside it.
+	if metric["level"] != "error" {
+		t.Errorf("level must be preserved for `sum by (level)`; got %#v", metric)
 	}
-	if metric["detected_level"] == "" {
+	if _, ok := metric["detected_level"]; ok {
+		t.Errorf("detected_level must not be added for `sum by (level)`; got %#v", metric)
+	}
+}
+
+// TestTranslateStatsResponseLabels_DetectedLevelRequested is the other half:
+// grouping by detected_level must come back as detected_level, with no raw
+// `level` alongside it.
+func TestTranslateStatsResponseLabels_DetectedLevelRequested(t *testing.T) {
+	p := newTestProxy(t, "http://unused")
+	p.labelTranslator = NewLabelTranslator(LabelStyleUnderscores, nil)
+
+	body := []byte(`{"results":[{"metric":{"level":"error"}}]}`)
+	got := p.translateStatsResponseLabelsWithContext(
+		context.Background(), body,
+		`sum by (detected_level) (count_over_time({app="api"}[5m]))`,
+	)
+
+	var resp struct {
+		Results []struct {
+			Metric map[string]interface{} `json:"metric"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(got, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	metric := resp.Results[0].Metric
+	if metric["detected_level"] != "error" {
 		t.Errorf("detected_level must be synthesised from level; got %#v", metric)
+	}
+	if _, ok := metric["level"]; ok {
+		t.Errorf("raw level must be replaced by detected_level; got %#v", metric)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -361,7 +362,7 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 	// coincide only while range <= step. Beyond that the native result is wrong,
 	// and evaluating a sliding TWO-stage fold is not something this layer can do
 	// (it folds once, per series). Refuse rather than return a plausible number.
-	if isMultiStageStatsQuery(logsqlQuery) {
+	if isMultiStageStatsQuery(logsqlQuery) && rangeAggregationHasOwnGrouping(originalLogql) {
 		return p.rejectMultiStageSlidingRange(w, r, originalLogql)
 	}
 	// Queries containing | math are multi-stage VL rate pipelines built by the translator
@@ -454,6 +455,33 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 // Rate pipelines are the deliberate exception: the translator builds them as
 // `stats … as __lvp_inner | math … | stats …`, and the manual path implements
 // their per-step accumulation on purpose. They are identified by `| math `.
+// rangeAggregationHasOwnGrouping reports whether the RANGE aggregation carries
+// its own `by (...)` / `without (...)` clause, as in
+// `sum by (app) (max_over_time({...}[5m]) by (ns))`.
+//
+// That is the only shape the two-stage translation introduces. An outer
+// aggregation over an UNGROUPED range aggregation — `max(quantile_over_time(…))`
+// — has also always produced two stats stages, but the compat layer has handled
+// it correctly for far longer, so it must not be diverted.
+func rangeAggregationHasOwnGrouping(logql string) bool {
+	logql = strings.TrimSpace(stripOuterLabelReplace(logql))
+	loc := outerAggregationRE.FindStringIndex(logql)
+	if loc == nil || loc[0] != 0 || loc[1] >= len(logql) {
+		// No outer aggregation: a trailing clause here belongs to the range
+		// aggregation itself, which is a single stage.
+		return false
+	}
+	inner := strings.TrimSpace(logql[loc[1]:])
+	if !strings.HasPrefix(inner, "(") || !strings.HasSuffix(inner, ")") {
+		return false
+	}
+	inner = strings.TrimSpace(inner[1 : len(inner)-1])
+	return outerByAfterRE.MatchString(inner) || rangeWithoutAfterRE.MatchString(inner)
+}
+
+// rangeWithoutAfterRE is outerByAfterRE's `without (...)` twin.
+var rangeWithoutAfterRE = regexp.MustCompile(`\)\s+without\s*\(([^)]*)\)\s*$`)
+
 func isMultiStageStatsQuery(logsqlQuery string) bool {
 	// Count PIPE stages only. A line filter carrying the literal text — e.g.
 	// `{...} |= "| stats "`, translated to `~"| stats "` — is data, not a stage,
@@ -468,7 +496,7 @@ func isMultiStageStatsQuery(logsqlQuery string) bool {
 }
 
 func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
-	if isMultiStageStatsQuery(logsqlQuery) {
+	if isMultiStageStatsQuery(logsqlQuery) && rangeAggregationHasOwnGrouping(originalLogql) {
 		return false
 	}
 	spec, ok := parseStatsCompatSpec(logsqlQuery)
@@ -693,7 +721,7 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 
 	series, err := p.collectRangeMetricSamples(r.Context(), spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, field, origSpec.UnwrapConv, startTS.Add(-origSpec.Window), endTS)
 	if err != nil {
-		p.writeError(w, http.StatusBadGateway, err.Error())
+		p.writeError(w, statusForRangeMetricCollectError(err), err.Error())
 		return true
 	}
 
@@ -720,7 +748,7 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 
 	series, err := p.collectRangeMetricSamples(r.Context(), spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, field, origSpec.UnwrapConv, evalTS.Add(-origSpec.Window), evalTS)
 	if err != nil {
-		p.writeError(w, http.StatusBadGateway, err.Error())
+		p.writeError(w, statusForRangeMetricCollectError(err), err.Error())
 		return true
 	}
 
@@ -971,16 +999,52 @@ type metricSeriesCacheEntry struct {
 	key          string
 }
 
+// statusForRangeMetricCollectError maps a collection failure to a status. Hitting
+// the row cap is the CLIENT's query being too broad for this path, not a backend
+// fault, so it must not read as 502 — an operator chasing a 502 looks at the
+// backend, which is healthy.
+func statusForRangeMetricCollectError(err error) int {
+	var truncated *rawRowScanTruncatedError
+	if errors.As(err, &truncated) {
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
+}
+
+// defaultManualRangeMetricRowLimit caps the raw-row scan of the manual
+// compatibility path. Lowered from 1,000,000 on 10.09.2026 — see
+// collectRangeMetricSamples for why that number was dangerous.
+const defaultManualRangeMetricRowLimit = 10_000
+
+// rawRowScanTruncatedError reports that the manual path hit its row cap, so any
+// number it could return would be short by an unknown amount.
+type rawRowScanTruncatedError struct{ limit int }
+
+func (e *rawRowScanTruncatedError) Error() string {
+	return fmt.Sprintf(
+		"query needs more than %d raw log rows to evaluate; the result would be silently incomplete. "+
+			"Narrow the time range or the stream selector, add a by(...) grouping so the aggregation runs "+
+			"in the backend, or raise -manual-range-metric-row-limit if this instance can afford the scan",
+		e.limit)
+}
+
 func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string, groupBy, origGroupBy []string, byExplicit bool, field, unwrapConv string, start, end time.Time) (map[string]manualSeriesSamples, error) {
 	params := url.Values{}
 	params.Set("query", baseQuery)
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
-	// Keep this high to avoid truncating series for compatibility stats functions.
-	// Configurable via -manual-range-metric-row-limit; default 1,000,000.
+	// This path reads RAW ROWS and folds them client-side, and VictoriaLogs
+	// executes a `limit` by sorting: the request becomes
+	// `| sort by (_time) desc limit N`. At N=1,000,000 over a busy namespace
+	// that sort is what OOM-killed both 4Gi VLSingle instances five times on
+	// 10.09.2026 — taking every other query on the cluster down with it.
+	//
+	// The limit is therefore a safety cap, not a tuning knob, and truncation is
+	// reported rather than folded into a smaller-but-plausible number: a
+	// silently short aggregate is indistinguishable from a real drop in traffic.
 	rowLimit := p.rangeMetricRowLimit
 	if rowLimit <= 0 {
-		rowLimit = 1_000_000
+		rowLimit = defaultManualRangeMetricRowLimit
 	}
 	params.Set("limit", strconv.Itoa(rowLimit))
 
@@ -1010,11 +1074,13 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 
+	rowsScanned := 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
+		rowsScanned++
 
 		v, parseErr := fjp.ParseBytes(line)
 		if parseErr != nil {
@@ -1094,6 +1160,9 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
 		return nil, fmt.Errorf("scanning VL response: %w", scanErr)
+	}
+	if rowsScanned >= rowLimit {
+		return nil, &rawRowScanTruncatedError{limit: rowLimit}
 	}
 
 	for key, series := range seriesMap {
@@ -1274,7 +1343,41 @@ func addGroupByParsedLabelsFJ(metricLabels map[string]string, v *fj.Value, group
 	}
 }
 
+// injectedLevelPipeRE matches the pipes the translator adds ITSELF to
+// materialise the derived `level` field (-derived-level-group-by). The
+// `as level` / `at level` suffixes are the tell: nothing a user writes in LogQL
+// translates to them.
+var injectedLevelPipeRE = regexp.MustCompile(
+	`\s*\|\s*(?:format if \([^)]*\)[^|]*? as level|replace_regexp \(.*?\) at level|unpack_json from _msg|unpack_logfmt from _msg)`)
+
+// stripInjectedLevelPipes removes the proxy's own level-materialisation chain
+// from a translated query.
+//
+// The chain contains `| unpack_json from _msg`, which makes every level-grouped
+// query look like it carries a USER parser stage. That misreading is expensive:
+// the parser-stage branches exist to preserve Loki's "parse-failed lines are
+// excluded" semantics, which only a user's parser can violate, and they route
+// the query to the manual path — a raw-row scan with limit=1000000 that VL
+// executes as `| sort by (_time) desc limit 1000000`. On a busy namespace over
+// a 1h window that is millions of rows sorted in memory; it returned 400 and
+// OOM-killed both 4Gi VLSingle instances five times on 10.09.2026, for a query
+// (`sum by (level) (count_over_time({ns}[1h]))`) that native `stats by (level)
+// count()` answers without reading a single raw row.
+//
+// The chain only computes a field — it never drops a line — so it must not
+// influence that decision.
+func stripInjectedLevelPipes(baseQuery string) string {
+	if !strings.Contains(baseQuery, " as level") {
+		// No materialisation chain present; nothing to strip.
+		return baseQuery
+	}
+	return injectedLevelPipeRE.ReplaceAllString(baseQuery, "")
+}
+
 func queryUsesParserStages(baseQuery string) bool {
+	// Ask about the USER's pipeline only — see stripInjectedLevelPipes.
+	baseQuery = stripInjectedLevelPipes(baseQuery)
+
 	// `| unpack_logfmt` exposes pre-parsed fields without transforming the
 	// log line — VL's stats_query_range handles it natively in tens of ms.
 	// Excluding it from the "parser stages" check lets queries with a

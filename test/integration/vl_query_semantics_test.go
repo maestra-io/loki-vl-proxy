@@ -102,14 +102,21 @@ func (r vlRecord) marshal(now time.Time) (string, error) {
 		return "", err
 	}
 	rec := map[string]string{
-		"_time":                         now.Add(r.tsOffset).UTC().Format(time.RFC3339Nano),
-		"_msg":                          string(msgBytes),
-		"kubernetes.pod_namespace":      r.namespace,
-		"kubernetes.pod_name":           r.pod,
-		"kubernetes.container_name":     r.container,
-		"kubernetes.pod_node_name":      "node-1",
-		"kubernetes.pod_labels.app":     r.app,
+		"_time":                     now.Add(r.tsOffset).UTC().Format(time.RFC3339Nano),
+		"_msg":                      string(msgBytes),
+		"kubernetes.pod_namespace":  r.namespace,
+		"kubernetes.pod_name":       r.pod,
+		"kubernetes.container_name": r.container,
+		"kubernetes.pod_node_name":  "node-1",
+		"kubernetes.pod_labels.app": r.app,
+
 		"kubernetes.pod_labels.product": "prod",
+	}
+	// An empty app means "this pod carries no `app` pod-label at all" — the
+	// record then only reaches the `app` Loki label through a later field in the
+	// -field-mapping fallback chain, which is the case S6 is about.
+	if r.app == "" {
+		delete(rec, "kubernetes.pod_labels.app")
 	}
 	for k, v := range r.extra {
 		rec[k] = v
@@ -578,7 +585,10 @@ func TestVLQuerySemantics(t *testing.T) {
 	slowNS := fmt.Sprintf("appslow-%d", runID)
 	tieNS := fmt.Sprintf("apptie-%d", runID)
 
+	chainNS := fmt.Sprintf("appchain-%d", runID)
+
 	records := append(trowFixture(trowNS), levelFixture(mainNS, slowNS, tieNS)...)
+	records = append(records, chainFallbackFixture(chainNS)...)
 	ingest(t, base, records, now)
 
 	// LVP_TEST_PROXY_LOG=1 makes the proxy log every translated LogsQL query and
@@ -606,6 +616,9 @@ func TestVLQuerySemantics(t *testing.T) {
 	})
 	t.Run("JSONLineFormat", func(t *testing.T) {
 		testJSONLineFormat(t, p, slowNS, now)
+	})
+	t.Run("PanelCompareDefects", func(t *testing.T) {
+		testPanelCompareDefects(t, base, p, mainNS, chainNS, now)
 	})
 	t.Run("LabelMatcherAnchoring", func(t *testing.T) {
 		testLabelMatcherAnchoring(t, p, mainNS, tieNS, now)
@@ -1121,6 +1134,151 @@ func testLabelMatcherAnchoring(t *testing.T, p *proxyProc, mainNS, tieNS string,
 			}
 		})
 	}
+}
+
+// chainFallbackFixture builds records that carry NO `kubernetes.pod_labels.app`
+// and reach the `app` Loki label only through the SECOND field of the
+// -field-mapping fallback chain. That is the production shape behind panel S6:
+// trow's pods label themselves with app.kubernetes.io/name, not app.
+func chainFallbackFixture(ns string) []vlRecord {
+	var out []vlRecord
+	for i := 0; i < 6; i++ {
+		out = append(out, vlRecord{
+			tsOffset:  -18*time.Minute + time.Duration(i)*time.Second,
+			namespace: ns,
+			pod:       ns + "-0",
+			container: "c",
+			app:       "", // no primary app pod-label
+			msg: map[string]interface{}{
+				"message": fmt.Sprintf("chain %d", i),
+				"level":   "info",
+			},
+			extra: map[string]string{
+				"kubernetes.pod_labels.app.kubernetes.io/name": "trow-registry",
+				"loglevel": "info",
+			},
+		})
+	}
+	return out
+}
+
+// testPanelCompareDefects covers the defects found by comparing the deployed
+// proxy against central Loki panel by panel on the same data (10.09.2026).
+// Expected values are Loki's, measured on that run.
+func testPanelCompareDefects(t *testing.T, base string, p *proxyProc, ns, chainNS string, now time.Time) {
+	sel := fmt.Sprintf(`{namespace=%q}`, ns)
+
+	// S4/S5. Grouping by the derived level made the translator inject
+	// `| unpack_json from _msg`, which the compat layer read as a USER parser
+	// stage and answered with a raw-row scan — `| sort by (_time) desc limit
+	// 1000000` in VL. That returned 400 and OOM-killed both 4Gi VLSingles five
+	// times. It must be a native stats aggregation, and it must return the label
+	// the client asked for: Loki answers `sum by (level)` with `level` and
+	// `sum by (detected_level)` with `detected_level`.
+	for _, tc := range []struct {
+		name  string
+		label string
+	}{
+		{"S4 sum by level", "level"},
+		{"S5 sum by detected_level", "detected_level"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logql := fmt.Sprintf(`sum by (%s) (count_over_time(%s[1h]))`, tc.label, sel)
+			want := map[string]string{
+				fmt.Sprintf("{%s=error}", tc.label): "5",
+				fmt.Sprintf("{%s=warn}", tc.label):  "3",
+				fmt.Sprintf("{%s=info}", tc.label):  "7",
+			}
+			assertVectorEquals(t, queryInstant(t, p, logql, now), want)
+			// A 1h window with a 1m step is the shape that failed in production.
+			assertVectorEquals(t, queryRange(t, p, logql, now.Add(-time.Hour), now, time.Hour), want)
+		})
+	}
+
+	// The VALUES above are identical whichever path answers, so they cannot
+	// catch the defect on a small fixture — the raw-row scan only fails at
+	// production volume. Assert the PATH instead: a proxy whose raw-row cap is
+	// below the fixture size answers only if it never reads raw rows.
+	t.Run("S4/S5 level grouping never scans raw rows", func(t *testing.T) {
+		capped := startProxyWithBackendURL(t, base,
+			append(vlSemanticsFlags(), "-manual-range-metric-row-limit=3")...)
+
+		for _, label := range []string{"level", "detected_level"} {
+			logql := fmt.Sprintf(`sum by (%s) (count_over_time(%s[1h]))`, label, sel)
+			want := map[string]string{
+				fmt.Sprintf("{%s=error}", label): "5",
+				fmt.Sprintf("{%s=warn}", label):  "3",
+				fmt.Sprintf("{%s=info}", label):  "7",
+			}
+			// 15 rows in the namespace, cap 3: a raw-row scan cannot answer this.
+			assertVectorEquals(t, queryInstant(t, capped, logql, now), want)
+			assertVectorEquals(t, queryRange(t, capped, logql, now.Add(-time.Hour), now, time.Hour), want)
+		}
+	})
+
+	// S6. A Loki label backed by a fallback chain cannot be a VL group-by key:
+	// VL grouped by the chain's FIRST field, which these records do not carry,
+	// so the panel showed {app=""} with an otherwise correct count.
+	t.Run("S6 grouping by a fallback-chain label", func(t *testing.T) {
+		logql := fmt.Sprintf(`sum by (app) (count_over_time({namespace=%q}[1h]))`, chainNS)
+		want := map[string]string{"{app=trow-registry}": "6"}
+		assertVectorEquals(t, queryInstant(t, p, logql, now), want)
+		assertVectorEquals(t, queryRange(t, p, logql, now.Add(-time.Hour), now, time.Hour), want)
+	})
+
+	// T5. An outer aggregation over an UNGROUPED range aggregation has always
+	// produced two stats stages and has always been evaluated correctly; the
+	// two-stage guard added earlier must not divert it, at any step.
+	t.Run("T5 nested range function at any step", func(t *testing.T) {
+		logql := `max(quantile_over_time(0.95, ` + sel + ` | json | unwrap Duration [10m]))`
+		for _, step := range []time.Duration{time.Minute, 10 * time.Minute, time.Hour} {
+			resp := queryRange(t, p, logql, now.Add(-time.Hour), now, step)
+			if len(resp.Data.Result) == 0 {
+				t.Errorf("step %s: no series", step)
+			}
+		}
+	})
+
+	// S11. bytes_over_time already mapped to sum_len(_msg); its production 502
+	// was the backends being dead from the S4/S5 OOM. Lock that it answers.
+	t.Run("S11 bytes_over_time", func(t *testing.T) {
+		logql := `bytes_over_time(` + sel + `[1h])`
+		if len(queryRange(t, p, logql, now.Add(-time.Hour), now, time.Hour).Data.Result) == 0 {
+			t.Error("bytes_over_time returned no series")
+		}
+		if len(queryInstant(t, p, logql, now).Data.Result) == 0 {
+			t.Error("bytes_over_time instant returned no series")
+		}
+	})
+
+	// rate must be count/range_seconds on every path — the panel run reported
+	// Σ=657 where Loki gave 10.95 over a 60s range (exactly ×60).
+	t.Run("rate is divided by the range seconds", func(t *testing.T) {
+		count := singleSeriesValue(t, queryInstant(t, p, `sum(count_over_time(`+sel+`[1h]))`, now))
+		for _, q := range []string{
+			`sum(rate(` + sel + `[1h]))`,
+			`sum by (app) (rate(` + sel + `[1h]))`,
+			`sum(rate(` + sel + ` | json [1h]))`,
+		} {
+			total := 0.0
+			for _, s := range queryInstant(t, p, q, now).Data.Result {
+				total += seriesValue(t, s)
+			}
+			if want := count / 3600.0; math.Abs(total-want) > want*0.01 {
+				t.Errorf("%s = %v, want %v (count %v / 3600s)", q, total, want, count)
+			}
+		}
+	})
+}
+
+// singleSeriesValue returns the value of a response that must hold exactly one
+// series.
+func singleSeriesValue(t *testing.T, resp lokiResponse) float64 {
+	t.Helper()
+	if len(resp.Data.Result) != 1 {
+		t.Fatalf("expected 1 series, got %d", len(resp.Data.Result))
+	}
+	return seriesValue(t, resp.Data.Result[0])
 }
 
 // seriesValue extracts the single sample of a vector series, or the last bucket

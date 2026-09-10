@@ -9,6 +9,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Grouping by the derived level scanned a million raw rows and OOM-killed the
+  backend.** `-derived-level-group-by` makes the translator inject
+  `| unpack_json from _msg | … | format … as level`. The compat layer read that
+  injected chain as a USER parser stage — the signal that Loki's
+  "parse-failed lines are excluded" semantics need a client-side fold — and so
+  answered `sum by (level) (count_over_time({ns}[1h]))` with a raw-row scan at
+  `limit=1000000`, which VictoriaLogs executes as
+  `| sort by (_time) desc limit 1000000`. On a busy namespace that sort returned
+  400 and OOM-killed both 4Gi VLSingle instances five times on 10.09.2026,
+  taking every other query down with them; panels S11 and others then failed
+  with "all backends unavailable" purely as collateral. The injected chain only
+  computes a field and never drops a line, so it no longer influences that
+  decision: the query is now a native `stats by (level) count()` that reads no
+  raw rows.
+- **`sum by (level)` came back as `detected_level`.** Both labels translate to
+  VL's `level` column, so the response cannot be disambiguated on its own — but
+  the original query can. Loki answers `sum by (level)` with `level` and
+  `sum by (detected_level)` with `detected_level`; both now match, on the
+  instant and range paths.
+- **Grouping by a `-field-mapping` fallback-chain label returned an empty
+  value.** A matcher on such a label expands to an OR over the chain, but a
+  grouping cannot: VL was asked to group by the chain's FIRST field, which
+  records carrying only a later field do not have, so the panel showed
+  `{app=""}` with an otherwise correct count. The chain is now coalesced into a
+  real field of that name before the stats stage
+  (`| format if (<f2>:*) "<f2>" as app | format if (<f1>:*) "<f1>" as app`,
+  lowest priority first) and the by-clause names it.
+- **`topk`/`bottomk` over a matrix selected globally instead of per timestamp.**
+  Ranking once by each series' last value returns exactly k series for the whole
+  range, so a series that led earlier in the window vanished. Loki selects
+  independently at each step and returns the union (10 series for a `topk(5)`
+  over a busy range), each carrying samples only where it made the cut.
+- **An outer aggregation over an UNGROUPED range aggregation was rejected.** The
+  two-stage guard added in maestra.4 was too broad: `max(quantile_over_time(…))`
+  has always produced two stats stages and has always been evaluated correctly,
+  and the guard 400'd it whenever range > step. It now fires only for the shape
+  it was written for — an outer aggregation over a range aggregation that has
+  its OWN grouping.
+
+### Changed
+
+- **`-manual-range-metric-row-limit` now defaults to 10 000, down from
+  1 000 000, and hitting it is an error rather than a silent truncation.** The
+  limit is executed by VictoriaLogs as a sort over that many raw rows, so the
+  old default was a backend-wide memory hazard (see the level-grouping entry
+  above). A query that needs more rows than the cap now returns 400 naming the
+  flag, because a short aggregate is indistinguishable from a real drop in
+  traffic.
+- **A failed upstream call now logs the translated LogsQL** (`logsql.query`, on
+  the existing `upstream_request` line, redacted per `-debug-log-raw-queries`).
+  Triaging the 10.09.2026 failures meant guessing at the generated query because
+  it appeared nowhere in the logs.
+
+### Fixed
+
 - **Label-matcher regex flags escaped the anchors.** `AnchorLabelMatcherRegex`
   hoisted leading inline flags in front of `^…$`, so `(?m)foo` became
   `(?m)^(?:foo)$` — and under `(?m)` the anchors match at LINE boundaries, which

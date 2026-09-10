@@ -2617,7 +2617,10 @@ func TestDrilldown_LogsTabCounter_SumCountOverTimeParserReturnsSingleSeries(t *t
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("parse form: %v", err)
 		}
-		if r.URL.Path == "/select/logsql/query" && r.Form.Get("limit") == "1000000" {
+		// Match the raw-row endpoint regardless of the limit value: the limit is
+		// a safety cap that changed (1_000_000 -> 10_000 on 10.09.2026) and is
+		// not what this test is about.
+		if r.URL.Path == "/select/logsql/query" && r.Form.Get("limit") != "" {
 			w.Header().Set("Content-Type", "application/x-ndjson")
 			ts := time.Unix(1700000000, 0).Add(-time.Hour)
 			for _, s := range streams {
