@@ -210,7 +210,7 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 
 	// Single parse pass: filter points to the requested end time AND translate
 	// metric labels. Replaces two sequential fastjson parses (trim then translate).
-	body = shiftStatsQRToLokiGrid(body, r.FormValue("step"))
+	body = shiftStatsQRToLokiGrid(body, r.FormValue("start"), r.FormValue("step"))
 	body = p.trimAndTranslateStatsQRFJ(r.Context(), body,
 		lokiGridWindowKeep(r.FormValue("start"), r.FormValue("end")), r.FormValue("query"))
 	// Cap to the busiest maxStatsQuerySeries (default 500, top-N by total count).
@@ -2244,7 +2244,7 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	if p2Err != nil {
 		return nil
 	}
-	p2Body = shiftStatsQRToLokiGrid(p2Body, r.FormValue("step"))
+	p2Body = shiftStatsQRToLokiGrid(p2Body, start, r.FormValue("step"))
 	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, lokiGridWindowKeep(start, end), r.FormValue("query"))
 	p2Body = limitLokiMatrixSeries(p2Body, p.resolvedMaxStatsQuerySeries())
 	return wrapAsLokiResponse(p2Body, "matrix")
@@ -2318,7 +2318,7 @@ func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, fi
 		return nil
 	}
 
-	p2Body = shiftStatsQRToLokiGrid(p2Body, step)
+	p2Body = shiftStatsQRToLokiGrid(p2Body, start, step)
 	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, lokiGridWindowKeep(start, end), r.FormValue("query"))
 	p2Body = limitLokiMatrixSeries(p2Body, maxDrilldownSeries)
 	return wrapAsLokiResponse(p2Body, "matrix")
@@ -2546,18 +2546,32 @@ func shiftRangeStartOneStep(startRaw, stepRaw string) string {
 // Loki draws it. Sums are unaffected, so a suite comparing totals sees nothing
 // wrong, while the chart silently lags one step and the newest bucket — the one
 // at `end` — never appears at all.
-func shiftStatsQRToLokiGrid(body []byte, stepRaw string) []byte {
+func shiftStatsQRToLokiGrid(body []byte, startRaw, stepRaw string) []byte {
 	step, ok := parsePositiveStepDuration(stepRaw)
 	if !ok || step <= 0 {
 		return body
 	}
-	return mapStatsQRPointTimestamps(body, step.Nanoseconds())
+	// buildLokiGridStatsParams moved the grid left by `offset`, so the bucket
+	// labelled L is the LogQL point at `L + step - offset` — which lands on the
+	// client's own step grid. Snapping to that grid keeps the points exact even
+	// against a backend that ignored the offset (it then shifts by a fraction of
+	// one step, and the nearest grid position is still the right point).
+	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)
+	stepNs := step.Nanoseconds()
+	delta := stepNs - lokiGridOffsetNanos(startRaw, stepRaw)
+	return mapStatsQRPointTimestamps(body, delta, func(tsNs int64) int64 {
+		if !hasStart {
+			return tsNs
+		}
+		k := int64(math.Round(float64(tsNs-startNs) / float64(stepNs)))
+		return startNs + k*stepNs
+	})
 }
 
 // mapStatsQRPointTimestamps rewrites the first element of every point array in a
 // stats_query_range response, adding deltaNs. Timestamps are re-emitted in the
 // unit they arrived in (VL uses whole seconds), so the shape is unchanged.
-func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
+func mapStatsQRPointTimestamps(body []byte, deltaNs int64, snap func(int64) int64) []byte {
 	parser := statsQRFJPool.Get()
 	defer statsQRFJPool.Put(parser)
 
@@ -2598,6 +2612,9 @@ func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
 				continue
 			}
 			shifted := ns + deltaNs
+			if snap != nil {
+				shifted = snap(shifted)
+			}
 			// VL emits whole-second numbers and the Loki contract keeps that
 			// form — but a sub-second step (`500ms`, `0.5`) shifts off the
 			// second boundary, and truncating there would emit the ORIGINAL
@@ -2626,6 +2643,42 @@ func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
 	return out
 }
 
+// VictoriaLogs aligns its stats buckets to the EPOCH grid of the step, while
+// LogQL puts a point at `start + k*step` and evaluates it over `(t-step, t]`.
+// Two things follow, and the `offset` parameter fixes both: the grid has to move
+// to the CLIENT's start — Grafana does not always send a step-aligned one (a 48h
+// Drilldown split starts on a 5-minute boundary and queries with step=1h) — and
+// it has to move one further microsecond so a sample sitting exactly ON a
+// boundary is counted in the window that ENDS there, the way Loki counts it.
+//
+// A microsecond is the finest offset VictoriaLogs accepts (`1ns` is rejected)
+// and is far below any log timestamp's resolution.
+const lokiGridBucketEpsilonNanos = int64(time.Microsecond)
+
+// lokiGridOffsetNanos is how far LEFT VictoriaLogs' bucket grid must move for
+// its buckets to become the LogQL windows of the client's own step grid.
+func lokiGridOffsetNanos(startRaw, stepRaw string) int64 {
+	step, ok := parsePositiveStepDuration(stepRaw)
+	if !ok || step <= 0 {
+		return 0
+	}
+	stepNs := step.Nanoseconds()
+	offset := lokiGridBucketEpsilonNanos
+	if startNs, hasStart := parseLokiTimeToUnixNano(startRaw); hasStart {
+		offset += ((startNs % stepNs) + stepNs) % stepNs
+	}
+	if offset > stepNs {
+		offset = stepNs
+	}
+	return offset
+}
+
+// formatVLDurationSeconds renders a nanosecond duration as the fractional-second
+// string VictoriaLogs parses (it rejects sub-microsecond units).
+func formatVLDurationSeconds(ns int64) string {
+	return strconv.FormatFloat(float64(ns)/float64(time.Second), 'f', 6, 64) + "s"
+}
+
 // buildLokiGridStatsParams builds stats_query_range params for a range query
 // whose response will be relabelled onto the Loki grid: the window opens one
 // step BEFORE `start`, so the point at `start` still has a bucket behind it.
@@ -2633,8 +2686,12 @@ func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
 // together with shiftStatsQRToLokiGrid + lokiGridWindowKeep, or its points land
 // one step to the left of where Loki draws them.
 func (p *Proxy) buildLokiGridStatsParams(query, startRaw, endRaw, stepRaw string) url.Values {
-	return buildStatsQueryRangeParams(p.guardExtractedLabelShadowing(query),
+	params := buildStatsQueryRangeParams(p.guardExtractedLabelShadowing(query),
 		shiftRangeStartOneStep(startRaw, stepRaw), endRaw, stepRaw)
+	if off := lokiGridOffsetNanos(startRaw, stepRaw); off > 0 {
+		params.Set("offset", "-"+formatVLDurationSeconds(off))
+	}
+	return params
 }
 
 // lokiGridWindowKeep returns the point filter for a relabelled response: the
@@ -3647,7 +3704,7 @@ func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildP
 	raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
 	body := stripVLStatsNameKey(raw)
 	if vlEndpoint == "stats_query_range" {
-		body = shiftStatsQRToLokiGrid(body, r.FormValue("step"))
+		body = shiftStatsQRToLokiGrid(body, r.FormValue("start"), r.FormValue("step"))
 	}
 	return body, nil
 }
