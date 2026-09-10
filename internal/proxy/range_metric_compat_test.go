@@ -517,16 +517,17 @@ func TestQueryRange_BytesRateCompatScalesFromSumLen(t *testing.T) {
 			if got := r.FormValue("query"); !strings.Contains(got, `app:="nginx"`) {
 				t.Errorf("expected translated query, got %q", got)
 			}
-			// Return per-step byte buckets: 100 bytes at T+60s, T+120s, T+180s.
-			// (VL tumbling windows: bucket at T covers [T-step, T))
-			// Sliding window [T+180s-300s, T+180s] sums all three = 300 bytes.
+			// Return per-step byte buckets: 100 bytes at T+0s, T+60s, T+120s.
+			// A VL bucket is labelled by its START and covers [T, T+step), so
+			// these three are the last buckets that end at or before the
+			// evaluation point at T+180s; the sliding window sums 300 bytes.
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
 				`{"metric":{"_stream":"{app=\"nginx\"}"},` +
 				`"values":[` +
+				fmt.Sprintf("[%d,\"100\"],", base.Unix()) +
 				fmt.Sprintf("[%d,\"100\"],", base.Add(60*time.Second).Unix()) +
-				fmt.Sprintf("[%d,\"100\"],", base.Add(120*time.Second).Unix()) +
-				fmt.Sprintf("[%d,\"100\"]", base.Add(180*time.Second).Unix()) +
+				fmt.Sprintf("[%d,\"100\"]", base.Add(120*time.Second).Unix()) +
 				`]}]}}`))
 		default:
 			t.Errorf("unexpected backend path %s — should use stats_query_range for sliding-window bytes_rate", r.URL.Path)
@@ -578,10 +579,15 @@ func TestQueryRange_StdvarCompatSquaresStddev(t *testing.T) {
 		if r.URL.Path != "/select/logsql/stats_query_range" {
 			t.Fatalf("unexpected backend path %s", r.URL.Path)
 		}
+		// The evaluation point is at base+120s. A VL bucket is labelled by its
+		// START, so the bucket that FEEDS that point is the one at base+60s —
+		// the bucket at base+120s covers [120,180), which is after the point.
+		// (Before the bucket-timestamp fix the proxy emitted VL's label as-is,
+		// so this stub returned base+120s.)
 		_, _ = fmt.Fprintf(
 			w,
 			`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"nginx"},"values":[[%d,"1"]]}]}}`,
-			base.Add(120*time.Second).Unix(),
+			base.Add(60*time.Second).Unix(),
 		)
 	}))
 	defer vlBackend.Close()

@@ -179,11 +179,12 @@ func TestCompatHelpers_AggregateManualWindow(t *testing.T) {
 	if got, ok := aggregateManualWindow("count_over_time", 0, samples, -1, 20, 21, false); !ok || got != 3 {
 		t.Fatalf("count_over_time with the left bound below ts=0: expected 3,true got %v,%v", got, ok)
 	}
-	// Pre-bucketed samples keep the left bound CLOSED: the timestamp is a bucket
-	// START standing for `[ts, ts+step)`, so dropping the bucket on the edge
-	// would drop entries that are inside the window.
-	if got, ok := aggregateManualWindow("count_over_time", 0, samples, 0, 20, 20, true); !ok || got != 3 {
-		t.Fatalf("count_over_time on pre-bucketed samples: expected 3,true got %v,%v", got, ok)
+	// Pre-bucketed samples shift the window one bucket left — [0, 20) over
+	// {0:1, 10:2, 20:3} sees {1, 2}. The timestamp is a bucket START standing
+	// for `[ts, ts+step)`: the bucket at 0 holds entries inside the window, the
+	// bucket at 20 holds entries after the evaluation time.
+	if got, ok := aggregateManualWindow("count_over_time", 0, samples, 0, 20, 20, true); !ok || got != 2 {
+		t.Fatalf("count_over_time on pre-bucketed samples: expected 2,true got %v,%v", got, ok)
 	}
 	if got, ok := aggregateManualWindow("rate", 0, samples, 0, 20, 20, false); !ok {
 		t.Fatal("rate: expected success")

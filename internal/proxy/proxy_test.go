@@ -609,8 +609,14 @@ func TestContract_QueryRange_MatrixFormat_TumblingRateExtendsEndAndTrimsExtraPoi
 	if !ok {
 		t.Fatalf("expected values array, got %#v", series["values"])
 	}
-	if len(values) != 2 {
-		t.Fatalf("expected proxy to trim extra backend point, got %#v", values)
+	// Updated 10.09.2026 with the bucket-timestamp fix: a VL bucket is labelled
+	// by its START, a LogQL point by its END. Loki emits points at 1705312200 and
+	// 1705312260 here; the first covers (…140, …200], for which the backend
+	// returns no bucket, so exactly ONE point survives — the one at the requested
+	// end, carrying the bucket that starts at …200. Verified against
+	// grafana/loki 3.7.1 on the same shape.
+	if len(values) != 1 {
+		t.Fatalf("expected a single in-range point, got %#v", values)
 	}
 	lastPair, ok := values[len(values)-1].([]interface{})
 	if !ok {

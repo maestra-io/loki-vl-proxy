@@ -1901,7 +1901,7 @@ func TestDrilldown_LabelCardMetricQuery_ServiceNameNonEmptyFilterUsesSyntheticAn
 					"result": []map[string]interface{}{
 						{
 							"metric": map[string]string{"service.name": "argocd"},
-							"values": [][]interface{}{{float64(1712538000), "42"}},
+							"values": [][]interface{}{{float64(1775322000), "42"}},
 						},
 					},
 				},
@@ -2467,7 +2467,7 @@ func TestDrilldownLogCountUnderscokeProxyLokiPushData(t *testing.T) {
 							"service.name": "",                // OTel field not found
 							"service_name": "payment-service", // stream label found
 						},
-						"values": [][]interface{}{{float64(1712538000), "13920"}},
+						"values": [][]interface{}{{float64(1775642400), "13920"}},
 					},
 				},
 			},
@@ -2554,7 +2554,7 @@ func TestDrilldownLogCountUnderscokeProxyOTelData(t *testing.T) {
 							"service.name": "otel-service", // OTel field found
 							"service_name": "",             // stream label not found
 						},
-						"values": [][]interface{}{{float64(1712538000), "4200"}},
+						"values": [][]interface{}{{float64(1775642400), "4200"}},
 					},
 				},
 			},

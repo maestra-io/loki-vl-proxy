@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -38,6 +39,11 @@ import (
 type templatePlan struct {
 	pipeline   *logqlpkg.Pipeline
 	baseLogsQL string // reduced LogsQL sent to VictoriaLogs
+	// fallbackLogsQL carries only the leading line filters. The pushed-down
+	// pipeline stages are an optimisation, and VictoriaLogs rejects a few of the
+	// filters Loki accepts (a `\d`-style regex inside a `| filter` pipe), so a
+	// backend 4xx retries with this narrower query rather than failing the panel.
+	fallbackLogsQL string
 }
 
 // templatePlanFor builds a plan when logqlQuery's log pipeline contains a
@@ -62,12 +68,23 @@ func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templa
 
 	p.metrics.RecordTemplatePipelineQuery()
 
-	reduced := &logqlpkg.LogQuery{Selector: lq.Selector, Pipeline: leadingLineFilters(lq.Pipeline)}
-	baseLogsQL, err := p.translateQueryWithContext(ctx, reduced.String())
+	// Push down everything up to the first stage the proxy must evaluate itself.
+	// Only the leading line filters used to travel, so a query whose parser-stage
+	// filter matches nothing still dragged every row of the selector across the
+	// wire — and on a broad selector that trips the raw-row cap, turning an
+	// EMPTY result into a 400 (Loki answers 0 rows). The stages pushed here are
+	// the same ones a non-template query already delegates to VictoriaLogs.
+	fallbackLogsQL, err := p.translateQueryWithContext(ctx,
+		(&logqlpkg.LogQuery{Selector: lq.Selector, Pipeline: leadingLineFilters(lq.Pipeline)}).String())
 	if err != nil {
 		return nil, err
 	}
-	return &templatePlan{pipeline: pipeline, baseLogsQL: baseLogsQL}, nil
+	baseLogsQL, err := p.translateQueryWithContext(ctx,
+		(&logqlpkg.LogQuery{Selector: lq.Selector, Pipeline: pushdownPrefix(lq.Pipeline)}).String())
+	if err != nil {
+		baseLogsQL = fallbackLogsQL
+	}
+	return &templatePlan{pipeline: pipeline, baseLogsQL: baseLogsQL, fallbackLogsQL: fallbackLogsQL}, nil
 }
 
 // innermostLogQuery unwraps aggregations down to the log query they range over.
@@ -88,6 +105,19 @@ func innermostLogQuery(expr logqlpkg.Expr) *logqlpkg.LogQuery {
 			return nil
 		}
 	}
+}
+
+// pushdownPrefix returns the leading stages VictoriaLogs can evaluate: every
+// stage before the first one that needs proxy-side evaluation (a Go template or
+// an `__error__` filter). Dropping rows earlier is safe — the proxy re-runs the
+// WHOLE pipeline on what comes back.
+func pushdownPrefix(stages []logqlpkg.Stage) []logqlpkg.Stage {
+	for i, s := range stages {
+		if logqlpkg.NeedsProxyEvaluation([]logqlpkg.Stage{s}) {
+			return stages[:i]
+		}
+	}
+	return stages
 }
 
 // leadingLineFilters returns the run of line filters at the head of the
@@ -123,9 +153,27 @@ type templateEntry struct {
 
 // fetchTemplatePipelineEntries runs the reduced LogsQL against VictoriaLogs and
 // returns the entries that survive the proxy-side pipeline.
-func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *templatePlan, start, end time.Time) ([]templateEntry, error) {
+// truncationFatal says whether hitting the raw-row cap must fail the query. An
+// AGGREGATION over a truncated scan is silently wrong, so it does; a LOG query
+// is already a "newest N lines" request (VictoriaLogs sorts by _time desc), so
+// it does not.
+func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *templatePlan, start, end time.Time, truncationFatal bool) ([]templateEntry, error) {
+	entries, err := p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.baseLogsQL, start, end, truncationFatal)
+	// The pushed-down stages are an optimisation; VictoriaLogs rejecting them is
+	// not a reason to fail a panel Loki answers.
+	var rejected *templatePushdownRejectedError
+	if err != nil && plan.fallbackLogsQL != "" && plan.fallbackLogsQL != plan.baseLogsQL &&
+		errors.As(err, &rejected) {
+		slog.WarnContext(ctx, "template pipeline pushdown rejected by backend, retrying with line filters only",
+			"status", rejected.status)
+		return p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.fallbackLogsQL, start, end, truncationFatal)
+	}
+	return entries, err
+}
+
+func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *templatePlan, logsql string, start, end time.Time, truncationFatal bool) ([]templateEntry, error) {
 	params := url.Values{}
-	params.Set("query", plan.baseLogsQL)
+	params.Set("query", logsql)
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
 	// Same raw-row contract as collectRangeMetricSamples: the cap is a safety
@@ -145,7 +193,11 @@ func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *template
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := readBodyLimited(resp.Body, maxUpstreamErrorBodyBytes)
-		return nil, p.redactedBackendStatusError("backend returned", resp.StatusCode, body)
+		err := p.redactedBackendStatusError("backend returned", resp.StatusCode, body)
+		if resp.StatusCode < 500 {
+			return nil, &templatePushdownRejectedError{status: resp.StatusCode, err: err}
+		}
+		return nil, err
 	}
 
 	fjp := vlFJParserPool.Get()
@@ -163,7 +215,10 @@ func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *template
 		}
 		rowsScanned++
 		if rowsScanned > rowLimit {
-			return nil, &rawRowScanTruncatedError{limit: rowLimit}
+			if truncationFatal {
+				return nil, &rawRowScanTruncatedError{limit: rowLimit}
+			}
+			break
 		}
 		v, parseErr := fjp.ParseBytes(raw)
 		if parseErr != nil {
@@ -287,7 +342,7 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 		return true
 	}
 
-	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end)
+	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false)
 	if err != nil {
 		p.writeError(w, templateFetchErrorStatus(err), err.Error())
 		return true
@@ -356,6 +411,16 @@ func groupTemplateEntriesIntoStreams(entries []templateEntry, categorizedLabels,
 
 // templateFetchErrorStatus maps a fetch failure to a status. Hitting the raw-row
 // cap is the client's query being too broad for this path, not a backend fault.
+// templatePushdownRejectedError marks a 4xx from VictoriaLogs on the pushed-down
+// query, which the caller retries with fewer stages.
+type templatePushdownRejectedError struct {
+	status int
+	err    error
+}
+
+func (e *templatePushdownRejectedError) Error() string { return e.err.Error() }
+func (e *templatePushdownRejectedError) Unwrap() error { return e.err }
+
 func templateFetchErrorStatus(err error) int {
 	var truncated *rawRowScanTruncatedError
 	if errors.As(err, &truncated) {
@@ -379,7 +444,7 @@ func (p *Proxy) collectTemplatePipelineSamples(
 	field, unwrapConv string,
 	start, end time.Time,
 ) (map[string]manualSeriesSamples, error) {
-	entries, err := p.fetchTemplatePipelineEntries(ctx, plan, start, end)
+	entries, err := p.fetchTemplatePipelineEntries(ctx, plan, start, end, true)
 	if err != nil {
 		return nil, err
 	}

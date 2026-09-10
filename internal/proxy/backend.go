@@ -105,12 +105,16 @@ func (p *Proxy) recordUpstreamObservation(ctx context.Context, system, method, r
 			"error.message", err.Error(),
 		)
 	}
-	// The query is the point of this log line on a failure. It is redacted the
-	// same way every other query log is, so -debug-log-raw-queries still governs
-	// whether the literal text is written.
-	if (err != nil || statusCode >= http.StatusBadRequest) && len(backendQuery) > 0 {
-		if q := strings.TrimSpace(backendQuery[0]); q != "" {
-			logAttrs = append(logAttrs, "logsql.query", redactQuery(q, p.debugLogRawQueries))
+	// The query IS the point of this log line on a failure: a hash cannot be
+	// pasted into VictoriaLogs, so a 4xx/5xx always carries the LogsQL verbatim.
+	// A successful query is only written when -log-translated-queries asks for it
+	// (or -debug-log-raw-queries is on).
+	if len(backendQuery) > 0 {
+		failed := err != nil || statusCode >= http.StatusBadRequest
+		if failed || p.logTranslatedQueries || p.debugLogRawQueries {
+			if q := strings.TrimSpace(backendQuery[0]); q != "" {
+				logAttrs = append(logAttrs, "logsql.query", q)
+			}
 		}
 	}
 	p.log.Log(ctx, level, "upstream_request", logAttrs...)

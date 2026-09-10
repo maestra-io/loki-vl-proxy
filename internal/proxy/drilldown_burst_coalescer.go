@@ -109,7 +109,7 @@ func fieldHasExistenceFilter(baseQuery, field string) bool {
 // count pattern.
 func detectDrilldownSingleFieldWithParser(effectiveQuery string) (cleanBase, field string, ok bool) {
 	spec, specOK := parseStatsCompatSpec(effectiveQuery)
-	if !specOK || len(spec.GroupBy) != 1 || spec.Func != "count" {
+	if !specOK || len(spec.GroupBy) != 1 || spec.Func != "count" || isRateMathPipeline(effectiveQuery) {
 		return "", "", false
 	}
 	// Unlike detectDrilldownSingleField, we do NOT reject queries with parser stages —
@@ -137,7 +137,7 @@ func detectDrilldownSingleFieldWithParser(effectiveQuery string) (cleanBase, fie
 // when stats by (field) count() exceeds the per-request 16 MB response cap.
 func detectDrilldownSingleField(effectiveQuery string) (cleanBase, field string, ok bool) {
 	spec, specOK := parseStatsCompatSpec(effectiveQuery)
-	if !specOK || len(spec.GroupBy) != 1 || spec.Func != "count" {
+	if !specOK || len(spec.GroupBy) != 1 || spec.Func != "count" || isRateMathPipeline(effectiveQuery) {
 		return "", "", false
 	}
 	// count() if (field:*) works on column-indexed fields only; reject queries
