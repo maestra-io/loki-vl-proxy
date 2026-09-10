@@ -607,6 +607,9 @@ func TestVLQuerySemantics(t *testing.T) {
 	t.Run("JSONLineFormat", func(t *testing.T) {
 		testJSONLineFormat(t, p, slowNS, now)
 	})
+	t.Run("LabelMatcherAnchoring", func(t *testing.T) {
+		testLabelMatcherAnchoring(t, p, mainNS, tieNS, now)
+	})
 }
 
 // testPipelineCounts asserts that a parser pipeline does not change the count
@@ -733,6 +736,23 @@ func testInstantGrouping(t *testing.T, p *proxyProc, ns, slowNS string, now time
 		// The reported run answered 400 "unsupported instant aggregation target".
 		resp := queryInstant(t, p, `topk(1, sum by (app) (count_over_time(`+sel+`[1h])))`, now)
 		assertVectorEquals(t, resp, map[string]string{"{app=svc-a}": "9"})
+	})
+
+	t.Run("instant rate emits no empty level label", func(t *testing.T) {
+		// Grouping by the derived level makes VL return a `level` column for
+		// every series, "" where the field is absent. Loki emits no label at
+		// all; the empty one used to reach Grafana as a series dimension.
+		for _, s := range queryInstant(t, p, `rate(`+sel+`[1h])`, now).Data.Result {
+			for k, v := range s.Metric {
+				if strings.TrimSpace(v) == "" {
+					t.Errorf("series %v carries empty label %q", s.Metric, k)
+				}
+			}
+			if _, ok := s.Metric["level"]; ok {
+				t.Errorf("series %v carries a level label; the fixture rows in this "+
+					"namespace have no level field reachable without a parser stage", s.Metric)
+			}
+		}
 	})
 
 	t.Run("instant rate returns finite values", func(t *testing.T) {
@@ -890,6 +910,92 @@ func testJSONLineFormat(t *testing.T, p *proxyProc, ns string, now time.Time) {
 		if strings.Contains(l, "kubernetes.") || strings.Contains(l, `"message"`) {
 			t.Errorf("line_format rendered the record instead of the message: %q", l)
 		}
+	}
+}
+
+// testLabelMatcherAnchoring asserts Loki's label-matcher contract against real
+// VL: a `=~` matcher is anchored to the WHOLE label value.
+//
+// mainNS and tieNS are distinct roots, so this builds its own prefix-sibling
+// pair from mainNS to exercise the case that was silently wrong: a pattern that
+// is a strict substring of a real namespace name.
+func testLabelMatcherAnchoring(t *testing.T, p *proxyProc, mainNS, tieNS string, now time.Time) {
+	// mainNS is "appmain-<id>"; "ppmain-<id>" is a strict substring of it, so an
+	// UNANCHORED match returns mainNS's 15 rows while Loki returns nothing.
+	substr := strings.TrimPrefix(mainNS, "a")
+	if substr == mainNS {
+		t.Fatalf("fixture: expected mainNS %q to start with 'a'", mainNS)
+	}
+
+	count := func(logql string) string {
+		got := scalarByLabels(t, queryInstant(t, p, logql, now))
+		if len(got) != 1 {
+			t.Fatalf("%s: expected 1 series, got %d: %v", logql, len(got), got)
+		}
+		for _, v := range got {
+			return v
+		}
+		return ""
+	}
+
+	tests := []struct {
+		name  string
+		logql string
+		want  string
+	}{
+		{
+			// The defect: a substring pattern matched the longer real value.
+			name:  "substring pattern matches nothing",
+			logql: `sum(count_over_time({namespace=~"` + substr + `"}[1h]))`,
+			want:  "0",
+		},
+		{
+			name:  "exact pattern matches the namespace",
+			logql: `sum(count_over_time({namespace=~"` + mainNS + `"}[1h]))`,
+			want:  "15",
+		},
+		{
+			// Alternation must be grouped: "^a|b$" would match either a prefix
+			// or a suffix and pull in unrelated namespaces.
+			name:  "alternation matches both members exactly",
+			logql: `sum(count_over_time({namespace=~"` + mainNS + `|` + tieNS + `"}[1h]))`,
+			want:  "24", // 15 + 9
+		},
+		{
+			name:  "alternation with a substring member still excludes it",
+			logql: `sum(count_over_time({namespace=~"` + substr + `|` + tieNS + `"}[1h]))`,
+			want:  "9",
+		},
+		{
+			name:  "match-all still matches the namespace",
+			logql: `sum(count_over_time({namespace=~"` + mainNS + `.*"}[1h]))`,
+			want:  "15",
+		},
+		{
+			name:  "negated substring pattern excludes nothing",
+			logql: `sum(count_over_time({namespace=~"` + mainNS + `"} | namespace !~ "` + substr + `" [1h]))`,
+			want:  "15",
+		},
+		{
+			// A line filter regex must stay a SUBSTRING match over the log line.
+			// The fixture's messages are "hello error 0" etc.
+			name:  "line filter regex remains unanchored",
+			logql: `sum(count_over_time({namespace=~"` + mainNS + `"} |~ "hello" [1h]))`,
+			want:  "15",
+		},
+		{
+			name:  "line filter regex anchored by the author still works",
+			logql: `sum(count_over_time({namespace=~"` + mainNS + `"} |~ ".*hello.*" [1h]))`,
+			want:  "15",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := count(tc.logql); got != tc.want {
+				t.Errorf("%s\n got: %s\nwant: %s", tc.logql, got, tc.want)
+			}
+		})
 	}
 }
 

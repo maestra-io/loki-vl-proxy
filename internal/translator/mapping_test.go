@@ -62,7 +62,7 @@ func TestFallbackChainSelectors(t *testing.T) {
 		{
 			name:  "regexp match is a disjunction over the chain",
 			logql: `{app=~"trow.*"}`,
-			want:  `("kubernetes.pod_labels.app":~"trow.*" OR "kubernetes.pod_labels.app.kubernetes.io/name":~"trow.*")`,
+			want:  `("kubernetes.pod_labels.app":~"^(?:trow.*)$" OR "kubernetes.pod_labels.app.kubernetes.io/name":~"^(?:trow.*)$")`,
 		},
 		{
 			name:  "negated exact match is a conjunction of negations",
@@ -72,7 +72,7 @@ func TestFallbackChainSelectors(t *testing.T) {
 		{
 			name:  "negated regexp match is a conjunction of negations",
 			logql: `{app!~"noisy.*"}`,
-			want:  `(-"kubernetes.pod_labels.app":~"noisy.*" -"kubernetes.pod_labels.app.kubernetes.io/name":~"noisy.*")`,
+			want:  `(-"kubernetes.pod_labels.app":~"^(?:noisy.*)$" -"kubernetes.pod_labels.app.kubernetes.io/name":~"^(?:noisy.*)$")`,
 		},
 		{
 			name:  "empty value means none of the chained fields is set",

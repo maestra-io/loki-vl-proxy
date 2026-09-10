@@ -131,3 +131,83 @@ func TestAddGroupByParsedLabelsFJUsesLokiNames(t *testing.T) {
 		})
 	}
 }
+
+// TestDropEmptyDerivedLevelLabels locks the "no empty label value" rule.
+//
+// Grouping by the derived level makes VictoriaLogs return a `level` column for
+// every series, including rows where the field is absent — value "". Loki never
+// emits an empty label value, so instant `rate({...}[5m])` used to come back
+// with a `{level=""}` dimension that Grafana treats as a real series label.
+func TestDropEmptyDerivedLevelLabels(t *testing.T) {
+	tests := []struct {
+		name string
+		in   map[string]string
+		want map[string]string
+	}{
+		{
+			name: "empty level is dropped",
+			in:   map[string]string{"namespace": "ns", "pod": "p", "level": ""},
+			want: map[string]string{"namespace": "ns", "pod": "p"},
+		},
+		{
+			name: "empty detected_level is dropped",
+			in:   map[string]string{"namespace": "ns", "detected_level": ""},
+			want: map[string]string{"namespace": "ns"},
+		},
+		{
+			name: "both empty are dropped",
+			in:   map[string]string{"namespace": "ns", "level": "", "detected_level": ""},
+			want: map[string]string{"namespace": "ns"},
+		},
+		{
+			name: "whitespace-only counts as empty",
+			in:   map[string]string{"namespace": "ns", "level": "   "},
+			want: map[string]string{"namespace": "ns"},
+		},
+		{
+			name: "populated level is kept",
+			in:   map[string]string{"namespace": "ns", "level": "error"},
+			want: map[string]string{"namespace": "ns", "level": "error"},
+		},
+		{
+			name: "populated detected_level is kept",
+			in:   map[string]string{"detected_level": "warn"},
+			want: map[string]string{"detected_level": "warn"},
+		},
+		{
+			// Only the derived level labels are in scope; an empty value on any
+			// other label is left alone, since that is a separate contract.
+			name: "other empty labels are untouched",
+			in:   map[string]string{"namespace": "", "level": ""},
+			want: map[string]string{"namespace": ""},
+		},
+		{
+			name: "empty map",
+			in:   map[string]string{},
+			want: map[string]string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(map[string]string, len(tc.in))
+			for k, v := range tc.in {
+				got[k] = v
+			}
+
+			dropEmptyDerivedLevelLabels(got)
+
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for k, want := range tc.want {
+				if v, ok := got[k]; !ok || v != want {
+					t.Errorf("got[%q] = %q (present=%v), want %q", k, v, ok, want)
+				}
+			}
+		})
+	}
+
+	// Must not panic on a nil map.
+	dropEmptyDerivedLevelLabels(nil)
+}

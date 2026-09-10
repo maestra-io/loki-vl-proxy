@@ -186,6 +186,26 @@ func ensureDetectedLevel(labels map[string]string) {
 	}
 }
 
+// dropEmptyDerivedLevelLabels removes level / detected_level when their value
+// is the empty string.
+//
+// Grouping by the derived level makes VictoriaLogs return a `level` COLUMN for
+// every series, including rows where the field is absent — the value is then
+// "". Loki never emits an empty label value: an absent label is absent. Copying
+// the column through verbatim gave `{level=""}` on e.g. instant
+// `rate({namespace="x"}[5m])`, which shows up in Grafana as a real series
+// dimension and breaks legend/series matching against native Loki.
+func dropEmptyDerivedLevelLabels(labels map[string]string) {
+	if labels == nil {
+		return
+	}
+	for _, key := range []string{"level", "detected_level"} {
+		if value, ok := labels[key]; ok && strings.TrimSpace(value) == "" {
+			delete(labels, key)
+		}
+	}
+}
+
 // extractLevelFromMsg attempts to detect a log level from a raw log line,
 // matching Loki's ingest-time automatic level detection behavior.
 // Handles JSON ({"level":"error"}) and logfmt (level=error key=val).

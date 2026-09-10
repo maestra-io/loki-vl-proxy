@@ -861,6 +861,9 @@ func (p *Proxy) collectRangeMetricHits(
 			}
 			metric[lokiKey] = string(mv.GetStringBytes())
 		})
+		// VL returns an empty grouping column for rows lacking the field;
+		// Loki emits no label at all.
+		dropEmptyDerivedLevelLabels(metric)
 		seriesKey := canonicalLabelsKey(metric)
 
 		values := res.GetArray("values")

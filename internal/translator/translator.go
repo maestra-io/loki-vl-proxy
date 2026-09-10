@@ -1240,6 +1240,15 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			if label == "" {
 				return "", false
 			}
+
+			// Same anchoring as the stream selector: `| label =~ "re"` is a
+			// label matcher, so Loki requires a full-value match. ip("cidr") is
+			// not a regexp and keeps its own translation below.
+			if entry.entry.isRe {
+				if v := strings.Trim(value, "\"`"); !strings.HasPrefix(v, `ip("`) {
+					value = logsql.AnchorLabelMatcherRegex(v)
+				}
+			}
 			if mapping.isDerivedLevelLabel(label) {
 				if v := strings.Trim(value, "\"`"); v != "" {
 					if ff := mapping.derivedLevelFilter(v, entry.entry.negate, entry.entry.isRe); ff != "" {
@@ -2784,6 +2793,13 @@ func streamMatcherToFieldFilter(matcher string, labelFn LabelTranslateFunc, mapp
 			value := strings.TrimSpace(matcher[idx+len(op.logql):])
 			if label == "" {
 				return ""
+			}
+
+			// Loki anchors label-matcher regexps to the whole value; VL's
+			// `field:~"re"` does not. Anchor here, once, before the value fans
+			// out to the fallback-chain / service_name / plain branches below.
+			if op.isRe {
+				value = logsql.AnchorLabelMatcherRegex(strings.Trim(value, "\"`"))
 			}
 
 			// Fallback chain: the Loki label is backed by an ordered list of VL

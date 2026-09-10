@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`=~` / `!~` label matchers reached VictoriaLogs UNANCHORED.** Loki anchors a
+  label-matcher regexp to the whole label value, so `{namespace=~"nch"}` matches
+  only the exact value `nch`. VL's `field:~"re"` is a substring match, so the
+  pattern was passed through verbatim and every `=~` matcher silently widened:
+  `{namespace=~"nch"}` matched `anch` and `nch-b`, and `{namespace=~"ppx"}`
+  matched `appx`. A widened matcher inflates counts instead of erroring, so
+  nothing surfaced it. Label matchers are now emitted as `^(?:<re>)$` in both
+  stream selectors and `| label =~ …` pipeline filters, including over
+  `-field-mapping` fallback chains and the synthetic `service_name` expansion.
+  The non-capturing group is required: `^a|b$` parses as `(^a)|(b$)` and would
+  match any value containing `a` or ending in `b`. Leading inline flags are
+  hoisted (`(?i)prod` → `(?i)^(?:prod)$`). **Line filters (`|~`, `!~` on the log
+  line) stay unanchored** — those are substring regexps in Loki too. No flag:
+  this is Loki compatibility, not an option.
+- **Instant `rate(...)` emitted an empty `level=""` label.** Grouping by the
+  derived level makes VL return a `level` column for every series, empty where
+  the field is absent. Loki emits no label at all in that case; the empty one
+  reached Grafana as a real series dimension. Empty-valued `level` /
+  `detected_level` are now dropped from metric responses.
+
 - **Instant `quantile_over_time(...) by (labels)` ignored its grouping.**
   `quantile_over_time` is intercepted by its own two-argument translator before
   the generic metric-function loop, and that interceptor never parsed the
