@@ -27,6 +27,15 @@ type Pipeline struct {
 	tmpls  map[any]*Template
 	buf    strings.Builder
 
+	// base is the label set the entry arrived with — its stream labels and
+	// structured metadata. LogQL gives those priority over anything a parser
+	// extracts: a `| json` that finds a `namespace` in the body does NOT
+	// overwrite the stream's `namespace`, it adds `namespace_extracted`.
+	// Reused across entries; Process resets it (a Pipeline is single-goroutine,
+	// like buf).
+	base   map[string]struct{}
+	parsed map[string]string
+
 	// UnwrapLabel is the label named by a trailing `| unwrap x` stage, if any.
 	UnwrapLabel string
 	// UnwrapConv is the converter of `| unwrap bytes(x)` / `duration(x)`.
@@ -190,6 +199,13 @@ type assignKey struct {
 // Process runs every stage against e, mutating it in place. It reports whether
 // the entry survives the pipeline's filters.
 func (p *Pipeline) Process(e *Entry) bool {
+	if p.base == nil {
+		p.base = make(map[string]struct{}, len(e.Labels))
+	}
+	clear(p.base)
+	for k := range e.Labels {
+		p.base[k] = struct{}{}
+	}
 	for _, s := range p.stages {
 		if !p.apply(s, e) {
 			return false
@@ -278,13 +294,17 @@ func (p *Pipeline) applyLabelFormat(st *LabelFormatStage, e *Entry) {
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
 func (p *Pipeline) applyParser(st *ParserStage, e *Entry) {
+	if p.parsed == nil {
+		p.parsed = make(map[string]string, 16)
+	}
+	clear(p.parsed)
 	switch st.Type {
 	case ParserJSON:
-		parseJSONInto(e, st.Params)
+		parseJSONInto(e, st.Params, p.parsed)
 	case ParserLogfmt:
-		parseLogfmtInto(e, st.Params)
+		parseLogfmtInto(e, st.Params, p.parsed)
 	case ParserUnpack:
-		parseUnpackInto(e)
+		parseUnpackInto(e, p.parsed)
 	case ParserRegexp, ParserPattern:
 		re, err := compileExtractor(st)
 		if err != nil || re == nil {
@@ -298,8 +318,22 @@ func (p *Pipeline) applyParser(st *ParserStage, e *Entry) {
 			if name == "" || i >= len(m) {
 				continue
 			}
-			e.Labels[name] = m[i]
+			p.parsed[name] = m[i]
 		}
+	}
+	p.mergeParsed(e)
+}
+
+// mergeParsed copies the stage's extracted labels onto the entry, renaming any
+// that collide with a label the entry already carried — Loki's `_extracted`
+// rule, without which a body field silently replaces the stream label it shares
+// a name with (a `sum by (namespace)` then fans out over the body's values).
+func (p *Pipeline) mergeParsed(e *Entry) {
+	for k, v := range p.parsed {
+		if _, collides := p.base[k]; collides {
+			k += "_extracted"
+		}
+		e.Labels[k] = v
 	}
 }
 
@@ -308,14 +342,14 @@ func setError(labels map[string]string, kind, details string) {
 	labels[errorDetailsLabel] = details
 }
 
-func parseJSONInto(e *Entry, params []LabelExtraction) {
+func parseJSONInto(e *Entry, params []LabelExtraction, out map[string]string) {
 	var v interface{}
 	if err := json.Unmarshal([]byte(e.Line), &v); err != nil {
 		setError(e.Labels, "JSONParserErr", err.Error())
 		return
 	}
 	if len(params) == 0 {
-		flattenJSON("", v, e.Labels)
+		flattenJSON("", v, out)
 		return
 	}
 	for _, prm := range params {
@@ -324,7 +358,7 @@ func parseJSONInto(e *Entry, params []LabelExtraction) {
 			path = prm.Name
 		}
 		if got, ok := lookupJSONPath(v, path); ok {
-			e.Labels[sanitizeLabel(prm.Name)] = got
+			out[sanitizeLabel(prm.Name)] = got
 		}
 	}
 }
@@ -441,11 +475,11 @@ func splitJSONPath(path string) []string {
 	return segs
 }
 
-func parseLogfmtInto(e *Entry, params []LabelExtraction) {
+func parseLogfmtInto(e *Entry, params []LabelExtraction, out map[string]string) {
 	fields := parseLogfmt(e.Line)
 	if len(params) == 0 {
 		for k, v := range fields {
-			e.Labels[sanitizeLabel(k)] = v
+			out[sanitizeLabel(k)] = v
 		}
 		return
 	}
@@ -455,7 +489,7 @@ func parseLogfmtInto(e *Entry, params []LabelExtraction) {
 			src = prm.Name
 		}
 		if v, ok := fields[src]; ok {
-			e.Labels[sanitizeLabel(prm.Name)] = v
+			out[sanitizeLabel(prm.Name)] = v
 		}
 	}
 }
@@ -522,7 +556,7 @@ func unescapeByte(c byte) byte {
 
 // parseUnpackInto implements `| unpack`: a JSON object whose `_entry` field
 // replaces the line while its other fields become labels.
-func parseUnpackInto(e *Entry) {
+func parseUnpackInto(e *Entry, out map[string]string) {
 	var obj map[string]interface{}
 	if err := json.Unmarshal([]byte(e.Line), &obj); err != nil {
 		setError(e.Labels, "JSONParserErr", err.Error())
@@ -536,7 +570,7 @@ func parseUnpackInto(e *Entry) {
 			continue
 		}
 		if s, ok := v.(string); ok {
-			e.Labels[sanitizeLabel(k)] = s
+			out[sanitizeLabel(k)] = s
 		}
 	}
 }

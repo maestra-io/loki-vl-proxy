@@ -348,7 +348,6 @@ func TestUpstreamLog_CarriesFullLogsQLOnFailure(t *testing.T) {
 			var buf bytes.Buffer
 			orig := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			defer slog.SetDefault(orig)
 			vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
@@ -361,6 +360,9 @@ func TestUpstreamLog_CarriesFullLogsQLOnFailure(t *testing.T) {
 				LogLevel:             "debug",
 				LogTranslatedQueries: tc.logTranslated,
 			})
+			// New() captured the handler; restore the global default at once so a
+			// parallel test never writes into this buffer (or reads a swapped one).
+			slog.SetDefault(orig)
 			if err != nil {
 				t.Fatalf("create proxy: %v", err)
 			}
@@ -413,5 +415,87 @@ func TestTemplatePipeline_PushesFiltersDownWithTheSelector(t *testing.T) {
 	}
 	if !strings.Contains(gotQuery, "level") {
 		t.Fatalf("the parser-stage filter was not pushed down: %q", gotQuery)
+	}
+}
+
+// The two-phase high-cardinality path (a `sum by (<stream label>)` over a range
+// wide enough to trip the global top-N gate) builds its OWN request and response
+// handling, and it kept VictoriaLogs' bucket-START labels after the direct path
+// was fixed: every point of `sum by (app) (count_over_time({...}[1h]))` sat one
+// step to the left and the last bucket collected data past `end`.
+func TestQueryRange_TwoPhaseGroupedCountIsOnTheLokiGrid(t *testing.T) {
+	base := time.Unix(1700000400, 0).UTC() // hour-aligned
+	const step = 3600
+
+	var phase2Start string
+	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		q := r.Form.Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(q, "sort by (_c desc)") { // phase 1: the legend
+			_, _ = fmt.Fprintf(w,
+				`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"trow"},"values":[[%d,"9"]]}]}}`,
+				base.Unix())
+			return
+		}
+		phase2Start = r.Form.Get("start")
+		// Buckets base+k*step carry k+1 — every step distinct.
+		pts := make([]string, 0, 5)
+		for k := 0; k < 5; k++ {
+			pts = append(pts, fmt.Sprintf(`[%d,"%d"]`, base.Unix()+int64(k*step), k+1))
+		}
+		_, _ = fmt.Fprintf(w,
+			`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"trow"},"values":[%s]}]}}`,
+			strings.Join(pts, ","))
+	}))
+	defer vlBackend.Close()
+
+	p := newGapTestProxy(t, vlBackend.URL)
+	params := url.Values{}
+	params.Set("query", `sum by (app) (count_over_time({namespace="trow-system"}[1h]))`)
+	params.Set("start", strconv.FormatInt(base.Unix()+step, 10))
+	params.Set("end", strconv.FormatInt(base.Unix()+4*step, 10)) // 3h: over the two-phase gate
+	params.Set("step", strconv.Itoa(step))
+	rec := httptest.NewRecorder()
+	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?"+params.Encode(), nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if want := strconv.FormatInt(base.Unix(), 10); phase2Start != want {
+		t.Fatalf("phase-2 start = %q, want %q (client start minus one step)", phase2Start, want)
+	}
+
+	var resp struct {
+		Data struct {
+			Result []struct {
+				Values [][]interface{} `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data.Result) != 1 {
+		t.Fatalf("expected 1 series, got %s", rec.Body.String())
+	}
+	// Point base+k*step carries bucket base+(k-1)*step, i.e. k. The bucket at
+	// base+4*step would land past `end` and is dropped.
+	want := map[int64]string{}
+	for k := 1; k <= 4; k++ {
+		want[base.Unix()+int64(k*step)] = strconv.Itoa(k)
+	}
+	got := resp.Data.Result[0].Values
+	if len(got) != len(want) {
+		t.Fatalf("expected %d points, got %d: %v", len(want), len(got), got)
+	}
+	for _, pt := range got {
+		ts := int64(pt[0].(float64))
+		v := fmt.Sprintf("%v", pt[1])
+		if w, ok := want[ts]; !ok {
+			t.Fatalf("unexpected point at base%+ds: %v", ts-base.Unix(), got)
+		} else if v != w {
+			t.Fatalf("point at base%+ds = %s, want %s (buckets still labelled by START?)", ts-base.Unix(), v, w)
+		}
 	}
 }

@@ -578,6 +578,9 @@ func (p *Proxy) buildTemplateMetricPlan(ctx context.Context, originalLogql, logs
 		Func:        statsSpec.Func,
 		Field:       statsSpec.Field,
 	}
+	// An outer aggregation over an ORDER STATISTIC runs across the per-label-set
+	// series, not over one pooled series (see applyLokiSeriesDecomposition).
+	applyLokiSeriesDecomposition(&spec, originalLogql, manualFunc)
 
 	field, quantile, err := templateMetricField(statsSpec, origSpec, manualFunc)
 	if err != nil {
@@ -633,8 +636,12 @@ func (p *Proxy) templateMetricRangeBody(r *http.Request, mp *templateMetricPlan)
 		return nil, err
 	}
 	// The template pipeline yields RAW log entries.
-	return buildManualRangeMetricMatrix(mp.manualFunc, mp.quantile, series,
-		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries(), false), nil
+	body := buildManualRangeMetricMatrix(mp.manualFunc, mp.quantile, series,
+		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries(), false)
+	if mp.spec.OuterAggAcrossSeries != "" {
+		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy)
+	}
+	return body, nil
 }
 
 // templateMetricInstantBody evaluates an instant metric query over a template
@@ -651,7 +658,11 @@ func (p *Proxy) templateMetricInstantBody(r *http.Request, mp *templateMetricPla
 		return nil, err
 	}
 	// The template pipeline yields RAW log entries.
-	return buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window, false), nil
+	body := buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window, false)
+	if mp.spec.OuterAggAcrossSeries != "" {
+		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy)
+	}
+	return body, nil
 }
 
 // handleTemplateMetricRange answers a range metric query over a template

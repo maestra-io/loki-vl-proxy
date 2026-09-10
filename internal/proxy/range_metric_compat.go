@@ -28,6 +28,12 @@ type statsCompatSpec struct {
 	Func        string
 	Field       string
 
+	// OuterAggAcrossSeries is the outer aggregation that must run ACROSS the
+	// per-label-set series instead of being folded into a pooled grouping — see
+	// outerAggregationOverSeries. OuterAggBy carries its by() labels.
+	OuterAggAcrossSeries string
+	OuterAggBy           []string
+
 	// UserParserStages records whether the CLIENT's LogQL carried a parser stage
 	// (| json, | logfmt, | pattern, | regexp, | unpack). It is read from the
 	// original query, never sniffed out of the translated LogsQL: the translator
@@ -441,7 +447,8 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 	if noSlidingOverlap && spec.UserParserStages && hasOrigSpec && hasDropErrorOnlyPostParserStage(origSpec.BaseQuery) {
 		return false
 	}
-	if !shouldUseManualRangeMetricCompat(spec.BaseQuery, manualFunc, noSlidingOverlap, spec.UserParserStages) {
+	if !manualQuantileRoutable(spec, manualFunc) &&
+		!shouldUseManualRangeMetricCompat(spec.BaseQuery, manualFunc, noSlidingOverlap, spec.UserParserStages) {
 		return false
 	}
 	if !hasOrigSpec || origSpec.Window <= 0 {
@@ -455,9 +462,7 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 	// A bare outer aggregation without by() collapses all streams into one empty-label
 	// series in Loki. Set ByExplicit=true so buildManualMetricLabels returns {} and
 	// collectRangeMetricSamples produces a single series — not one per stream.
-	if len(spec.GroupBy) == 0 && !spec.ByExplicit && hasOuterAggregationWithoutBy(originalLogql) {
-		spec.ByExplicit = true
-	}
+	applyLokiSeriesDecomposition(&spec, originalLogql, manualFunc)
 	return p.proxyManualRangeMetricRange(w, r, spec, origSpec, manualFunc)
 }
 
@@ -568,7 +573,8 @@ func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request,
 	// queries; the manual path aggregates them into the expected single series.
 	if spec.UserParserStages {
 		// Parser+no-drop-error → always manual for correct stream-collapse semantics.
-	} else if !shouldUseManualRangeMetricCompat(spec.BaseQuery, manualFunc, true, spec.UserParserStages) {
+	} else if !manualQuantileRoutable(spec, manualFunc) &&
+		!shouldUseManualRangeMetricCompat(spec.BaseQuery, manualFunc, true, spec.UserParserStages) {
 		return false
 	}
 	if !hasOrigSpec || origSpec.Window <= 0 {
@@ -582,9 +588,7 @@ func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request,
 	// A bare outer aggregation without by() collapses all streams into one empty-label
 	// series in Loki. Set ByExplicit=true so buildManualMetricLabels returns {} and
 	// collectRangeMetricSamples produces a single series — not one per stream.
-	if len(spec.GroupBy) == 0 && !spec.ByExplicit && hasOuterAggregationWithoutBy(originalLogql) {
-		spec.ByExplicit = true
-	}
+	applyLokiSeriesDecomposition(&spec, originalLogql, manualFunc)
 	return p.proxyManualRangeMetricInstant(w, r, spec, origSpec, manualFunc)
 }
 
@@ -646,6 +650,46 @@ func parseTopKWrapper(logql string) (k int, descending bool, ok bool) {
 // step. When true, VL's native rate() — which buckets by the step interval —
 // is semantically identical to LogQL rate()[range]. Pass false to keep the
 // sliding-window manual path for cases where range != step.
+// quantileFallsBackToBackend reports whether a failed raw-row scan for a
+// QUANTILE should hand the query back to the native VictoriaLogs route.
+//
+// A quantile is computed here because VictoriaLogs' `quantile()` is nearest-rank
+// while LogQL interpolates — but that exactness is bought with a raw-row scan,
+// and a busy panel can exceed the scan cap. Failing such a panel with a 400
+// trades a small numeric difference for no chart at all, so a truncated scan
+// falls back to VictoriaLogs' own quantile instead.
+func quantileFallsBackToBackend(manualFunc string, err error) bool {
+	if manualFunc != "quantile" {
+		return false
+	}
+	var truncated *rawRowScanTruncatedError
+	return errors.As(err, &truncated)
+}
+
+// manualQuantileRoutable reports whether a quantile query must be evaluated
+// HERE rather than pushed to VictoriaLogs.
+//
+// VL's `quantile()` returns an actual sample (nearest rank); LogQL interpolates
+// between the two order statistics around `q*(n-1)`, exactly as Prometheus does.
+// Measured against Loki 3.7.1 over the ten samples 109…199: q=0.95 → Loki 194.5,
+// VL 199; q=0.5 → Loki 154, VL 149. They agree only when the two neighbouring
+// samples happen to be equal, so the quantile is computed here from the raw
+// values with Loki's formula (quantileFloat64).
+//
+// A two-stage translation (an outer aggregation over the quantile) hides the
+// field inside a second stats clause that this spec cannot parse; those keep
+// their existing route.
+func manualQuantileRoutable(spec statsCompatSpec, manualFunc string) bool {
+	if manualFunc != "quantile" {
+		return false
+	}
+	_, field, ok := parseStatsQuantileSpec(spec.Field)
+	// A two-stage translation leaves the rest of the pipeline inside `field`
+	// ("duration_ms) as __lvp_inner | stats max(...)"), which parses but names
+	// nothing; routing that here yields an empty result.
+	return ok && field != "" && !strings.ContainsAny(field, " |()\"'")
+}
+
 func shouldUseManualRangeMetricCompat(baseQuery, manualFunc string, rangeEqualsStep, userParserStages bool) bool {
 	manualFunc = strings.TrimSpace(manualFunc)
 	if manualFunc == "rate_counter" {
@@ -761,12 +805,18 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 
 	series, err := p.collectRangeMetricSamples(r.Context(), spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, field, origSpec.UnwrapConv, startTS.Add(-origSpec.Window), endTS)
 	if err != nil {
+		if quantileFallsBackToBackend(manualFunc, err) {
+			return false
+		}
 		p.writeError(w, statusForRangeMetricCollectError(err), err.Error())
 		return true
 	}
 
 	// collectRangeMetricSamples returns RAW log entries.
 	result := buildManualRangeMetricMatrix(manualFunc, quantile, series, startTS, endTS, step, origSpec.Window, p.resolvedMaxStatsQuerySeries(), false)
+	if spec.OuterAggAcrossSeries != "" {
+		result = reduceLokiSeriesAcrossSeries(result, spec.OuterAggAcrossSeries, spec.OuterAggBy)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(result) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter -- Content-Type set above; proxy returns pre-built JSON
 	return true
@@ -789,12 +839,18 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 
 	series, err := p.collectRangeMetricSamples(r.Context(), spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, field, origSpec.UnwrapConv, evalTS.Add(-origSpec.Window), evalTS)
 	if err != nil {
+		if quantileFallsBackToBackend(manualFunc, err) {
+			return false
+		}
 		p.writeError(w, statusForRangeMetricCollectError(err), err.Error())
 		return true
 	}
 
 	// collectRangeMetricSamples returns RAW log entries.
 	result := buildManualRangeMetricVector(manualFunc, quantile, series, evalTS, origSpec.Window, false)
+	if spec.OuterAggAcrossSeries != "" {
+		result = reduceLokiSeriesAcrossSeries(result, spec.OuterAggAcrossSeries, spec.OuterAggBy)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(result) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter -- Content-Type set above; proxy returns pre-built JSON
 	return true
@@ -2028,4 +2084,223 @@ func rateCounterWindow(values []float64, windowSeconds float64) float64 {
 		prev = current
 	}
 	return increase / windowSeconds
+}
+
+// outerAggregationOverSeries returns the bare outer aggregation that must be
+// applied ACROSS series, or "" when the range aggregation may instead be pooled
+// into a single series.
+//
+// LogQL evaluates the range aggregation PER LABEL SET and only then applies the
+// outer aggregation. Pooling every row into one series is a shortcut that holds
+// exactly when the outer aggregation is a sum of additive per-series values —
+// `sum(count_over_time(...))` is the same number either way. It does NOT hold
+// for an order statistic: `max(quantile_over_time(0.95, …))` is the max of the
+// per-series p95s, and pooling returns the p95 of everything, which is lower
+// (measured on the T5 panel: 1488.7 pooled vs 1720 in Loki, −13.4%).
+func outerAggregationOverSeries(originalLogql, manualFunc string) (agg string, by []string, ok bool) {
+	switch manualFunc {
+	case "quantile", "min", "max", "avg", "stddev", "stdvar", "first", "last":
+	default:
+		// count/rate/bytes are ADDITIVE: pooling every row into one series is the
+		// same number the outer sum would produce, and it is the cheaper path.
+		return "", nil, false
+	}
+	trimmed := stripOuterLabelReplace(strings.TrimSpace(originalLogql))
+	loc := outerAggregationRE.FindStringIndex(trimmed)
+	if loc == nil || loc[0] != 0 || loc[1] >= len(trimmed) {
+		return "", nil, false
+	}
+	// outerAggregationRE matches a bare keyword, and every one of them is also
+	// the prefix of a RANGE aggregation: `min_over_time(...)` starts with `min`,
+	// `count_over_time(...)` with `count`. Only a `(` (after an optional
+	// by/without clause) makes it the outer operator.
+	if !strings.HasPrefix(strings.TrimSpace(trimmed[loc[1]:]), "(") {
+		return "", nil, false
+	}
+	name := strings.TrimSpace(trimmed[loc[0]:loc[1]])
+	if i := strings.IndexAny(name, "( \t"); i > 0 {
+		name = name[:i]
+	}
+	switch name {
+	case "sum", "min", "max", "avg", "count":
+	default:
+		// topk/bottomk/sort/stddev keep their existing post-processing.
+		return "", nil, false
+	}
+	return name, parseOriginalByLabels(originalLogql), true
+}
+
+// applyLokiSeriesDecomposition makes the manual path evaluate the range
+// aggregation the way LogQL does — once per LABEL SET — and reduce the results
+// with the outer aggregation afterwards. Pooling every row into one series is
+// only equivalent for an additive aggregation; on an order statistic it answers
+// a different question (the T5 panel: p95 of everything, 1488.7, where Loki
+// takes the max of the per-series p95s, 1720).
+func applyLokiSeriesDecomposition(spec *statsCompatSpec, originalLogql, manualFunc string) {
+	agg, by, ok := outerAggregationOverSeries(originalLogql, manualFunc)
+	if !ok {
+		// A bare outer aggregation without by() collapses all streams into one
+		// empty-label series in Loki, and pooling gets there directly.
+		if len(spec.GroupBy) == 0 && !spec.ByExplicit && hasOuterAggregationWithoutBy(originalLogql) {
+			spec.ByExplicit = true
+		}
+		return
+	}
+	spec.OuterAggAcrossSeries, spec.OuterAggBy = agg, by
+	// Only the POOLING is switched off. The grouping labels stay: the raw-row
+	// collector needs them to keep parser-derived dimensions in the series key
+	// (it only materialises the fields named in by(...)), and dropping them
+	// would leave the reduction below with labels that no longer exist.
+	spec.ByExplicit = false
+}
+
+// reduceLokiSeriesAcrossSeries applies the outer aggregation LogQL runs over the
+// per-series range-aggregation results, collapsing the matrix/vector to one
+// series per `by` group (one unlabelled series when by is empty).
+//
+// groupedMetricLabels keeps only the grouping labels of a series.
+func groupedMetricLabels(metric map[string]string, by []string) map[string]string {
+	if len(by) == 0 {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(by))
+	for _, name := range by {
+		if v, ok := metric[name]; ok && v != "" {
+			out[name] = v
+		}
+	}
+	return out
+}
+
+func reduceLokiSeriesAcrossSeries(body []byte, agg string, by []string) []byte {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+	data, _ := resp["data"].(map[string]interface{})
+	if data == nil {
+		return body
+	}
+	result, _ := data["result"].([]interface{})
+	if len(result) == 0 {
+		return body
+	}
+	// A single series is NOT a no-op: the decomposition keeps the full label set
+	// on it, and the outer aggregation still has to trim it to its by() labels
+	// (to `{}` when it has none).
+
+	type acc struct {
+		val    float64
+		count  int
+		metric map[string]string
+	}
+	type key struct {
+		ts    int64
+		group string
+	}
+	byTS := map[key]*acc{}
+	instant := false
+	add := func(ts int64, v float64, metric map[string]string) {
+		grouped := groupedMetricLabels(metric, by)
+		k := key{ts: ts, group: canonicalLabelsKey(grouped)}
+		a := byTS[k]
+		if a == nil {
+			byTS[k] = &acc{val: v, count: 1, metric: grouped}
+			return
+		}
+		a.count++
+		switch agg {
+		case "min":
+			if v < a.val {
+				a.val = v
+			}
+		case "max":
+			if v > a.val {
+				a.val = v
+			}
+		default: // sum, avg, count
+			a.val += v
+		}
+	}
+	for _, raw := range result {
+		s, _ := raw.(map[string]interface{})
+		if s == nil {
+			continue
+		}
+		metric := map[string]string{}
+		if m, ok := s["metric"].(map[string]interface{}); ok {
+			for k, v := range m {
+				metric[k], _ = v.(string)
+			}
+		}
+		if pt, ok := s["value"].([]interface{}); ok && len(pt) >= 2 {
+			instant = true
+			add(int64(parsePointValue(pt[0])), parsePointValue(pt[1]), metric)
+			continue
+		}
+		values, _ := s["values"].([]interface{})
+		for _, rawPt := range values {
+			pt, _ := rawPt.([]interface{})
+			if len(pt) < 2 {
+				continue
+			}
+			add(int64(parsePointValue(pt[0])), parsePointValue(pt[1]), metric)
+		}
+	}
+
+	keys := make([]key, 0, len(byTS))
+	for k := range byTS {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].group != keys[j].group {
+			return keys[i].group < keys[j].group
+		}
+		return keys[i].ts < keys[j].ts
+	})
+
+	type outSeries struct {
+		metric map[string]string
+		points []interface{}
+	}
+	order := make([]string, 0, 4)
+	out := map[string]*outSeries{}
+	for _, k := range keys {
+		a := byTS[k]
+		v := a.val
+		switch agg {
+		case "avg":
+			v /= float64(a.count)
+		case "count":
+			v = float64(a.count)
+		}
+		os := out[k.group]
+		if os == nil {
+			os = &outSeries{metric: a.metric}
+			out[k.group] = os
+			order = append(order, k.group)
+		}
+		os.points = append(os.points, []interface{}{k.ts, strconv.FormatFloat(v, 'f', -1, 64)})
+	}
+
+	reduced := make([]interface{}, 0, len(order))
+	for _, g := range order {
+		os := out[g]
+		series := map[string]interface{}{"metric": os.metric}
+		if instant {
+			if len(os.points) == 0 {
+				continue
+			}
+			series["value"] = os.points[len(os.points)-1]
+		} else {
+			series["values"] = os.points
+		}
+		reduced = append(reduced, series)
+	}
+	data["result"] = reduced
+	encoded, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return encoded
 }

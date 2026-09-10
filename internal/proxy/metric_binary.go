@@ -145,13 +145,18 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 
 	// Keep metric query_range as a single backend request. Window splitting and
 	// window-level cache reuse are for raw log queries only.
+	// `now`/`now±d` bounds resolve against time.Now() on EVERY parse, so the
+	// request and the response filter would otherwise be built from two
+	// different instants — and the filter, being later, drops the very first
+	// point the request went one step back to fetch. Freeze them once.
+	startRaw := freezeRelativeRangeBound(r.FormValue("start"))
+	endRaw := freezeRelativeRangeBound(r.FormValue("end"))
+
 	// VictoriaLogs labels each stats bucket with its START; LogQL labels every
 	// range-metric point with the EVALUATION time, i.e. the bucket's END. The
 	// response is relabelled below, and the request reaches one step FURTHER
 	// BACK so the point at `start` still has a bucket behind it.
-	params := buildStatsQueryRangeParams(logsqlQuery,
-		shiftRangeStartOneStep(r.FormValue("start"), r.FormValue("step")),
-		r.FormValue("end"), r.FormValue("step"))
+	params := p.buildLokiGridStatsParams(logsqlQuery, startRaw, endRaw, r.FormValue("step"))
 
 	// Use vlPost directly (not coalesced) so readBodyLimited can bound the response
 	// before the full body is allocated. The coalescer's 256 MB cap is too generous
@@ -212,20 +217,9 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 
 	// Single parse pass: filter points to the requested end time AND translate
 	// metric labels. Replaces two sequential fastjson parses (trim then translate).
-	body = shiftStatsQRToLokiGrid(body, r.FormValue("step"))
-	var keepFn func(int64) bool
-	startNs, hasStart := parseLokiTimeToUnixNano(r.FormValue("start"))
-	endNs, hasEnd := parseLokiTimeToUnixNano(r.FormValue("end"))
-	if hasStart || hasEnd {
-		keepFn = func(tsNs int64) bool {
-			if hasEnd && tsNs > endNs {
-				return false
-			}
-			// The extra step requested above can yield a point before `start`.
-			return !hasStart || tsNs >= startNs
-		}
-	}
-	body = p.trimAndTranslateStatsQRFJ(r.Context(), body, keepFn, r.FormValue("query"))
+	body = shiftStatsQRToLokiGrid(body, startRaw, r.FormValue("step"))
+	body = p.trimAndTranslateStatsQRFJ(r.Context(), body,
+		lokiGridWindowKeep(startRaw, endRaw), r.FormValue("query"))
 	// Cap to the busiest maxStatsQuerySeries (default 500, top-N by total count).
 	// This is the path taken by `sum by (pod|trace_id|*_id) (count_over_time(
 	// {...} | detected_level="error" [w]))` from the Drilldown labels page —
@@ -2183,7 +2177,8 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	if !ok || spec.Func != "count" || len(spec.GroupBy) != 1 || isRateMathPipeline(logsqlQuery) {
 		return nil
 	}
-	start, end := r.FormValue("start"), r.FormValue("end")
+	start := freezeRelativeRangeBound(r.FormValue("start"))
+	end := freezeRelativeRangeBound(r.FormValue("end"))
 	startNs, ok1 := parseLokiTimeToUnixNano(start)
 	endNs, ok2 := parseLokiTimeToUnixNano(end)
 	if !ok1 || !ok2 || endNs <= startNs {
@@ -2244,7 +2239,7 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	inFilter := buildVLInFilter(field, topValues)
 	p2Query := p1Base + " | filter " + inFilter + " | stats by (" + quoteLogsQLIdent(field) + ") count()"
 	p2Query = p.addUnderscorefallbackByLabels(p2Query, parseOriginalByLabels(r.FormValue("query")))
-	p2Params := buildStatsQueryRangeParams(p2Query, start, end, r.FormValue("step"))
+	p2Params := p.buildLokiGridStatsParams(p2Query, start, end, r.FormValue("step"))
 	resp2, err := p.vlPost(ctx, "/select/logsql/stats_query_range", p2Params)
 	if err != nil {
 		return nil
@@ -2257,15 +2252,16 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	if p2Err != nil {
 		return nil
 	}
-	keepFn := func(tsNs int64) bool { return tsNs <= endNs }
-	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, keepFn, r.FormValue("query"))
+	p2Body = shiftStatsQRToLokiGrid(p2Body, start, r.FormValue("step"))
+	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, lokiGridWindowKeep(start, end), r.FormValue("query"))
 	p2Body = limitLokiMatrixSeries(p2Body, p.resolvedMaxStatsQuerySeries())
 	return wrapAsLokiResponse(p2Body, "matrix")
 }
 
 func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, field, effectiveStep string) []byte {
 	ctx := r.Context()
-	start, end := r.FormValue("start"), r.FormValue("end")
+	start := freezeRelativeRangeBound(r.FormValue("start"))
+	end := freezeRelativeRangeBound(r.FormValue("end"))
 	step := effectiveStep
 	if step == "" {
 		step = r.FormValue("step")
@@ -2316,7 +2312,7 @@ func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, fi
 	origGroupBy := parseOriginalByLabels(r.FormValue("query"))
 	p2Query = p.addUnderscorefallbackByLabels(p2Query, origGroupBy)
 
-	p2Params := buildStatsQueryRangeParams(p2Query, start, end, step)
+	p2Params := p.buildLokiGridStatsParams(p2Query, start, end, step)
 	resp2, err := p.vlPost(ctx, "/select/logsql/stats_query_range", p2Params)
 	if err != nil {
 		return nil
@@ -2331,11 +2327,8 @@ func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, fi
 		return nil
 	}
 
-	var keepFn func(int64) bool
-	if ok2 {
-		keepFn = func(tsNs int64) bool { return tsNs <= endNs }
-	}
-	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, keepFn, r.FormValue("query"))
+	p2Body = shiftStatsQRToLokiGrid(p2Body, start, step)
+	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, lokiGridWindowKeep(start, end), r.FormValue("query"))
 	p2Body = limitLokiMatrixSeries(p2Body, maxDrilldownSeries)
 	return wrapAsLokiResponse(p2Body, "matrix")
 }
@@ -2562,18 +2555,32 @@ func shiftRangeStartOneStep(startRaw, stepRaw string) string {
 // Loki draws it. Sums are unaffected, so a suite comparing totals sees nothing
 // wrong, while the chart silently lags one step and the newest bucket — the one
 // at `end` — never appears at all.
-func shiftStatsQRToLokiGrid(body []byte, stepRaw string) []byte {
+func shiftStatsQRToLokiGrid(body []byte, startRaw, stepRaw string) []byte {
 	step, ok := parsePositiveStepDuration(stepRaw)
 	if !ok || step <= 0 {
 		return body
 	}
-	return mapStatsQRPointTimestamps(body, step.Nanoseconds())
+	// buildLokiGridStatsParams moved the grid left by `offset`, so the bucket
+	// labelled L is the LogQL point at `L + step - offset` — which lands on the
+	// client's own step grid. Snapping to that grid keeps the points exact even
+	// against a backend that ignored the offset (it then shifts by a fraction of
+	// one step, and the nearest grid position is still the right point).
+	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)
+	stepNs := step.Nanoseconds()
+	delta := stepNs - lokiGridOffsetNanos(startRaw, stepRaw)
+	return mapStatsQRPointTimestamps(body, delta, func(tsNs int64) int64 {
+		if !hasStart {
+			return tsNs
+		}
+		k := int64(math.Round(float64(tsNs-startNs) / float64(stepNs)))
+		return startNs + k*stepNs
+	})
 }
 
 // mapStatsQRPointTimestamps rewrites the first element of every point array in a
 // stats_query_range response, adding deltaNs. Timestamps are re-emitted in the
 // unit they arrived in (VL uses whole seconds), so the shape is unchanged.
-func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
+func mapStatsQRPointTimestamps(body []byte, deltaNs int64, snap func(int64) int64) []byte {
 	parser := statsQRFJPool.Get()
 	defer statsQRFJPool.Put(parser)
 
@@ -2614,6 +2621,9 @@ func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
 				continue
 			}
 			shifted := ns + deltaNs
+			if snap != nil {
+				shifted = snap(shifted)
+			}
 			// VL emits whole-second numbers and the Loki contract keeps that
 			// form — but a sub-second step (`500ms`, `0.5`) shifts off the
 			// second boundary, and truncating there would emit the ORIGINAL
@@ -2640,6 +2650,89 @@ func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
 	out := make([]byte, buf.Len())
 	copy(out, buf.Bytes())
 	return out
+}
+
+// VictoriaLogs aligns its stats buckets to the EPOCH grid of the step, while
+// LogQL puts a point at `start + k*step` and evaluates it over `(t-step, t]`.
+// Two things follow, and the `offset` parameter fixes both: the grid has to move
+// to the CLIENT's start — Grafana does not always send a step-aligned one (a 48h
+// Drilldown split starts on a 5-minute boundary and queries with step=1h) — and
+// it has to move one further microsecond so a sample sitting exactly ON a
+// boundary is counted in the window that ENDS there, the way Loki counts it.
+//
+// A microsecond is the finest offset VictoriaLogs accepts (`1ns` is rejected)
+// and is far below any log timestamp's resolution.
+const lokiGridBucketEpsilonNanos = int64(time.Microsecond)
+
+// freezeRelativeRangeBound resolves a `now`/`now±d` bound to an absolute
+// nanosecond timestamp so every later parse of the same request sees ONE
+// instant. Absolute bounds are returned untouched.
+func freezeRelativeRangeBound(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed != "now" && !strings.HasPrefix(trimmed, "now-") && !strings.HasPrefix(trimmed, "now+") {
+		return raw
+	}
+	ns, ok := parseLokiTimeToUnixNano(trimmed)
+	if !ok {
+		return raw
+	}
+	return strconv.FormatInt(ns, 10)
+}
+
+// lokiGridOffsetNanos is how far LEFT VictoriaLogs' bucket grid must move for
+// its buckets to become the LogQL windows of the client's own step grid.
+func lokiGridOffsetNanos(startRaw, stepRaw string) int64 {
+	step, ok := parsePositiveStepDuration(stepRaw)
+	if !ok || step <= 0 {
+		return 0
+	}
+	stepNs := step.Nanoseconds()
+	offset := lokiGridBucketEpsilonNanos
+	if startNs, hasStart := parseLokiTimeToUnixNano(startRaw); hasStart {
+		offset += ((startNs % stepNs) + stepNs) % stepNs
+	}
+	if offset > stepNs {
+		offset = stepNs
+	}
+	return offset
+}
+
+// formatVLDurationSeconds renders a nanosecond duration as the fractional-second
+// string VictoriaLogs parses (it rejects sub-microsecond units).
+func formatVLDurationSeconds(ns int64) string {
+	return strconv.FormatFloat(float64(ns)/float64(time.Second), 'f', 6, 64) + "s"
+}
+
+// buildLokiGridStatsParams builds stats_query_range params for a range query
+// whose response will be relabelled onto the Loki grid: the window opens one
+// step BEFORE `start`, so the point at `start` still has a bucket behind it.
+// Every path that returns a Loki matrix built from stats buckets must use this
+// together with shiftStatsQRToLokiGrid + lokiGridWindowKeep, or its points land
+// one step to the left of where Loki draws them.
+func (p *Proxy) buildLokiGridStatsParams(query, startRaw, endRaw, stepRaw string) url.Values {
+	params := buildStatsQueryRangeParams(p.guardExtractedLabelShadowing(query),
+		shiftRangeStartOneStep(startRaw, stepRaw), endRaw, stepRaw)
+	if off := lokiGridOffsetNanos(startRaw, stepRaw); off > 0 {
+		params.Set("offset", "-"+formatVLDurationSeconds(off))
+	}
+	return params
+}
+
+// lokiGridWindowKeep returns the point filter for a relabelled response: the
+// extra step fetched below `start` lands before it, and the bucket at `end`
+// lands past it. nil when the request carries neither bound.
+func lokiGridWindowKeep(startRaw, endRaw string) func(int64) bool {
+	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)
+	endNs, hasEnd := parseLokiTimeToUnixNano(endRaw)
+	if !hasStart && !hasEnd {
+		return nil
+	}
+	return func(tsNs int64) bool {
+		if hasEnd && tsNs > endNs {
+			return false
+		}
+		return !hasStart || tsNs >= startNs
+	}
 }
 
 func buildStatsQueryRangeParams(logsqlQuery, startRaw, endRaw, stepRaw string) url.Values {
@@ -2709,9 +2802,9 @@ func trimStatsQueryRangeResponseFromStart(body []byte, startNs int64) []byte {
 // clampStatsQRToRequestWindow drops points outside the client's [start, end]
 // after the bucket-to-Loki-grid relabel: the extra step fetched below `start`
 // lands before it, and the bucket at `end` lands past it.
-func clampStatsQRToRequestWindow(body []byte, r *http.Request) []byte {
-	startNs, hasStart := parseLokiTimeToUnixNano(r.FormValue("start"))
-	endNs, hasEnd := parseLokiTimeToUnixNano(r.FormValue("end"))
+func clampStatsQRToRequestWindow(body []byte, startRaw, endRaw string) []byte {
+	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)
+	endNs, hasEnd := parseLokiTimeToUnixNano(endRaw)
 	if !hasStart && !hasEnd {
 		return body
 	}
@@ -3402,7 +3495,7 @@ func (p *Proxy) proxyStatsQuery(w http.ResponseWriter, r *http.Request, logsqlQu
 	}
 
 	params := url.Values{}
-	params.Set("query", logsqlQuery)
+	params.Set("query", p.guardExtractedLabelShadowing(logsqlQuery))
 	evalTime := r.FormValue("time")
 	if evalTime == "" {
 		evalTime = strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -3464,31 +3557,28 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 
 	isRange := vlEndpoint == "stats_query_range"
 
+	// One resolution of `now`/`now±d` for the whole request, and each range
+	// operand goes through the SAME builder the single-operand paths use: it
+	// carries the bucket-grid offset, without which VictoriaLogs answers on the
+	// epoch grid while fetchBinOpSide relabels the points onto the client's —
+	// with a 1h step and a `:05` start the operands would be `:00–:60` buckets
+	// wearing `:05` labels, and no relabelling can fix their contents.
+	startRaw := freezeRelativeRangeBound(r.FormValue("start"))
+	endRaw := freezeRelativeRangeBound(r.FormValue("end"))
+	stepRaw := r.FormValue("step")
+
 	buildParams := func(query string) url.Values {
-		params := url.Values{"query": {query}}
 		if isRange {
-			if s := r.FormValue("start"); s != "" {
-				// A VL bucket is labelled by its START, a LogQL point by the
-				// bucket's END: every side is relabelled one step forward in
-				// fetchBinOpSide, so the window opens one step earlier to keep a
-				// bucket behind the point at `start`.
-				params.Set("start", formatVLStatsTimestamp(shiftRangeStartOneStep(s, r.FormValue("step"))))
-			}
-			if e := r.FormValue("end"); e != "" {
-				params.Set("end", formatVLStatsTimestamp(e))
-			}
-			if step := r.FormValue("step"); step != "" {
-				params.Set("step", formatVLStep(step))
-			}
-		} else {
-			if t := r.FormValue("time"); t != "" {
-				params.Set("time", formatVLStatsTimestamp(t))
-			}
+			return p.buildLokiGridStatsParams(query, startRaw, endRaw, stepRaw)
+		}
+		params := url.Values{"query": {query}}
+		if t := r.FormValue("time"); t != "" {
+			params.Set("time", formatVLStatsTimestamp(t))
 		}
 		return params
 	}
 
-	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams)
+	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams, startRaw, stepRaw)
 	if sideErr != nil {
 		p.writeError(w, statusFromUpstreamErr(sideErr), sideErr.Error())
 		return
@@ -3510,7 +3600,7 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 	}
 
 	if isRange {
-		result = clampStatsQRToRequestWindow(result, r)
+		result = clampStatsQRToRequestWindow(result, startRaw, endRaw)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3520,32 +3610,29 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, leftQL, rightQL, vlEndpoint, resultType string) {
 	isRange := vlEndpoint == "stats_query_range"
 
+	// One resolution of `now`/`now±d` for the whole request, and each range
+	// operand goes through the SAME builder the single-operand paths use: it
+	// carries the bucket-grid offset, without which VictoriaLogs answers on the
+	// epoch grid while fetchBinOpSide relabels the points onto the client's —
+	// with a 1h step and a `:05` start the operands would be `:00–:60` buckets
+	// wearing `:05` labels, and no relabelling can fix their contents.
+	startRaw := freezeRelativeRangeBound(r.FormValue("start"))
+	endRaw := freezeRelativeRangeBound(r.FormValue("end"))
+	stepRaw := r.FormValue("step")
+
 	buildParams := func(query string) url.Values {
-		params := url.Values{"query": {query}}
 		if isRange {
-			if s := r.FormValue("start"); s != "" {
-				// A VL bucket is labelled by its START, a LogQL point by the
-				// bucket's END: every side is relabelled one step forward in
-				// fetchBinOpSide, so the window opens one step earlier to keep a
-				// bucket behind the point at `start`.
-				params.Set("start", formatVLStatsTimestamp(shiftRangeStartOneStep(s, r.FormValue("step"))))
-			}
-			if e := r.FormValue("end"); e != "" {
-				params.Set("end", formatVLStatsTimestamp(e))
-			}
-			if step := r.FormValue("step"); step != "" {
-				params.Set("step", formatVLStep(step))
-			}
-		} else {
-			if t := r.FormValue("time"); t != "" {
-				params.Set("time", formatVLStatsTimestamp(t))
-			}
+			return p.buildLokiGridStatsParams(query, startRaw, endRaw, stepRaw)
+		}
+		params := url.Values{"query": {query}}
+		if t := r.FormValue("time"); t != "" {
+			params.Set("time", formatVLStatsTimestamp(t))
 		}
 		return params
 	}
 
 	// Check if either side is a scalar or a nested binary marker.
-	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams)
+	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams, startRaw, stepRaw)
 	if sideErr != nil {
 		p.writeError(w, statusFromUpstreamErr(sideErr), sideErr.Error())
 		return
@@ -3554,7 +3641,7 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 	// Combine results with arithmetic at proxy level
 	result := combineBinaryMetricResults(leftBody, rightBody, op, resultType, leftIsScalar, rightIsScalar, leftQL, rightQL)
 	if isRange {
-		result = clampStatsQRToRequestWindow(result, r)
+		result = clampStatsQRToRequestWindow(result, startRaw, endRaw)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3571,16 +3658,17 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 // VictoriaLogs as if it were a query.
 func (p *Proxy) fetchBinOpSides(
 	r *http.Request, leftQL, rightQL, vlEndpoint, resultType string, buildParams func(string) url.Values,
+	gridStartRaw, gridStepRaw string,
 ) (leftBody, rightBody []byte, leftIsScalar, rightIsScalar bool, err error) {
 	leftIsScalar = translator.IsScalar(leftQL)
 	rightIsScalar = translator.IsScalar(rightQL)
 
 	if isBinOpMarker(leftQL) || isBinOpMarker(rightQL) {
-		leftBody, leftIsScalar, err = p.resolveBinOpBody(r, leftQL, vlEndpoint, resultType, buildParams)
+		leftBody, leftIsScalar, err = p.resolveBinOpBody(r, leftQL, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 		if err != nil {
 			return nil, nil, false, false, fmt.Errorf("left query: %w", err)
 		}
-		rightBody, rightIsScalar, err = p.resolveBinOpBody(r, rightQL, vlEndpoint, resultType, buildParams)
+		rightBody, rightIsScalar, err = p.resolveBinOpBody(r, rightQL, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 		if err != nil {
 			return nil, nil, false, false, fmt.Errorf("right query: %w", err)
 		}
@@ -3594,11 +3682,11 @@ func (p *Proxy) fetchBinOpSides(
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			leftBody, leftErr = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams)
+			leftBody, leftErr = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams, gridStartRaw, gridStepRaw)
 		}()
 		go func() {
 			defer wg.Done()
-			rightBody, rightErr = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams)
+			rightBody, rightErr = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams, gridStartRaw, gridStepRaw)
 		}()
 		wg.Wait()
 		if leftErr != nil {
@@ -3612,12 +3700,12 @@ func (p *Proxy) fetchBinOpSides(
 
 	if leftIsScalar {
 		leftBody = scalarBinOpBody(leftQL)
-	} else if leftBody, err = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams); err != nil {
+	} else if leftBody, err = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams, gridStartRaw, gridStepRaw); err != nil {
 		return nil, nil, false, false, fmt.Errorf("left query: %w", err)
 	}
 	if rightIsScalar {
 		rightBody = scalarBinOpBody(rightQL)
-	} else if rightBody, err = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams); err != nil {
+	} else if rightBody, err = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams, gridStartRaw, gridStepRaw); err != nil {
 		return nil, nil, false, false, fmt.Errorf("right query: %w", err)
 	}
 	return leftBody, rightBody, leftIsScalar, rightIsScalar, nil
@@ -3626,7 +3714,7 @@ func (p *Proxy) fetchBinOpSides(
 // fetchBinOpSide POSTs one side to VictoriaLogs. VL's internal __name__ column
 // marker is stripped here: this route never reaches the label translator, which
 // is where the key is normally dropped.
-func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildParams func(string) url.Values) ([]byte, error) {
+func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildParams func(string) url.Values, gridStartRaw, gridStepRaw string) ([]byte, error) {
 	resp, err := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(query))
 	if err != nil {
 		return nil, err
@@ -3635,7 +3723,7 @@ func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildP
 	raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
 	body := stripVLStatsNameKey(raw)
 	if vlEndpoint == "stats_query_range" {
-		body = shiftStatsQRToLokiGrid(body, r.FormValue("step"))
+		body = shiftStatsQRToLokiGrid(body, gridStartRaw, gridStepRaw)
 	}
 	return body, nil
 }
@@ -3653,12 +3741,12 @@ func isBinOpMarker(q string) bool {
 
 // resolveBinOpBody returns the result body for one side of a binary expression.
 // Handles scalar strings, nested binary markers, and plain VL queries.
-func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType string, buildParams func(string) url.Values) (body []byte, isScalar bool, err error) {
+func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType string, buildParams func(string) url.Values, gridStartRaw, gridStepRaw string) (body []byte, isScalar bool, err error) {
 	if translator.IsScalar(query) {
 		return []byte(`{"status":"success","data":{"resultType":"scalar","result":[0,"` + query + `"]}}`), true, nil
 	}
 	if strings.HasPrefix(query, translator.BinaryMetricPrefix) {
-		body, err = p.evalBinaryMarker(r, query, vlEndpoint, resultType, buildParams)
+		body, err = p.evalBinaryMarker(r, query, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 		return body, false, err
 	}
 	if strings.HasPrefix(query, templateBinOpPrefix) {
@@ -3675,17 +3763,17 @@ func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType 
 }
 
 // evalBinaryMarker recursively evaluates a __binary__: expression marker.
-func (p *Proxy) evalBinaryMarker(r *http.Request, marker, vlEndpoint, resultType string, buildParams func(string) url.Values) ([]byte, error) {
+func (p *Proxy) evalBinaryMarker(r *http.Request, marker, vlEndpoint, resultType string, buildParams func(string) url.Values, gridStartRaw, gridStepRaw string) ([]byte, error) {
 	op, left, right, vm, ok := translator.ParseBinaryMetricExprFull(marker)
 	if !ok {
 		return nil, fmt.Errorf("invalid binary expression marker")
 	}
 
-	leftBody, leftScalar, err := p.resolveBinOpBody(r, left, vlEndpoint, resultType, buildParams)
+	leftBody, leftScalar, err := p.resolveBinOpBody(r, left, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 	if err != nil {
 		return nil, err
 	}
-	rightBody, rightScalar, err := p.resolveBinOpBody(r, right, vlEndpoint, resultType, buildParams)
+	rightBody, rightScalar, err := p.resolveBinOpBody(r, right, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 	if err != nil {
 		return nil, err
 	}
