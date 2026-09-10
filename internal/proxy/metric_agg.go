@@ -97,6 +97,8 @@ type instantMetricPostAgg struct {
 	name  string
 	inner string
 	k     int
+	// label is the output label name for count_values("<label>", inner).
+	label string
 }
 
 func parseInstantMetricPostAggQuery(logql string) (instantMetricPostAgg, bool) {
@@ -126,6 +128,28 @@ func parseInstantMetricPostAggQuery(logql string) (instantMetricPostAgg, bool) {
 			return instantMetricPostAgg{}, false
 		}
 		return instantMetricPostAgg{name: name, inner: inner}, true
+	}
+	// count_values("label", inner) buckets the inner vector's SAMPLE VALUES:
+	// one output series per distinct value, labelled {label="<value>"}, whose
+	// value is how many input series carried that value. VL/LogsQL has no
+	// equivalent (stats groups by FIELD values, not by computed metric values),
+	// so the proxy runs the inner query and buckets the result set itself —
+	// the same execute-inner-then-post-aggregate shape used by stddev/stdvar.
+	if prefix := "count_values("; strings.HasPrefix(logql, prefix) && strings.HasSuffix(logql, ")") {
+		args := strings.TrimSpace(logql[len(prefix) : len(logql)-1])
+		comma := topLevelCommaIndex(args)
+		if comma <= 0 {
+			return instantMetricPostAgg{}, false
+		}
+		label, ok := parseQuotedLabelName(strings.TrimSpace(args[:comma]))
+		if !ok {
+			return instantMetricPostAgg{}, false
+		}
+		inner := strings.TrimSpace(args[comma+1:])
+		if inner == "" {
+			return instantMetricPostAgg{}, false
+		}
+		return instantMetricPostAgg{name: "count_values", inner: inner, label: label}, true
 	}
 	for _, name := range []string{"topk", "bottomk"} {
 		prefix := name + "("
@@ -365,6 +389,9 @@ func applyMatrixPostAggregation(body []byte, postAgg instantMetricPostAgg) []byt
 	if postAgg.name == "stddev" || postAgg.name == "stdvar" {
 		return applyMatrixStddevAgg(body, postAgg.name)
 	}
+	if postAgg.name == "count_values" {
+		return applyMatrixCountValuesAgg(body, postAgg.label)
+	}
 	return applyMatrixSortTopkAgg(body, postAgg)
 }
 
@@ -541,7 +568,182 @@ func applyInstantVectorPostAggregation(body []byte, postAgg instantMetricPostAgg
 	if postAgg.name == "stddev" || postAgg.name == "stdvar" {
 		return applyInstantStddevAgg(body, postAgg.name)
 	}
+	if postAgg.name == "count_values" {
+		return applyInstantCountValuesAgg(body, postAgg.label)
+	}
 	return applyInstantSortTopkAgg(body, postAgg)
+}
+
+// parseQuotedLabelName unquotes count_values' first argument and rejects
+// anything that is not a legal Prometheus/Loki label name, so the label can be
+// emitted into the response metric without escaping concerns.
+func parseQuotedLabelName(arg string) (string, bool) {
+	if len(arg) < 3 {
+		return "", false
+	}
+	q := arg[0]
+	if (q != '"' && q != '\'') || arg[len(arg)-1] != q {
+		return "", false
+	}
+	name := arg[1 : len(arg)-1]
+	if !labelNameRE.MatchString(name) {
+		return "", false
+	}
+	return name, true
+}
+
+var labelNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// formatCountValuesLabel renders a sample value the way Prometheus does when it
+// becomes a label value: shortest round-tripping decimal, no trailing zeros.
+func formatCountValuesLabel(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// applyInstantCountValuesAgg implements count_values() over an instant vector:
+// bucket the series by their sample value and emit one series per distinct
+// value, {label="<value>"} = number of series that carried it.
+func applyInstantCountValuesAgg(body []byte, label string) []byte {
+	var resp struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string `json:"resultType"`
+			Result     []struct {
+				Metric map[string]interface{} `json:"metric"`
+				Value  []interface{}          `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Status != "success" || resp.Data.ResultType != "vector" {
+		return body
+	}
+
+	counts := make(map[string]int, len(resp.Data.Result))
+	var order []string
+	var ts interface{}
+	for i, s := range resp.Data.Result {
+		if len(s.Value) < 2 {
+			continue
+		}
+		if i == 0 || ts == nil {
+			ts = s.Value[0]
+		}
+		v, err := parseFloat(s.Value[1])
+		if err != nil {
+			continue
+		}
+		key := formatCountValuesLabel(v)
+		if _, seen := counts[key]; !seen {
+			order = append(order, key)
+		}
+		counts[key]++
+	}
+	if ts == nil {
+		ts = float64(0)
+	}
+
+	sort.Strings(order)
+	result := make([]map[string]interface{}, 0, len(order))
+	for _, key := range order {
+		result = append(result, map[string]interface{}{
+			"metric": map[string]string{label: key},
+			"value":  []interface{}{ts, strconv.Itoa(counts[key])},
+		})
+	}
+
+	out, err := json.Marshal(map[string]interface{}{
+		"status": "success",
+		"data": map[string]interface{}{
+			"resultType": "vector",
+			"result":     result,
+		},
+	})
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// applyMatrixCountValuesAgg implements count_values() over a matrix: the value
+// buckets are computed independently at every timestamp, so a series exists for
+// each distinct value seen anywhere in the window and carries samples only at
+// the timestamps where that value occurred (Prometheus semantics).
+func applyMatrixCountValuesAgg(body []byte, label string) []byte {
+	var resp struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string `json:"resultType"`
+			Result     []struct {
+				Metric map[string]interface{} `json:"metric"`
+				Values [][]interface{}        `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Status != "success" || resp.Data.ResultType != "matrix" {
+		return body
+	}
+
+	// perValue[valueKey][ts] = how many series held that value at ts.
+	perValue := make(map[string]map[float64]int)
+	var tsOrder []float64
+	tsSeen := make(map[float64]struct{})
+	for _, s := range resp.Data.Result {
+		for _, v := range s.Values {
+			if len(v) < 2 {
+				continue
+			}
+			ts, err := parseFloat(v[0])
+			if err != nil {
+				continue
+			}
+			val, err := parseFloat(v[1])
+			if err != nil {
+				continue
+			}
+			if _, ok := tsSeen[ts]; !ok {
+				tsSeen[ts] = struct{}{}
+				tsOrder = append(tsOrder, ts)
+			}
+			key := formatCountValuesLabel(val)
+			if perValue[key] == nil {
+				perValue[key] = make(map[float64]int)
+			}
+			perValue[key][ts]++
+		}
+	}
+
+	sort.Float64s(tsOrder)
+	keys := make([]string, 0, len(perValue))
+	for k := range perValue {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	result := make([]map[string]interface{}, 0, len(keys))
+	for _, key := range keys {
+		values := make([][]interface{}, 0, len(tsOrder))
+		for _, ts := range tsOrder {
+			if n, ok := perValue[key][ts]; ok {
+				values = append(values, []interface{}{ts, strconv.Itoa(n)})
+			}
+		}
+		result = append(result, map[string]interface{}{
+			"metric": map[string]string{label: key},
+			"values": values,
+		})
+	}
+
+	out, err := json.Marshal(map[string]interface{}{
+		"status": "success",
+		"data": map[string]interface{}{
+			"resultType": "matrix",
+			"result":     result,
+		},
+	})
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // applyInstantStddevAgg computes population stddev/stdvar across all series

@@ -619,7 +619,7 @@ func TestAddGroupByParsedLabelsFJ_AddsRequestedFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	labels := map[string]string{}
-	addGroupByParsedLabelsFJ(labels, v, []string{"method", "status"})
+	addGroupByParsedLabelsFJ(labels, v, []string{"method", "status"}, nil)
 	if labels["method"] != "GET" {
 		t.Fatalf("expected method=GET, got %q", labels["method"])
 	}
@@ -638,7 +638,7 @@ func TestAddGroupByParsedLabelsFJ_SkipsInternalFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	labels := map[string]string{}
-	addGroupByParsedLabelsFJ(labels, v, []string{"_stream", "_stream_id", "method"})
+	addGroupByParsedLabelsFJ(labels, v, []string{"_stream", "_stream_id", "method"}, nil)
 	if _, ok := labels["_stream"]; ok {
 		t.Fatal("expected _stream to be skipped (internal field)")
 	}
@@ -657,7 +657,7 @@ func TestAddGroupByParsedLabelsFJ_DoesNotOverwriteExistingLabel(t *testing.T) {
 		t.Fatal(err)
 	}
 	labels := map[string]string{"app": "from-stream"}
-	addGroupByParsedLabelsFJ(labels, v, []string{"app"})
+	addGroupByParsedLabelsFJ(labels, v, []string{"app"}, nil)
 	if labels["app"] != "from-stream" {
 		t.Fatalf("existing label must not be overwritten by parsed field; got %q", labels["app"])
 	}
@@ -670,7 +670,7 @@ func TestAddGroupByParsedLabelsFJ_SkipsMissingFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	labels := map[string]string{}
-	addGroupByParsedLabelsFJ(labels, v, []string{"method", "nonexistent"})
+	addGroupByParsedLabelsFJ(labels, v, []string{"method", "nonexistent"}, nil)
 	if _, ok := labels["nonexistent"]; ok {
 		t.Fatal("expected missing field to be skipped")
 	}
@@ -683,7 +683,7 @@ func TestAddGroupByParsedLabelsFJ_SkipsEmptyStringValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	labels := map[string]string{}
-	addGroupByParsedLabelsFJ(labels, v, []string{"method"})
+	addGroupByParsedLabelsFJ(labels, v, []string{"method"}, nil)
 	if _, ok := labels["method"]; ok {
 		t.Fatalf("expected whitespace-only field to be skipped, got %q", labels["method"])
 	}

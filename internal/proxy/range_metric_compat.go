@@ -1006,7 +1006,7 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 				// JSON-object combination — O(N) series for N distinct log entries.
 				// Loki groups by stream labels only when no by(...) is present; parsed
 				// fields become metric dimensions only when explicitly named in by(...).
-				addGroupByParsedLabelsFJ(metricLabels, v, groupBy)
+				addGroupByParsedLabelsFJ(metricLabels, v, groupBy, origGroupBy)
 				translatedParsed := p.labelTranslator.TranslateLabelsMap(metricLabels)
 				seriesEntry = &metricSeriesCacheEntry{
 					metricLabels: metricLabels,
@@ -1169,13 +1169,26 @@ func parseFloatValueFJ(v *fj.Value) (float64, bool) {
 	}
 }
 
-// addGroupByParsedLabelsFJ is the fastjson variant of addGroupByParsedLabels.
-func addGroupByParsedLabelsFJ(metricLabels map[string]string, v *fj.Value, groupBy []string) {
-	for _, key := range groupBy {
+// addGroupByParsedLabelsFJ injects the by(...) fields that only exist after a
+// parser stage (| json, | extract) into the series labels.
+//
+// groupBy holds VL field names; origGroupBy holds the Loki label names the
+// client actually asked for, positionally aligned. The value must be stored
+// under the Loki name: buildMetricSeriesEntry has already renamed the VL key
+// (e.g. VL "level" -> Loki "detected_level"), so writing the VL name here
+// re-adds the pre-rename label and the response carries BOTH — one more
+// grouping dimension than Loki returns, which renames every Grafana series.
+func addGroupByParsedLabelsFJ(metricLabels map[string]string, v *fj.Value, groupBy, origGroupBy []string) {
+	aligned := len(origGroupBy) == len(groupBy)
+	for i, key := range groupBy {
 		if isVLInternalField(key) || key == "_stream_id" {
 			continue
 		}
-		if _, exists := metricLabels[key]; exists {
+		outKey := key
+		if aligned && strings.TrimSpace(origGroupBy[i]) != "" {
+			outKey = origGroupBy[i]
+		}
+		if _, exists := metricLabels[outKey]; exists {
 			continue
 		}
 		fv := v.Get(key)
@@ -1188,7 +1201,7 @@ func addGroupByParsedLabelsFJ(metricLabels map[string]string, v *fj.Value, group
 		}
 		value = strings.TrimSpace(value)
 		if value != "" {
-			metricLabels[key] = value
+			metricLabels[outKey] = value
 		}
 	}
 }

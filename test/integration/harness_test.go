@@ -270,13 +270,20 @@ func (b *syncBuf) String() string { return string(b.Bytes()) }
 // only need to call stop() early if they want to assert exit behavior.
 func startProxy(t *testing.T, backend *stubBackend, extraArgs ...string) *proxyProc {
 	t.Helper()
+	return startProxyWithBackendURL(t, backend.URL(), extraArgs...)
+}
+
+// startProxyWithBackendURL is startProxy against an arbitrary backend address,
+// so a suite can point the proxy at a real VictoriaLogs instead of the stub.
+func startProxyWithBackendURL(t *testing.T, backendURL string, extraArgs ...string) *proxyProc {
+	t.Helper()
 	ports := pickPorts(t, 3)
 	listenAddr := fmt.Sprintf("127.0.0.1:%d", ports[0])
 	adminAddr := fmt.Sprintf("127.0.0.1:%d", ports[1])
 	metricsAddr := fmt.Sprintf("127.0.0.1:%d", ports[2])
 
 	args := []string{
-		"-backend=" + backend.URL(),
+		"-backend=" + backendURL,
 		"-listen=" + listenAddr,
 		"-admin-listen=" + adminAddr,
 	}

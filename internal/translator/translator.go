@@ -2443,6 +2443,15 @@ func tryTranslateQuantileOverTimeM(innerExpr, outerAgg, byLabels string, labelFn
 	}
 	body := rest[:end]
 
+	// Detect a trailing by (...) modifier on the range aggregation, e.g.
+	// quantile_over_time(0.95, {...} | unwrap d [5m]) by (namespace).
+	// The generic metric-function loop below already does this; quantile_over_time
+	// is intercepted here for its two-argument form and must not lose the clause,
+	// otherwise unwrapInnerGrouping falls through to the "_stream, _msg" default
+	// and the result is one series per stream (or per log line) instead of one
+	// series per requested label.
+	rangeByLabels, rangeByExplicit := extractRangeByClause(strings.TrimSpace(rest[end+1:]))
+
 	// Extract phi (first arg before comma): quantile_over_time(0.95, ...)
 	commaIdx := strings.Index(body, ",")
 	if commaIdx < 0 {
@@ -2470,7 +2479,7 @@ func tryTranslateQuantileOverTimeM(innerExpr, outerAgg, byLabels string, labelFn
 	}
 
 	statsExpr := "quantile(" + phi + ", " + unwrapField + ")"
-	innerBy := unwrapInnerGrouping(query, byLabels, outerAgg, labelFn, false, "")
+	innerBy := unwrapInnerGrouping(query, byLabels, outerAgg, labelFn, rangeByExplicit, rangeByLabels)
 
 	if outerAgg != "" && byLabels == "" {
 		innerAliased := buildStatsQuery(logsqlQuery, statsExpr, innerBy, "__lvp_inner")

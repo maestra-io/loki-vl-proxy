@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Instant `quantile_over_time(...) by (labels)` ignored its grouping.**
+  `quantile_over_time` is intercepted by its own two-argument translator before
+  the generic metric-function loop, and that interceptor never parsed the
+  trailing `by (...)` / `by ()` modifier. Grouping then fell through to the
+  parser-pipeline default `by (_stream, _msg)`, so
+  `quantile_over_time(0.95, {ns=~"app.+"} | json | unwrap Duration [10m]) by (namespace)`
+  returned one series per POD on the instant path and one series per LOG LINE on
+  the range path instead of one per namespace. Without a parser pipeline the
+  clause was dropped entirely, collapsing every namespace into one series. The
+  clause is now honoured exactly as it already was for the single-argument
+  siblings (`max_over_time`, `avg_over_time`, …). Verified against VictoriaLogs
+  v1.52.0.
+- **`sum by (detected_level)` returned both `detected_level` and `level`.** On
+  the manual (parser-stage) metric path, by-fields that only exist after a
+  parser stage were injected under their VL name after the VL→Loki rename had
+  already run, re-adding the pre-rename label. The response carried one grouping
+  dimension more than Loki returns, which renames every Grafana series.
+
 - **Derived-level queries returned HTTP 400 from VictoriaLogs.** Two generated
   constructs are not valid LogsQL: there is no `coalesce` PIPE (`unexpected pipe
   "coalesce"`), and `replace`/`replace_regexp` take the field LAST
@@ -27,6 +45,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`count_values("<label>", <inner>)` is now served instead of rejected with
+  400 `count_values is not translatable to LogsQL`.** It runs as a
+  post-aggregation — the inner query executes, then the proxy buckets the
+  RESULT SERIES by their sample value — the same execute-inner-then-aggregate
+  shape already used for `stddev`/`stdvar`. Output follows Prometheus/Loki
+  semantics: one series per distinct sample value, labelled
+  `{<label>="<value>"}`, valued by how many input series carried that value;
+  input labels are dropped. Instant and range both supported.
+
+  Note this is NOT `| stats by (<field>) count()`: that groups by a log FIELD's
+  values and is spelled `sum by (<field>) (count_over_time(...))` in LogQL.
+  `count_values` groups by the inner expression's computed VALUES, which no
+  LogsQL construct can express — hence the client-side bucketing.
 - **`-field-mapping` fallback chains.** A `loki_label` may map to an ordered
   `vl_fields` list instead of a single `vl_field`. Positive matchers become a
   LogsQL disjunction, negative matchers a conjunction of negations, label values
