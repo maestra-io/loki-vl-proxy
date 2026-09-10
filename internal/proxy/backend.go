@@ -105,12 +105,16 @@ func (p *Proxy) recordUpstreamObservation(ctx context.Context, system, method, r
 			"error.message", err.Error(),
 		)
 	}
-	// The query is the point of this log line on a failure. It is redacted the
-	// same way every other query log is, so -debug-log-raw-queries still governs
-	// whether the literal text is written.
-	if (err != nil || statusCode >= http.StatusBadRequest) && len(backendQuery) > 0 {
-		if q := strings.TrimSpace(backendQuery[0]); q != "" {
-			logAttrs = append(logAttrs, "logsql.query", redactQuery(q, p.debugLogRawQueries))
+	// A failure needs the query to be reproducible, but a query literal can carry
+	// credentials, an email address or user text, so the verbatim text is opt-in:
+	// -log-translated-queries (or -debug-log-raw-queries) turns it on for BOTH
+	// failures and successes. Off, a failure still names the query by digest.
+	if len(backendQuery) > 0 {
+		verbatim := p.logTranslatedQueries || p.debugLogRawQueries
+		if verbatim || err != nil || statusCode >= http.StatusBadRequest {
+			if q := strings.TrimSpace(backendQuery[0]); q != "" {
+				logAttrs = append(logAttrs, "logsql.query", redactQuery(q, verbatim))
+			}
 		}
 	}
 	p.log.Log(ctx, level, "upstream_request", logAttrs...)

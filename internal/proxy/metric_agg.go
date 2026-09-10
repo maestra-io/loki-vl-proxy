@@ -267,9 +267,22 @@ func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *htt
 	}
 
 	if !dispatched {
-		if isStatsQuery(translatedInner) {
-			p.proxyStatsQuery(sc, r, translatedInner)
-		} else {
+		// The compat layer reads the ORIGINAL LogQL from the request to pick a
+		// path; with the topk/sort wrapper still in "query" it sees `topk` as the
+		// metric function and refuses. Hand it the inner expression — the same
+		// clone handleRangeMetricPostAggregation makes — so a wrapped query is
+		// served exactly like the bare one. Without this, `topk(k, sum by (l)
+		// (count_over_time({...} | regexp ... [w])))` either 400'd with
+		// "unsupported instant aggregation target" or lost its by() grouping and
+		// collapsed to one unlabelled total.
+		innerR := r.Clone(r.Context())
+		_ = innerR.ParseForm()
+		innerR.Form.Set("query", postAgg.inner)
+		switch {
+		case p.handleStatsCompatInstant(sc, innerR, postAgg.inner, translatedInner):
+		case isStatsQuery(translatedInner):
+			p.proxyStatsQuery(sc, innerR, translatedInner)
+		default:
 			p.writeError(w, http.StatusBadRequest, "unsupported instant aggregation target")
 			p.metrics.RecordRequest("query", http.StatusBadRequest, time.Since(start))
 			return
@@ -834,4 +847,168 @@ func applyConstantBinaryOp(left, right float64, op string) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// constantVectorValue returns the constant carried by a `vector(N)` expression.
+func constantVectorValue(expr string) (float64, bool) {
+	m := vectorLiteralRE.FindStringSubmatch(expr)
+	if len(m) != 2 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(m[1]), 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// serveOrVectorFallback answers `<expr> or vector(N)` — the Grafana idiom for
+// "draw a zero instead of No data". The binary machinery has no constant-vector
+// side, so it POSTed the literal `vector(0)` to VictoriaLogs as if it were a
+// query, got nothing back, and an empty left side came out as `result: []`:
+// the panel showed "No data" where Loki draws a flat zero.
+//
+// The left side is served by the normal handler (every path stays available to
+// it) and the constant fills whatever the unlabelled series is missing.
+func (p *Proxy) serveOrVectorFallback(w http.ResponseWriter, r *http.Request, binOp *logqlpkg.BinOpExpr, isRange bool) bool {
+	if binOp.Op != "or" {
+		return false
+	}
+	value, ok := constantVectorValue(binOp.Right.String())
+	if !ok {
+		return false
+	}
+
+	innerR := r.Clone(r.Context())
+	_ = innerR.ParseForm()
+	innerR.Form.Set("query", binOp.Left.String())
+	innerR.URL.RawQuery = innerR.Form.Encode()
+
+	buf := &bufferedResponseWriter{header: make(http.Header)}
+	sc := &statusCapture{ResponseWriter: buf, code: 200}
+	if isRange {
+		p.handleQueryRange(sc, innerR)
+	} else {
+		p.handleQuery(sc, innerR)
+	}
+
+	copyHeaders(w.Header(), buf.Header())
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	if sc.code >= http.StatusBadRequest {
+		w.WriteHeader(sc.code)
+		_, _ = w.Write(buf.body)
+		return true
+	}
+	_, _ = w.Write(fillOrVectorConstant(buf.body, value, r, isRange))
+	return true
+}
+
+// fillOrVectorConstant adds the constant series `vector(N)` contributes to an
+// `or` result: LogQL keeps a right-hand series only where the left has no
+// sample with the same label set, and `vector(N)` carries no labels.
+func fillOrVectorConstant(body []byte, value float64, r *http.Request, isRange bool) []byte {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+	data, _ := resp["data"].(map[string]interface{})
+	if data == nil {
+		return body
+	}
+	result, _ := data["result"].([]interface{})
+	formatted := strconv.FormatFloat(value, 'f', -1, 64)
+
+	// The unlabelled series is the only one `vector(N)` can match.
+	var unlabelled map[string]interface{}
+	for _, s := range result {
+		sm, _ := s.(map[string]interface{})
+		if metric, _ := sm["metric"].(map[string]interface{}); len(metric) == 0 {
+			unlabelled = sm
+			break
+		}
+	}
+
+	if !isRange {
+		if unlabelled != nil {
+			return body
+		}
+		ts := parseInstantVectorTime(r.FormValue("time")) / int64(time.Second)
+		data["result"] = append(result, map[string]interface{}{
+			"metric": map[string]string{},
+			"value":  []interface{}{ts, formatted},
+		})
+		out, err := json.Marshal(resp)
+		if err != nil {
+			return body
+		}
+		return out
+	}
+
+	grid, ok := rangeStepGridSeconds(r)
+	if !ok {
+		return body
+	}
+	have := map[int64]bool{}
+	var values []interface{}
+	if unlabelled != nil {
+		// Keep only well-formed points: the sort below indexes pt[0], and a
+		// null or empty point in the upstream body would panic there.
+		existing, _ := unlabelled["values"].([]interface{})
+		for _, raw := range existing {
+			pt, _ := raw.([]interface{})
+			if len(pt) < 1 {
+				continue
+			}
+			have[int64(parsePointValue(pt[0]))] = true
+			values = append(values, raw)
+		}
+	}
+	for _, ts := range grid {
+		if !have[ts] {
+			values = append(values, []interface{}{ts, formatted})
+		}
+	}
+	sort.Slice(values, func(i, j int) bool {
+		a, _ := values[i].([]interface{})
+		b, _ := values[j].([]interface{})
+		return parsePointValue(a[0]) < parsePointValue(b[0])
+	})
+	if unlabelled != nil {
+		unlabelled["values"] = values
+	} else {
+		data["result"] = append(result, map[string]interface{}{
+			"metric": map[string]string{},
+			"values": values,
+		})
+	}
+	if data["resultType"] == nil {
+		data["resultType"] = "matrix"
+	}
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// rangeStepGridSeconds returns the evaluation timestamps (unix seconds) of a
+// query_range request: start, start+step, … up to end.
+func rangeStepGridSeconds(r *http.Request) ([]int64, bool) {
+	startNs, ok1 := parseLokiTimeToUnixNano(r.FormValue("start"))
+	endNs, ok2 := parseLokiTimeToUnixNano(r.FormValue("end"))
+	step, ok3 := parsePositiveStepDuration(r.FormValue("step"))
+	if !ok1 || !ok2 || !ok3 || step <= 0 || endNs < startNs {
+		return nil, false
+	}
+	// A pathological step/range pair must not allocate an unbounded slice.
+	if (endNs-startNs)/step.Nanoseconds() > 100_000 {
+		return nil, false
+	}
+	var grid []int64
+	for ts := startNs; ts <= endNs; ts += step.Nanoseconds() {
+		grid = append(grid, ts/int64(time.Second))
+	}
+	return grid, true
 }

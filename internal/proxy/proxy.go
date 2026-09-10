@@ -373,6 +373,10 @@ type Config struct {
 	// only. Default is false (redacted).
 	DebugLogRawQueries bool
 
+	// LogTranslatedQueries, when true, writes the translated LogsQL of every
+	// SUCCESSFUL upstream call to the request log. Failures always carry it.
+	LogTranslatedQueries bool
+
 	// MetadataDefaultLookback is the default time window applied to /labels,
 	// /label/{name}/values, and /series when the client omits both start and
 	// end. 0 disables (unbounded scan, prior behavior).
@@ -603,6 +607,7 @@ type Proxy struct {
 	cacheTTLLabels                        time.Duration // per-instance TTL for labels endpoint (from Config.LabelCacheTTL)
 	cacheTTLLabelValues                   time.Duration // per-instance TTL for label_values endpoint
 	debugLogRawQueries                    bool          // when true, debug logs include raw LogQL/LogsQL and backend params
+	logTranslatedQueries                  bool          // when true, successful upstream calls log their translated LogsQL
 	metadataDefaultLookback               time.Duration // default lookback for /labels, /label/{name}/values, /series when client omits start+end; 0 disables
 	// drilldownScanTimeout caps the time a single detected_fields /
 	// detected_field_values request will spend scanning logs with a parser
@@ -1193,6 +1198,7 @@ func New(cfg Config) (*Proxy, error) {
 		cacheTTLLabels:                        labelCacheTTL,
 		cacheTTLLabelValues:                   labelCacheTTL,
 		debugLogRawQueries:                    cfg.DebugLogRawQueries,
+		logTranslatedQueries:                  cfg.LogTranslatedQueries,
 		metadataDefaultLookback:               cfg.MetadataDefaultLookback,
 		drilldownScanTimeout:                  cfg.DrilldownScanTimeout,
 	}
@@ -2207,6 +2213,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Route using the original LogQL AST — more reliable than re-parsing translated markers.
+	accountedByNestedHandler := false
 	parsedForRouting, _ := logqlpkg.Parse(logqlQuery)
 	if ra, ok := parsedForRouting.(*logqlpkg.RangeAggregation); ok && ra.Step != "" {
 		// Subquery: max_over_time(rate(...)[1h:5m])
@@ -2216,6 +2223,12 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		} else {
 			p.proxySubqueryRange(sc, r, string(ra.Op), innerLogsql, ra.Range, ra.Step)
 		}
+	} else if binOp, ok := parsedForRouting.(*logqlpkg.BinOpExpr); ok && p.serveOrVectorFallback(sc, r, binOp, true) {
+		// `<expr> or vector(N)` — served by the left side plus the constant.
+		// That nested handler did this request's accounting, so the tail below
+		// skips it: counting again would double every counter and the
+		// query-tracker total.
+		accountedByNestedHandler = true
 	} else if binOp, ok := parsedForRouting.(*logqlpkg.BinOpExpr); ok {
 		// Binary metric expression: sum(rate(...)) / sum(rate(...))
 		// translateBinOpSide handles scalar literals (e.g. * 100) without translation.
@@ -2280,6 +2293,9 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		cacheTap.Release()
 	}
 
+	if accountedByNestedHandler {
+		return
+	}
 	elapsed := time.Since(start)
 	p.metrics.RecordRequest("query_range", sc.code, elapsed)
 	p.queryTracker.Record("query_range", logqlQuery, elapsed, sc.code >= 400)
@@ -2434,6 +2450,18 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 	if postAgg, ok := parseInstantMetricPostAggQuery(logqlQuery); ok {
 		p.handleInstantMetricPostAggregation(w, r, start, logqlQuery, postAgg)
 		return
+	}
+
+	// `<expr> or vector(N)`: the constant has no LogsQL equivalent, so the left
+	// side runs on its own and the constant fills what it does not cover.
+	if parsed, perr := logqlpkg.Parse(logqlQuery); perr == nil {
+		if binOp, isBin := parsed.(*logqlpkg.BinOpExpr); isBin {
+			// The nested handleQuery accounts for this request; recording it
+			// here as well would double the counters.
+			if p.serveOrVectorFallback(w, r, binOp, false) {
+				return
+			}
+		}
 	}
 
 	logsqlQuery, err := p.translateQueryWithContext(r.Context(), logqlQuery)

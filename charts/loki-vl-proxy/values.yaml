@@ -165,6 +165,7 @@ extraArgs:
   # log-stats-interval: "10s"       # how often to print a request statistics summary
   # log-rate-threshold: "10"        # above this req/s, replace per-request logs with periodic summaries
   # debug-log-raw-queries: "false"  # when true, debug logs include raw LogQL/LogsQL and backend params verbatim (default false: redacted to sha256+len)
+  # log-translated-queries: "false"  # when true, upstream calls log the translated LogsQL verbatim (failures and successes); off: sha256 digest only
 
   # --- HTTP server hardening ---
   http-read-timeout: "30s"

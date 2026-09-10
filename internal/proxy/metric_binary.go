@@ -57,31 +57,11 @@ func (p *Proxy) proxyStatsQueryRange(w http.ResponseWriter, r *http.Request, log
 		return
 	}
 
-	// For rate() with range==step: VL tumbling windows miss the pre-window data
-	// for the first evaluation point (Loki uses a sliding window [T0-W, T0];
-	// VL gives [T0, T0+W)). Shift start back by W, call the direct path, then
-	// trim the extra leading bucket from the response.
-	if origSpec, origStartNs, ok := statsRateRangeEqualsStepShift(originalLogql, r); ok {
-		buf := &bufferedResponseWriter{}
-		shiftedR := r.Clone(r.Context())
-		_ = shiftedR.ParseForm()
-		shiftedR.Form.Set("start", nanosToVLTimestamp(origStartNs-origSpec.Window.Nanoseconds()))
-		_ = p.proxyStatsQueryRangeDirect(buf, shiftedR, logsqlQuery)
-		body := trimStatsQueryRangeResponseFromStart(buf.body, origStartNs)
-		if hasTopK {
-			body = applyTopKToMatrix(body, topK, topKDesc)
-		}
-		code := buf.code
-		if code == 0 {
-			code = http.StatusOK
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if code != http.StatusOK {
-			w.WriteHeader(code)
-		}
-		_, _ = w.Write(body)
-		return
-	}
+	// NOTE (10.09.2026): a special case used to live here that shifted `start`
+	// back by the range for tumbling rate(), to compensate for VL bucketing as
+	// [T0, T0+W) while Loki evaluates (T0-W, T0]. That off-by-one is now fixed
+	// for EVERY range query at the response layer (shiftStatsQRToLokiGrid), so
+	// the special case became a second, stacking shift and was removed.
 
 	// Strip | delete __error__, __error_details__ for any stats query — it removes
 	// a field per row but never filters logs; counts are identical without it.
@@ -165,7 +145,13 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 
 	// Keep metric query_range as a single backend request. Window splitting and
 	// window-level cache reuse are for raw log queries only.
-	params := buildStatsQueryRangeParams(logsqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
+	// VictoriaLogs labels each stats bucket with its START; LogQL labels every
+	// range-metric point with the EVALUATION time, i.e. the bucket's END. The
+	// response is relabelled below, and the request reaches one step FURTHER
+	// BACK so the point at `start` still has a bucket behind it.
+	params := buildStatsQueryRangeParams(logsqlQuery,
+		shiftRangeStartOneStep(r.FormValue("start"), r.FormValue("step")),
+		r.FormValue("end"), r.FormValue("step"))
 
 	// Use vlPost directly (not coalesced) so readBodyLimited can bound the response
 	// before the full body is allocated. The coalescer's 256 MB cap is too generous
@@ -209,7 +195,7 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 		// appears once). Without this it rendered an empty chart ("nothing").
 		// The level value-filter disqualifies it from the detectDrilldownSingleField
 		// fast paths (those require pure existence filters), so it lands here.
-		if spec, ok := parseStatsCompatSpec(logsqlQuery); ok && spec.Func == "count" && len(spec.GroupBy) == 1 {
+		if spec, ok := parseStatsCompatSpec(logsqlQuery); ok && spec.Func == "count" && len(spec.GroupBy) == 1 && !isRateMathPipeline(logsqlQuery) {
 			field := spec.GroupBy[0]
 			phase1Query := spec.BaseQuery + " | stats by (" + quoteLogsQLIdent(field) + ") count()"
 			if out := p.drilldownTwoPhase(r, phase1Query, spec.BaseQuery, field, r.FormValue("step")); len(out) > 0 {
@@ -226,9 +212,18 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 
 	// Single parse pass: filter points to the requested end time AND translate
 	// metric labels. Replaces two sequential fastjson parses (trim then translate).
+	body = shiftStatsQRToLokiGrid(body, r.FormValue("step"))
 	var keepFn func(int64) bool
-	if endNs, ok := parseLokiTimeToUnixNano(r.FormValue("end")); ok {
-		keepFn = func(tsNs int64) bool { return tsNs <= endNs }
+	startNs, hasStart := parseLokiTimeToUnixNano(r.FormValue("start"))
+	endNs, hasEnd := parseLokiTimeToUnixNano(r.FormValue("end"))
+	if hasStart || hasEnd {
+		keepFn = func(tsNs int64) bool {
+			if hasEnd && tsNs > endNs {
+				return false
+			}
+			// The extra step requested above can yield a point before `start`.
+			return !hasStart || tsNs >= startNs
+		}
 	}
 	body = p.trimAndTranslateStatsQRFJ(r.Context(), body, keepFn, r.FormValue("query"))
 	// Cap to the busiest maxStatsQuerySeries (default 500, top-N by total count).
@@ -2152,7 +2147,7 @@ func (p *Proxy) tryHighCardCountByWindowedHits(w http.ResponseWriter, r *http.Re
 	// maxStatsQuerySeries top-N-by-count, like Loki's max_query_series, with the
 	// two-phase fallback only on a 16MB overflow).
 	spec, ok := parseStatsCompatSpec(logsqlQuery)
-	if !ok || spec.Func != "count" || len(spec.GroupBy) != 1 {
+	if !ok || spec.Func != "count" || len(spec.GroupBy) != 1 || isRateMathPipeline(logsqlQuery) {
 		return false
 	}
 	if !isGrafanaDrilldownRequest(r) && (!isGrafanaSourcedRequest(r) || !isLikelyHighCardinalityField(spec.GroupBy[0])) {
@@ -2185,7 +2180,7 @@ func (p *Proxy) tryHighCardCountByWindowedHits(w http.ResponseWriter, r *http.Re
 
 func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) []byte {
 	spec, ok := parseStatsCompatSpec(logsqlQuery)
-	if !ok || spec.Func != "count" || len(spec.GroupBy) != 1 {
+	if !ok || spec.Func != "count" || len(spec.GroupBy) != 1 || isRateMathPipeline(logsqlQuery) {
 		return nil
 	}
 	start, end := r.FormValue("start"), r.FormValue("end")
@@ -2542,6 +2537,111 @@ func statsRateRangeEqualsStepShift(originalLogql string, r *http.Request) (origS
 // statsQRFJPool pools fastjson.Parser instances for trimStatsQueryRange* hot paths.
 var statsQRFJPool fj.ParserPool
 
+// shiftRangeStartOneStep moves a range query's start back by one step.
+//
+// LogQL's point at t covers (t-range, t]; VictoriaLogs' bucket labelled b covers
+// [b, b+step). The point at `start` therefore comes out of the bucket at
+// `start-step`, which VL only returns if the request reaches that far back.
+// Returns startRaw unchanged when either value cannot be parsed.
+func shiftRangeStartOneStep(startRaw, stepRaw string) string {
+	startNs, ok := parseLokiTimeToUnixNano(startRaw)
+	if !ok {
+		return startRaw
+	}
+	step, ok := parsePositiveStepDuration(stepRaw)
+	if !ok || step <= 0 {
+		return startRaw
+	}
+	return nanosToVLTimestamp(startNs - step.Nanoseconds())
+}
+
+// shiftStatsQRToLokiGrid relabels every stats_query_range bucket from its START
+// to its END, which is where LogQL puts a range-metric sample.
+//
+// Without it every point of every range panel sits one `step` left of where
+// Loki draws it. Sums are unaffected, so a suite comparing totals sees nothing
+// wrong, while the chart silently lags one step and the newest bucket — the one
+// at `end` — never appears at all.
+func shiftStatsQRToLokiGrid(body []byte, stepRaw string) []byte {
+	step, ok := parsePositiveStepDuration(stepRaw)
+	if !ok || step <= 0 {
+		return body
+	}
+	return mapStatsQRPointTimestamps(body, step.Nanoseconds())
+}
+
+// mapStatsQRPointTimestamps rewrites the first element of every point array in a
+// stats_query_range response, adding deltaNs. Timestamps are re-emitted in the
+// unit they arrived in (VL uses whole seconds), so the shape is unchanged.
+func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
+	parser := statsQRFJPool.Get()
+	defer statsQRFJPool.Put(parser)
+
+	v, err := parser.ParseBytes(body)
+	if err != nil {
+		return body
+	}
+
+	var seriesArr []*fj.Value
+	if r := v.Get("results"); r != nil && r.Type() == fj.TypeArray {
+		seriesArr, _ = r.Array()
+	}
+	if len(seriesArr) == 0 {
+		if d := v.Get("data"); d != nil {
+			if r := d.Get("result"); r != nil && r.Type() == fj.TypeArray {
+				seriesArr, _ = r.Array()
+			}
+		}
+	}
+	if len(seriesArr) == 0 {
+		return body
+	}
+
+	changed := false
+	for _, series := range seriesArr {
+		valObj := series.Get("values")
+		if valObj == nil {
+			continue
+		}
+		points, _ := valObj.Array()
+		for _, point := range points {
+			pts, _ := point.Array()
+			if len(pts) == 0 {
+				continue
+			}
+			ns := statsQRFJPointNano(pts[0])
+			if ns == 0 {
+				continue
+			}
+			shifted := ns + deltaNs
+			// VL emits whole-second numbers and the Loki contract keeps that
+			// form — but a sub-second step (`500ms`, `0.5`) shifts off the
+			// second boundary, and truncating there would emit the ORIGINAL
+			// label. SetArrayItem is the only mutator that reaches an array
+			// ELEMENT — Value.Set addresses object keys and does nothing here.
+			newTS, parseErr := fj.Parse(formatUnixSecondsNumber(shifted))
+			if parseErr != nil {
+				continue
+			}
+			point.SetArrayItem(0, newTS)
+			changed = true
+		}
+	}
+	if !changed {
+		return body
+	}
+
+	buf := jsonBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer jsonBufPool.Put(buf)
+	scratch := fjMarshalPool.Get().(*[]byte)
+	defer fjMarshalPool.Put(scratch)
+	marshalFJ(buf, v, scratch)
+	out := make([]byte, buf.Len())
+	copy(out, buf.Bytes())
+	return out
+}
+
 func buildStatsQueryRangeParams(logsqlQuery, startRaw, endRaw, stepRaw string) url.Values {
 	return buildStatsQueryRangeParamsShifted(logsqlQuery, startRaw, endRaw, stepRaw, 0)
 }
@@ -2604,6 +2704,23 @@ func marshalFJ(buf *bytes.Buffer, v *fj.Value, scratch *[]byte) {
 // Used when start was shifted back to include the pre-start bucket for rate().
 func trimStatsQueryRangeResponseFromStart(body []byte, startNs int64) []byte {
 	return trimStatsQRByTimeFJ(body, func(tsNs int64) bool { return tsNs >= startNs })
+}
+
+// clampStatsQRToRequestWindow drops points outside the client's [start, end]
+// after the bucket-to-Loki-grid relabel: the extra step fetched below `start`
+// lands before it, and the bucket at `end` lands past it.
+func clampStatsQRToRequestWindow(body []byte, r *http.Request) []byte {
+	startNs, hasStart := parseLokiTimeToUnixNano(r.FormValue("start"))
+	endNs, hasEnd := parseLokiTimeToUnixNano(r.FormValue("end"))
+	if !hasStart && !hasEnd {
+		return body
+	}
+	return trimStatsQRByTimeFJ(body, func(tsNs int64) bool {
+		if hasEnd && tsNs > endNs {
+			return false
+		}
+		return !hasStart || tsNs >= startNs
+	})
 }
 
 // trimStatsQRByTimeFJ filters stats_query_range point arrays using fastjson,
@@ -3347,32 +3464,15 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 
 	isRange := vlEndpoint == "stats_query_range"
 
-	// Apply first-bucket shift if the original LogQL contains rate/bytes_rate with range==step.
-	// Guard: only shift when all range windows in the binary expression are equal — mixed
-	// windows (e.g. rate({a}[1m]) / rate({b}[5m])) cannot share a single shift value.
-	var origStartNs, shiftNs int64
-	if isRange {
-		if _, uniformOk := allRangeWindowsEqual(r.FormValue("query")); uniformOk {
-			if origSpec, startNs, ok := statsRateRangeEqualsStepShift(r.FormValue("query"), r); ok {
-				origStartNs = startNs
-				shiftNs = origSpec.Window.Nanoseconds()
-			}
-		}
-	}
-
 	buildParams := func(query string) url.Values {
 		params := url.Values{"query": {query}}
 		if isRange {
 			if s := r.FormValue("start"); s != "" {
-				if shiftNs > 0 {
-					if ns, ok2 := parseLokiTimeToUnixNano(s); ok2 {
-						params.Set("start", nanosToVLTimestamp(ns-shiftNs))
-					} else {
-						params.Set("start", formatVLStatsTimestamp(s))
-					}
-				} else {
-					params.Set("start", formatVLStatsTimestamp(s))
-				}
+				// A VL bucket is labelled by its START, a LogQL point by the
+				// bucket's END: every side is relabelled one step forward in
+				// fetchBinOpSide, so the window opens one step earlier to keep a
+				// bucket behind the point at `start`.
+				params.Set("start", formatVLStatsTimestamp(shiftRangeStartOneStep(s, r.FormValue("step"))))
 			}
 			if e := r.FormValue("end"); e != "" {
 				params.Set("end", formatVLStatsTimestamp(e))
@@ -3409,8 +3509,8 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 		result = combineBinaryMetricResults(leftBody, rightBody, op, resultType, leftIsScalar, rightIsScalar, leftQL, rightQL)
 	}
 
-	if origStartNs > 0 {
-		result = trimStatsQueryRangeResponseFromStart(result, origStartNs)
+	if isRange {
+		result = clampStatsQRToRequestWindow(result, r)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3420,31 +3520,15 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, leftQL, rightQL, vlEndpoint, resultType string) {
 	isRange := vlEndpoint == "stats_query_range"
 
-	// Apply first-bucket shift if the original LogQL contains rate/bytes_rate with range==step.
-	// Guard: only shift when all range windows in the binary expression are equal.
-	var origStartNs, shiftNs int64
-	if isRange {
-		if _, uniformOk := allRangeWindowsEqual(r.FormValue("query")); uniformOk {
-			if origSpec, startNs, ok := statsRateRangeEqualsStepShift(r.FormValue("query"), r); ok {
-				origStartNs = startNs
-				shiftNs = origSpec.Window.Nanoseconds()
-			}
-		}
-	}
-
 	buildParams := func(query string) url.Values {
 		params := url.Values{"query": {query}}
 		if isRange {
 			if s := r.FormValue("start"); s != "" {
-				if shiftNs > 0 {
-					if ns, ok2 := parseLokiTimeToUnixNano(s); ok2 {
-						params.Set("start", nanosToVLTimestamp(ns-shiftNs))
-					} else {
-						params.Set("start", formatVLStatsTimestamp(s))
-					}
-				} else {
-					params.Set("start", formatVLStatsTimestamp(s))
-				}
+				// A VL bucket is labelled by its START, a LogQL point by the
+				// bucket's END: every side is relabelled one step forward in
+				// fetchBinOpSide, so the window opens one step earlier to keep a
+				// bucket behind the point at `start`.
+				params.Set("start", formatVLStatsTimestamp(shiftRangeStartOneStep(s, r.FormValue("step"))))
 			}
 			if e := r.FormValue("end"); e != "" {
 				params.Set("end", formatVLStatsTimestamp(e))
@@ -3469,8 +3553,8 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 
 	// Combine results with arithmetic at proxy level
 	result := combineBinaryMetricResults(leftBody, rightBody, op, resultType, leftIsScalar, rightIsScalar, leftQL, rightQL)
-	if origStartNs > 0 {
-		result = trimStatsQueryRangeResponseFromStart(result, origStartNs)
+	if isRange {
+		result = clampStatsQRToRequestWindow(result, r)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3549,7 +3633,11 @@ func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildP
 	}
 	defer resp.Body.Close()
 	raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-	return stripVLStatsNameKey(raw), nil
+	body := stripVLStatsNameKey(raw)
+	if vlEndpoint == "stats_query_range" {
+		body = shiftStatsQRToLokiGrid(body, r.FormValue("step"))
+	}
+	return body, nil
 }
 
 func scalarBinOpBody(query string) []byte {

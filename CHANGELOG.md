@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`-log-translated-queries`** writes the translated LogsQL (`logsql.query`)
+  verbatim for both failed and successful upstream calls, so a backend 4xx can
+  be pasted straight into VictoriaLogs instead of being reproduced by hand. It
+  is off by default — a query literal can carry credentials or user text — and
+  with it off a failure still names its query by `sha256:…` digest.
 - **`loki_vl_proxy_template_pipeline_queries_total`** counts queries routed to
   the proxy-side LogQL pipeline instead of being pushed down to VictoriaLogs.
   That route reads raw rows, so its rate is what an operator needs — and it is
@@ -31,6 +36,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template text is never emitted as data.
 
 ### Fixed
+
+- **Every range-metric point sat one `step` to the left of where Loki draws it.**
+  VictoriaLogs labels a stats bucket by its START; LogQL labels a range point by
+  the EVALUATION time, i.e. the bucket's END. The proxy passed VL's label
+  through, so every chart lagged one step and the bucket at `t = end` ignored
+  `end` and collected live data past it. Every range path now relabels buckets
+  onto the Loki grid — the direct stats path, both binary-operator paths — and
+  requests one extra step behind `start` so the first point has a bucket to
+  stand on. Sums were unaffected, which is why a suite comparing totals never
+  saw it: the regression tests are per-point over data where every step has a
+  distinct count.
+- **The pre-bucketed sliding window counted one bucket too many.** The manual
+  builder took bucket starts in `[t-window, t]`, so the bucket AT the evaluation
+  time — which holds entries after `t` — was added to the point and then counted
+  again by the next one. It now uses `[t-window, t)`, the bounds its sibling
+  `buildHitsRangeMetricMatrix` already used.
+- **`rate()` lost its division under `topk`/`bottomk`.** A rate translation is a
+  multi-stage pipeline (`stats … count() | math …/<window> | stats … sum(…)`),
+  which the single-stage spec parser reads as a plain `count`; the
+  high-cardinality top-N paths then REBUILT the query from that spec and
+  returned raw counts — rate × the window in seconds (×300 on a `[5m]` panel).
+  Those paths now decline a rate pipeline.
+- **An instant `topk`/`sort` over a regexp-extracted label returned 400
+  `unsupported instant aggregation target`, or silently collapsed to one
+  unlabelled total.** The compat layer reads the ORIGINAL LogQL off the request
+  and saw `topk` as the metric function; it is now handed the inner expression,
+  the way the range path already did it.
+- **`<expr> or vector(0)` returned `result: []` for an empty left side.** The
+  literal `vector(0)` was POSTed to VictoriaLogs as if it were a query, so the
+  Grafana idiom for "draw a zero instead of No data" drew No data. The left side
+  now runs on its own and the constant fills every step it does not cover.
+- **The 10 000-raw-row guard rejected queries whose result is EMPTY.** Only the
+  leading line filters were pushed down, so a pipeline filter that matches
+  nothing still dragged every row of the selector across the wire and tripped the
+  cap — a 400 where Loki answers 0 rows. Every stage before the first one the
+  proxy must evaluate itself now travels with the selector (with a retry on the
+  narrower query when VictoriaLogs rejects a pushed-down filter), and a plain LOG
+  query — already a "newest N lines" request — no longer fails on truncation at
+  all; the cap still guards aggregations, which truncation would silently falsify.
 
 - **The proxy-side pipeline's compile caches were plain maps written from every
   request goroutine.** `extractorCache`, `lineFilterCache`, `anchoredCache` and

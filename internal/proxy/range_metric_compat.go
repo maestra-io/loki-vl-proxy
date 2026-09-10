@@ -517,6 +517,20 @@ func isMultiStageStatsQuery(logsqlQuery string) bool {
 	return strings.Count(scanned, "| stats ") >= 2
 }
 
+// isRateMathPipeline reports whether a translated LogsQL query is a rate-style
+// pipeline: a per-bucket stats stage, a `| math <field>/<window>` division and a
+// second stats stage that re-aggregates the divided value.
+//
+// parseStatsCompatSpec only understands a SINGLE stats clause, so it reads such
+// a pipeline as a plain `count` and swallows the division into Field. Any caller
+// that REBUILDS a query from that spec would therefore drop the division and
+// return counts — rate multiplied by the window in seconds (a topk(5, sum by (ns)
+// (rate([5m]))) panel came back ×300 against Loki).
+func isRateMathPipeline(logsqlQuery string) bool {
+	scanned := stripQuotedSpans(logsqlQuery)
+	return strings.Contains(scanned, "| math ") && strings.Count(scanned, "| stats ") >= 2
+}
+
 func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
 	if p.handleTemplateMetricInstant(w, r, originalLogql, logsqlQuery) {
 		return true
@@ -1847,19 +1861,21 @@ func marshalManualMetricResponse(resultType string, result []map[string]interfac
 //
 // That rule is about RAW entry timestamps. Some callers instead pass
 // PRE-BUCKETED VictoriaLogs stats samples, whose timestamp is a bucket START
-// standing for every entry in `[ts, ts+step)`. Excluding such a bucket because
-// its start coincides with the window edge would drop entries that are inside
-// the window, so `preBucketed` keeps the left bound closed for them — the same
-// choice buildHitsRangeMetricMatrix makes with `[T-window, T)`.
+// standing for every entry in `[ts, ts+step)`. Their window is therefore
+// `[windowStart, windowEnd)` — the same bounds buildHitsRangeMetricMatrix uses:
+// the bucket ON the left edge holds entries inside the window and must stay,
+// while the bucket ON the right edge (`windowEnd`) covers entries AFTER the
+// evaluation time and belongs to the next point. Counting it over-counted every
+// point by a whole bucket and counted that bucket twice.
 func aggregateManualWindow(functionName string, quantile float64, samples []rangeMetricSample, windowStart, windowEnd int64, windowSeconds float64, preBucketed bool) (float64, bool) {
 	// One exclusive lower bound, computed once: raw entries exclude windowStart
 	// itself, pre-bucketed samples keep it (timestamps are integer nanoseconds,
 	// so "one below" is exact).
-	lowerExclusive := windowStart
+	lowerExclusive, upperInclusive := windowStart, windowEnd
 	if preBucketed {
-		lowerExclusive = windowStart - 1
+		lowerExclusive, upperInclusive = windowStart-1, windowEnd-1
 	}
-	outOfWindow := func(ts int64) bool { return ts <= lowerExclusive || ts > windowEnd }
+	outOfWindow := func(ts int64) bool { return ts <= lowerExclusive || ts > upperInclusive }
 	// Slice-dependent functions: build filtered slice, then aggregate.
 	switch functionName {
 	case "quantile", "stddev", "stdvar", "rate_counter":
