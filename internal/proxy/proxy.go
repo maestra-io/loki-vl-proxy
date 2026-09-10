@@ -2230,7 +2230,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if isStatsQuery(logsqlQuery) {
 		p.proxyStatsQueryRange(sc, r, logsqlQuery)
-	} else if !p.proxyTemplateLogQuery(sc, r, logqlQuery) {
+	} else if !p.proxyTemplateLogQuery(sc, r, logqlQuery, categorizedLabels) {
 		// proxyTemplateLogQuery claims only pipelines carrying a Go template,
 		// which it must evaluate itself — VictoriaLogs would emit the template
 		// text as the log line.

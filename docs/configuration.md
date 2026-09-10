@@ -201,7 +201,16 @@ backend.
 **Pushdown boundary**: a format stage carrying no `{{` action is a constant and
 a bare rename is a field copy, so both translate to LogsQL faithfully and are
 NOT pulled onto this path: `| line_format ""`, `| label_format env="prod"` and
-`| label_format new=old` keep going to VictoriaLogs.
+`| label_format new=old` keep going to VictoriaLogs. Anything with a `{{` —
+including a bare `{{.field}}` — is evaluated in the proxy. The counter
+`loki_vl_proxy_template_pipeline_queries_total` reports how many queries took
+that route.
+
+**Response shape**: under the `categorize-labels` encoding the stream map holds
+only the original stream labels, VictoriaLogs' other row fields are returned as
+`structuredMetadata`, and everything the pipeline itself produced (parser
+captures, `label_format` results) is returned as `parsed`. Without that encoding
+the labels are flattened into the stream map, as on the proxy's other log paths.
 
 Supported template functions mirror
 [Loki's list](https://grafana.com/docs/loki/latest/query/template_functions/):

@@ -2,6 +2,7 @@ package logql
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,7 +69,13 @@ func TestTemplateFunctions(t *testing.T) {
 		{"contains", `{{ if contains "api" .path }}yes{{ end }}`, "yes"},
 		{"hasPrefix", `{{ if hasPrefix "/api" .path }}yes{{ end }}`, "yes"},
 		{"hasSuffix", `{{ if hasSuffix "users" .path }}yes{{ end }}`, "yes"},
-		{"bytes", `{{ .size | bytes }}`, "2.048kB"},
+		// Loki's `bytes` PARSES a humanised size into a byte count.
+		{"bytes_plain", `{{ .size | bytes }}`, "2048"},
+		{"bytes_decimal_unit", `{{ bytes "2kB" }}`, "2000"},
+		{"bytes_binary_unit", `{{ bytes "1KiB" }}`, "1024"},
+		{"bytes_mib", `{{ bytes "1.5MiB" }}`, "1572864"},
+		{"bytes_bare_b", `{{ bytes "512B" }}`, "512"},
+		{"bytes_unparseable", `{{ bytes "nope" }}`, "0"},
 
 		// encoding
 		{"b64enc", `{{ b64enc "abc" }}`, "YWJj"},
@@ -85,12 +92,12 @@ func TestTemplateFunctions(t *testing.T) {
 		{"count", `{{ count "a|b" "abab" }}`, "4"},
 
 		// time
-		{"date", `{{ date "2006-01-02" __timestamp__ }}`, "2026-09-10"},
-		{"toDate", `{{ toDate "2006-01-02" "2021-11-02" | unixEpoch }}`, "1635811200"},
+		{"date", `{{ date "2006-01-02" __timestamp__ }}`, ts.Format("2006-01-02")},
+		{"toDate", `{{ toDate "2006-01-02" "2021-11-02" | unixEpoch }}`, strconv.FormatInt(toDate("2006-01-02", "2021-11-02").Unix(), 10)},
 		{"toDateInZone", `{{ toDateInZone "2006-01-02" "UTC" "2021-11-02" | unixEpoch }}`, "1635811200"},
 		{"unixEpochMillis", `{{ unixEpochMillis __timestamp__ }}`, "1789041600000"},
 		{"unixEpochNanos", `{{ unixEpochNanos __timestamp__ }}`, "1789041600000000000"},
-		{"unixToTime", `{{ date "2006-01-02" (unixToTime .epoch) }}`, "2023-11-14"},
+		{"unixToTime", `{{ date "2006-01-02" (unixToTime .epoch) }}`, time.Unix(1700000000, 0).Format("2006-01-02")},
 		{"duration_seconds", `{{ duration_seconds .dur }}`, "90"},
 		{"duration_alias", `{{ .dur | duration }}`, "90"},
 

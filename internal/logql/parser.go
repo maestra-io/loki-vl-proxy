@@ -88,6 +88,17 @@ type parser struct {
 	input string
 }
 
+// atStageEnd reports whether the cursor sits where a pipeline stage may end —
+// the same token set consumeRestOfStage stops at.
+func (p *parser) atStageEnd() bool {
+	switch p.cur.Typ {
+	case TokEOF, TokPipe, TokPipeEq, TokPipeTilde, TokPipeGt, TokBangGt,
+		TokLBracket, TokRParen, TokBangEq, TokBangTilde:
+		return true
+	}
+	return false
+}
+
 // parserMark snapshots the scanner + lookahead so a speculative parse can be
 // rewound. The scanner is a pure (src, pos, braceDepth) cursor, so copying it
 // is a complete restore point.
@@ -728,6 +739,14 @@ func (p *parser) parseLabelFormatAssignments() []LabelFormatAssign {
 		}
 		out = append(out, a)
 		if p.cur.Typ != TokComma {
+			// The list ended. Anything OTHER than the end of the stage means we
+			// read only a PREFIX of it (`a="{{.x}}" b=c`, no comma): returning
+			// that prefix would silently drop `b=c`, so hand back nil and let
+			// NewPipeline reject the stage as unsupported.
+			if !p.atStageEnd() {
+				p.reset(mark)
+				return nil
+			}
 			break
 		}
 		p.advance()

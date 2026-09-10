@@ -2,7 +2,9 @@ package logql
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -412,5 +414,79 @@ func TestPipeline_MalformedTemplateIsNotAQueryError(t *testing.T) {
 	}
 	if e.Labels["__error__"] != "TemplateFormatErr" {
 		t.Errorf("__error__ = %q, want TemplateFormatErr", e.Labels["__error__"])
+	}
+}
+
+// TestPipeline_ConcurrentUse hammers the package-level compile caches from many
+// goroutines. Before they were guarded, this reproduced
+// `fatal error: concurrent map writes` — which kills the PROCESS, taking every
+// other in-flight query with it. Run under -race.
+func TestPipeline_ConcurrentUse(t *testing.T) {
+	queries := []string{
+		`{a="b"} |~ "40[0-9]" | json | line_format "{{.status}}" | status=~"4.."`,
+		`{a="b"} |~ "50[0-9]" | json | line_format "{{ upper .level }}" | status!~"2.."`,
+		"{a=\"b\"} | regexp \"(?P<code>\\\\d{3})\" | label_format cls=`{{ printf \"%.1sxx\" .code }}`",
+		`{a="b"} | logfmt | line_format "{{.msg}}" | dur > 10ms`,
+		"{a=\"b\"} | pattern `<verb> <path>` | line_format `{{.verb}}`",
+		`{a="b"} | json | __error__="" | line_format "{{__line__}}"`,
+	}
+	lines := []string{
+		`{"status":"404","level":"error","msg":"x","dur":"250ms"}`,
+		`{"status":"200","level":"info","msg":"y","dur":"5ms"}`,
+		`level=warn msg="hi there" dur=90ms`,
+		`GET /api/v1/users`,
+		`not json at all`,
+	}
+
+	const goroutines = 32
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 40; i++ {
+				q := queries[(g+i)%len(queries)]
+				expr, err := Parse(q)
+				if err != nil {
+					t.Errorf("Parse(%q): %v", q, err)
+					return
+				}
+				lq, ok := expr.(*LogQuery)
+				if !ok {
+					t.Errorf("expected a log query for %q", q)
+					return
+				}
+				// Each goroutine compiles its OWN Pipeline — that is the
+				// supported usage — but they all share the compile caches.
+				pipeline, err := NewPipeline(lq.Pipeline)
+				if err != nil {
+					t.Errorf("NewPipeline(%q): %v", q, err)
+					return
+				}
+				for _, line := range lines {
+					e := &Entry{TS: time.Unix(1789041600, 0), Line: line, Labels: map[string]string{"a": "b"}}
+					pipeline.Process(e)
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+}
+
+// TestCompileCacheIsBounded proves the 1024-entry cap still holds now that the
+// length check moved under the write lock.
+func TestCompileCacheIsBounded(t *testing.T) {
+	var c compileCache[int]
+	for i := 0; i < compileCacheMaxEntries+50; i++ {
+		c.put(strconv.Itoa(i), i)
+	}
+	c.mu.RLock()
+	size := len(c.m)
+	c.mu.RUnlock()
+	if size != compileCacheMaxEntries {
+		t.Errorf("cache size = %d, want %d", size, compileCacheMaxEntries)
+	}
+	if _, ok := c.get("0"); !ok {
+		t.Error("early entries should survive; the cap drops NEW writes")
 	}
 }

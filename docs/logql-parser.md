@@ -251,14 +251,33 @@ The AST-to-AST translator (`logql.Translate`) maps LogQL pipeline stages to `log
 | `*ParserStage` — unpack | always | `logsql.PipeUnpackJSON` | |
 | `*DropStage` | bare labels only | `logsql.PipeDelete` | Matcher-based drop → `errFallthrough` |
 | `*KeepStage` | bare labels only | `logsql.PipeKeep` | Matcher-based keep → `errFallthrough` |
-| `*LineFormatStage` | simple templates | `logsql.PipeFormat` | Complex `{{` templates → `errFallthrough` |
-| `*LabelFormatStage` | any | `errFallthrough` | No LogsQL equivalent yet |
+| `*LineFormatStage` | CONSTANT only (no `{{`) | `logsql.PipeFormat` | Any `{{` action → proxy-side pipeline (see below) |
+| `*LabelFormatStage` | bare rename / constant | `errFallthrough` → string translator | Any `{{` action → proxy-side pipeline |
 | `*UnwrapStage` | any | `errFallthrough` | Handled by metric translator |
 | `*DecolorizeStage` | any | `errFallthrough` | No LogsQL equivalent |
 | `*RangeAggregation` | any | `errFallthrough` | Metric path via string translator |
 | `*VectorAggregation` | any | `errFallthrough` | Metric path via string translator |
 | `*BinOpExpr` | any | `errFallthrough` | Binary metric path |
 | `*OpaqueMetricExpr` | any | raw pass-through | `label_replace`, `label_join` etc. |
+
+### Format stages and the pushdown boundary
+
+The table above describes what the AST translator emits. Whether the query
+reaches VictoriaLogs at all is decided one step earlier, by
+`logql.NeedsProxyEvaluation`:
+
+- a `line_format` / `label_format` carrying **any `{{` action** — a field
+  reference included — is evaluated in the proxy (`internal/logql/pipeline.go`),
+  and so is the rest of the pipeline around it;
+- a **constant** format (`| line_format ""`, `| label_format env="prod"`) and a
+  **bare rename** (`| label_format new=old`) are expressible in LogsQL and stay
+  pushed down;
+- so is a pipeline with no format stage, unless it FILTERS on `__error__` /
+  `__error_details__` — those labels exist only in Loki's model.
+
+`loki_vl_proxy_template_pipeline_queries_total` counts the queries that took the
+proxy-side route. See `docs/configuration.md` →
+"LogQL Templates and `__error__` Filtering".
 
 `errFallthrough` is a package-private sentinel — callers route to `TranslateLogQLWithCapabilities` unchanged.
 

@@ -60,6 +60,8 @@ func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templa
 		return nil, err
 	}
 
+	p.metrics.RecordTemplatePipelineQuery()
+
 	reduced := &logqlpkg.LogQuery{Selector: lq.Selector, Pipeline: leadingLineFilters(lq.Pipeline)}
 	baseLogsQL, err := p.translateQueryWithContext(ctx, reduced.String())
 	if err != nil {
@@ -104,10 +106,19 @@ func leadingLineFilters(stages []logqlpkg.Stage) []logqlpkg.Stage {
 }
 
 // templateEntry is one entry that survived the pipeline.
+//
+// labels is the flat post-pipeline set (what grouping and non-categorized
+// responses use). stream/sm/parsed are the same values split the way Loki's
+// categorize-labels encoding wants them: original stream labels stay in the
+// stream map, VictoriaLogs' other row fields are structured metadata, and
+// anything the pipeline itself produced is parsed.
 type templateEntry struct {
 	ts     int64 // unix nanoseconds
 	line   string
 	labels map[string]string
+	stream map[string]string
+	sm     map[string]string
+	parsed map[string]string
 }
 
 // fetchTemplatePipelineEntries runs the reduced LogsQL against VictoriaLogs and
@@ -162,15 +173,21 @@ func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *template
 		if !ok {
 			continue
 		}
-		entry := logqlpkg.Entry{
-			TS:     time.Unix(0, ts),
-			Line:   string(v.GetStringBytes("_msg")),
-			Labels: p.templateEntryLabels(v),
+		streamLabels, smFields := p.templateEntryFields(v)
+		merged := make(map[string]string, len(streamLabels)+len(smFields))
+		for k, val := range smFields {
+			merged[k] = val
 		}
+		for k, val := range streamLabels {
+			merged[k] = val
+		}
+		entry := logqlpkg.Entry{TS: time.Unix(0, ts), Line: string(v.GetStringBytes("_msg")), Labels: merged}
 		if !plan.pipeline.Process(&entry) {
 			continue
 		}
-		out = append(out, templateEntry{ts: ts, line: entry.Line, labels: entry.Labels})
+		te := templateEntry{ts: ts, line: entry.Line, labels: entry.Labels}
+		te.stream, te.sm, te.parsed = splitTemplateLabels(entry.Labels, streamLabels, smFields)
+		out = append(out, te)
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
 		return nil, fmt.Errorf("scanning VL response: %w", scanErr)
@@ -178,10 +195,30 @@ func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *template
 	return out, nil
 }
 
-// templateEntryLabels builds the Loki-named label set a template sees: stream
-// labels plus every other non-internal field VictoriaLogs stored with the row
-// (Loki's structured metadata), all translated back to Loki naming.
-func (p *Proxy) templateEntryLabels(v *fj.Value) map[string]string {
+// splitTemplateLabels classifies the post-pipeline label set. A key that still
+// holds its original value belongs where it came from; everything else — a new
+// label, or one a parser or label_format rewrote — is a PARSED field, which is
+// exactly Loki's rule for the categorize-labels encoding.
+func splitTemplateLabels(final, streamLabels, smFields map[string]string) (stream, sm, parsed map[string]string) {
+	stream = make(map[string]string, len(streamLabels))
+	sm = make(map[string]string, len(smFields))
+	parsed = make(map[string]string, 4)
+	for k, v := range final {
+		switch {
+		case streamLabels[k] == v:
+			stream[k] = v
+		case smFields[k] == v:
+			sm[k] = v
+		default:
+			parsed[k] = v
+		}
+	}
+	return stream, sm, parsed
+}
+
+// templateEntryFields splits a VictoriaLogs row into the Loki-named stream
+// labels and the row's other fields (Loki's structured metadata).
+func (p *Proxy) templateEntryFields(v *fj.Value) (streamLabels, smFields map[string]string) {
 	labels := make(map[string]string, 8)
 	if obj, err := v.Object(); err == nil {
 		obj.Visit(func(key []byte, val *fj.Value) {
@@ -198,10 +235,12 @@ func (p *Proxy) templateEntryLabels(v *fj.Value) map[string]string {
 			}
 		})
 	}
-	for k, val := range parseStreamLabels(string(v.GetStringBytes("_stream"))) {
-		labels[k] = val
+	smFields = p.labelTranslator.TranslateLabelsMap(labels)
+	streamLabels = p.labelTranslator.TranslateLabelsMap(parseStreamLabels(string(v.GetStringBytes("_stream"))))
+	for k := range streamLabels {
+		delete(smFields, k)
 	}
-	return p.labelTranslator.TranslateLabelsMap(labels)
+	return streamLabels, smFields
 }
 
 func vlRowTimestampNanos(v *fj.Value) (int64, bool) {
@@ -227,7 +266,7 @@ func vlRowTimestampNanos(v *fj.Value) (int64, bool) {
 
 // proxyTemplateLogQuery serves a `streams` query whose pipeline needs
 // proxy-side template evaluation. It reports whether it wrote a response.
-func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, logqlQuery string) bool {
+func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, logqlQuery string, categorizedLabels bool) bool {
 	plan, err := p.templatePlanFor(r.Context(), logqlQuery)
 	if err != nil {
 		p.writeError(w, http.StatusBadRequest, err.Error())
@@ -263,9 +302,9 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 	backward := !strings.EqualFold(r.FormValue("direction"), "forward")
 
 	sort.SliceStable(entries, func(i, j int) bool {
-		if entries[i].ts == entries[j].ts {
-			return i < j
-		}
+		// Equal timestamps are NOT ordered here: SliceStable already preserves
+		// their input order, and returning i<j makes the comparator inconsistent
+		// (it would claim both i<j and j<i for a swapped pair).
 		if backward {
 			return entries[i].ts > entries[j].ts
 		}
@@ -275,25 +314,36 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 		entries = entries[:limit]
 	}
 
-	writeLokiStreamQueryResponse(w, groupTemplateEntriesIntoStreams(entries), false)
+	emitStructuredMetadata := p.shouldEmitStructuredMetadata(r)
+	writeLokiStreamQueryResponse(w, groupTemplateEntriesIntoStreams(entries, categorizedLabels, emitStructuredMetadata), categorizedLabels)
 	return true
 }
 
 // groupTemplateEntriesIntoStreams collapses entries sharing a label set into one
 // Loki stream, preserving the order they were given in.
-func groupTemplateEntriesIntoStreams(entries []templateEntry) []map[string]interface{} {
+//
+// Under the categorize-labels encoding the stream map carries ONLY the original
+// stream labels and the per-entry tuple carries structuredMetadata + parsed;
+// without it Loki flattens everything into the stream map, which is what the
+// proxy's other log paths do too.
+func groupTemplateEntriesIntoStreams(entries []templateEntry, categorizedLabels, emitStructuredMetadata bool) []map[string]interface{} {
 	order := make([]string, 0, 8)
 	byKey := make(map[string]map[string]interface{}, 8)
 	for _, e := range entries {
-		key := canonicalLabelsKey(e.labels)
+		labels := e.labels
+		if categorizedLabels {
+			labels = e.stream
+		}
+		key := canonicalLabelsKey(labels)
 		stream, ok := byKey[key]
 		if !ok {
-			stream = map[string]interface{}{"stream": e.labels, "values": make([]interface{}, 0, 16)}
+			stream = map[string]interface{}{"stream": labels, "values": make([]interface{}, 0, 16)}
 			byKey[key] = stream
 			order = append(order, key)
 		}
 		values, _ := stream["values"].([]interface{})
-		stream["values"] = append(values, []interface{}{strconv.FormatInt(e.ts, 10), e.line})
+		stream["values"] = append(values, buildStreamValue(
+			strconv.FormatInt(e.ts, 10), e.line, e.sm, e.parsed, emitStructuredMetadata, categorizedLabels))
 	}
 	out := make([]map[string]interface{}, 0, len(order))
 	for _, key := range order {

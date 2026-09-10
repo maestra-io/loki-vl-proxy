@@ -385,16 +385,46 @@ func durationSecondsFn(s string) float64 {
 	return d.Seconds()
 }
 
-var byteUnits = []string{"B", "kB", "MB", "GB", "TB", "PB", "EB"}
+// byteSizeUnits maps a humanised size suffix to its multiplier. Longest suffix
+// wins, so "KiB" is matched before "B".
+var byteSizeUnits = []struct {
+	suffix string
+	factor float64
+}{
+	{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}, {"TiB", 1 << 40},
+	{"PiB", 1 << 50}, {"EiB", 1 << 60},
+	{"KB", 1e3}, {"MB", 1e6}, {"GB", 1e9}, {"TB", 1e12}, {"PB", 1e15}, {"EB", 1e18},
+	{"K", 1e3}, {"M", 1e6}, {"G", 1e9}, {"T", 1e12}, {"P", 1e15}, {"E", 1e18},
+	{"B", 1},
+}
 
+// humanBytes implements Loki's `bytes`: it PARSES a humanised size and returns
+// the byte count ("2kB" → 2000, "1KiB" → 1024, "2048" → 2048). It does not
+// render a number as a humanised string — that is the opposite direction, and
+// getting it backwards silently corrupted every `{{ .size | bytes }}`.
 func humanBytes(s string) string {
-	v := toFloat(s)
-	i := 0
-	for v >= 1000 && i < len(byteUnits)-1 {
-		v /= 1000
-		i++
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return "0"
 	}
-	return strconv.FormatFloat(v, 'f', -1, 64) + byteUnits[i]
+	for _, u := range byteSizeUnits {
+		if len(trimmed) <= len(u.suffix) {
+			continue
+		}
+		if !strings.EqualFold(trimmed[len(trimmed)-len(u.suffix):], u.suffix) {
+			continue
+		}
+		n, err := strconv.ParseFloat(strings.TrimSpace(trimmed[:len(trimmed)-len(u.suffix)]), 64)
+		if err != nil {
+			continue
+		}
+		return strconv.FormatFloat(n*u.factor, 'f', -1, 64)
+	}
+	n, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return "0"
+	}
+	return strconv.FormatFloat(n, 'f', -1, 64)
 }
 
 func stringify(v interface{}) string {

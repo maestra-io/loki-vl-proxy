@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -540,12 +541,47 @@ func parseUnpackInto(e *Entry) {
 	}
 }
 
-var extractorCache = map[string]*regexp.Regexp{}
+// compileCache memoises compiled regexps and label filters across requests.
+//
+// These caches are package-level and every in-flight HTTP request writes to
+// them from its own goroutine, so a plain map is a `fatal error: concurrent map
+// writes` waiting to happen — one that kills the PROCESS, not the request.
+// Reads take the read lock; the 1024-entry bound is checked under the write lock
+// so two racing writers cannot both pass it.
+type compileCache[T any] struct {
+	mu sync.RWMutex
+	m  map[string]T
+}
+
+// compileCacheMaxEntries bounds each cache. Queries are operator-authored and
+// few; the bound exists so a pathological client cannot grow them without end.
+const compileCacheMaxEntries = 1024
+
+func (c *compileCache[T]) get(key string) (T, bool) {
+	c.mu.RLock()
+	v, ok := c.m[key]
+	c.mu.RUnlock()
+	return v, ok
+}
+
+func (c *compileCache[T]) put(key string, v T) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = make(map[string]T, 16)
+	}
+	if len(c.m) >= compileCacheMaxEntries {
+		return
+	}
+	c.m[key] = v
+}
+
+var extractorCache compileCache[*regexp.Regexp]
 
 // compileExtractor turns a regexp or pattern stage into a named-group regexp.
 func compileExtractor(st *ParserStage) (*regexp.Regexp, error) {
 	key := strconv.Itoa(int(st.Type)) + "\x00" + st.Param
-	if re, ok := extractorCache[key]; ok {
+	if re, ok := extractorCache.get(key); ok {
 		return re, nil
 	}
 	src := st.Param
@@ -556,9 +592,7 @@ func compileExtractor(st *ParserStage) (*regexp.Regexp, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid %s expression %q: %w", st.String(), st.Param, err)
 	}
-	if len(extractorCache) < 1024 {
-		extractorCache[key] = re
-	}
+	extractorCache.put(key, re)
 	return re, nil
 }
 
@@ -613,7 +647,7 @@ func sanitizeLabel(s string) string {
 
 // ─── filters ────────────────────────────────────────────────────────────────
 
-var lineFilterCache = map[string]*regexp.Regexp{}
+var lineFilterCache compileCache[*regexp.Regexp]
 
 func matchLineFilter(st *LineFilterStage, line string) bool {
 	switch st.Op {
@@ -622,16 +656,14 @@ func matchLineFilter(st *LineFilterStage, line string) bool {
 	case LineFilterExcludes:
 		return !strings.Contains(line, st.Value)
 	case LineFilterMatchRe, LineFilterExcludeRe:
-		re, ok := lineFilterCache[st.Value]
+		re, ok := lineFilterCache.get(st.Value)
 		if !ok {
 			var err error
 			re, err = regexp.Compile(st.Value)
 			if err != nil {
 				return true
 			}
-			if len(lineFilterCache) < 1024 {
-				lineFilterCache[st.Value] = re
-			}
+			lineFilterCache.put(st.Value, re)
 		}
 		if st.Op == LineFilterMatchRe {
 			return re.MatchString(line)
@@ -682,20 +714,18 @@ func matchDropMatcher(m DropMatcher, val string) bool {
 	}
 }
 
-var anchoredCache = map[string]*regexp.Regexp{}
+var anchoredCache compileCache[*regexp.Regexp]
 
 // matchAnchored applies LogQL label-matcher regex semantics: fully anchored.
 func matchAnchored(pattern, val string) bool {
-	re, ok := anchoredCache[pattern]
+	re, ok := anchoredCache.get(pattern)
 	if !ok {
 		var err error
 		re, err = regexp.Compile("^(?:" + pattern + ")$")
 		if err != nil {
 			return false
 		}
-		if len(anchoredCache) < 1024 {
-			anchoredCache[pattern] = re
-		}
+		anchoredCache.put(pattern, re)
 	}
 	return re.MatchString(val)
 }
@@ -762,10 +792,10 @@ func (f *labelFilterPred) eval(l map[string]string) bool {
 	return false
 }
 
-var labelFilterCache = map[string]labelFilter{}
+var labelFilterCache compileCache[labelFilter]
 
 func parseLabelFilter(raw string) (labelFilter, error) {
-	if f, ok := labelFilterCache[raw]; ok {
+	if f, ok := labelFilterCache.get(raw); ok {
 		return f, nil
 	}
 	lp := &lfParser{src: raw}
@@ -777,9 +807,7 @@ func parseLabelFilter(raw string) (labelFilter, error) {
 	if lp.pos < len(lp.src) {
 		return nil, fmt.Errorf("unsupported label filter expression: %s", strings.TrimSpace(raw))
 	}
-	if len(labelFilterCache) < 1024 {
-		labelFilterCache[raw] = f
-	}
+	labelFilterCache.put(raw, f)
 	return f, nil
 }
 

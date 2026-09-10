@@ -74,8 +74,12 @@ var tplTrowPaths = []struct {
 func ensureTemplateDataIngested(t *testing.T) {
 	t.Helper()
 	tplIngestOnce.Do(func() {
-		waitForReady(t, proxyURL+"/ready", 30*time.Second)
-		waitForReady(t, lokiURL+"/ready", 30*time.Second)
+		// 90 s, not 30: on a cold stack Loki needs longer, and a readiness
+		// t.Fatal inside sync.Once poisons every later test in this file (the
+		// Once is spent, so the fixture is never ingested and each of them then
+		// compares two empty results).
+		waitForReady(t, proxyURL+"/ready", 90*time.Second)
+		waitForReady(t, lokiURL+"/ready", 90*time.Second)
 
 		runID := strconv.FormatInt(time.Now().UnixNano(), 36)
 		tplStreamNS = "e2e-tpl-" + runID
@@ -201,21 +205,26 @@ func tplPush(t *testing.T, labels map[string]string, entries []tplEntry) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"streams": []map[string]interface{}{{"stream": labels, "values": lokiValues}},
 	})
-	resp, err := http.Post(lokiURL+"/loki/api/v1/push", "application/json", strings.NewReader(string(body)))
-	if err != nil {
-		t.Fatalf("Loki push failed: %v", err)
-	}
-	resp.Body.Close()
-
-	resp, err = http.Post(
+	tplPostOK(t, "Loki", lokiURL+"/loki/api/v1/push", "application/json", string(body))
+	tplPostOK(t, "VictoriaLogs",
 		vlURL+"/insert/jsonline?_stream_fields="+strings.Join(streamFields, ","),
-		"application/stream+json",
-		strings.NewReader(strings.Join(vlLines, "\n")),
-	)
+		"application/stream+json", strings.Join(vlLines, "\n"))
+}
+
+// tplPostOK ingests and FAILS THE TEST on a non-2xx. A silently rejected push
+// leaves both backends empty, and the comparisons downstream then agree on
+// nothing — which reads as a pass, not as a broken fixture.
+func tplPostOK(t *testing.T, name, url, contentType, body string) {
+	t.Helper()
+	resp, err := http.Post(url, contentType, strings.NewReader(body))
 	if err != nil {
-		t.Fatalf("VL push failed: %v", err)
+		t.Fatalf("%s ingest failed: %v", name, err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		t.Fatalf("%s ingest returned %d: %s", name, resp.StatusCode, tplTruncate(string(respBody)))
+	}
 }
 
 // ─── query helpers ──────────────────────────────────────────────────────────
@@ -425,11 +434,11 @@ func TestTemplate_T6_LabelFormatRate(t *testing.T) {
 
 	// The rate shape: Σ over a [1m] rate must be ≈ Σ(counts)/60, i.e. two
 	// orders of magnitude below the line count — never the count itself.
-	proxySum, lokiSum := tplSum(proxyTotals), tplSum(lokiTotals)
+	proxySum := tplSum(proxyTotals)
 	if proxySum >= float64(tplLines)/2 {
 		t.Errorf("Σ=%v looks like an undivided count (%d lines ingested) — rate() must divide by the range seconds", proxySum, tplLines)
 	}
-	tplAssertClose(t, "T6 Σ", proxySum, lokiSum, 0.10)
+	tplAssertSeriesClose(t, "T6", proxyTotals, lokiTotals, 0.10)
 }
 
 // TestTemplate_T8_PrintfLabelFormat covers the `printf` template producing the
@@ -445,10 +454,7 @@ func TestTemplate_T8_PrintfLabelFormat(t *testing.T) {
 			t.Errorf("missing series %s in proxy result %v", key, proxyTotals)
 		}
 	}
-	if len(proxyTotals) != len(lokiTotals) {
-		t.Errorf("series count proxy=%d loki=%d (proxy=%v loki=%v)", len(proxyTotals), len(lokiTotals), proxyTotals, lokiTotals)
-	}
-	tplAssertClose(t, "T8 Σ", tplSum(proxyTotals), tplSum(lokiTotals), 0.10)
+	tplAssertSeriesClose(t, "T8", proxyTotals, lokiTotals, 0.10)
 }
 
 // TestTemplate_BacktickLineFormat is the D1/D2 shape: a backtick-quoted
@@ -572,22 +578,82 @@ func TestTemplate_UnknownFunctionIsRejected(t *testing.T) {
 	}
 }
 
+// tplTemplatePipelineCounter reads the proxy's count of queries routed to the
+// proxy-side pipeline. It is the only externally visible signal of WHICH side of
+// the pushdown boundary a query landed on — output alone cannot tell, because
+// both routes produce the same lines when the template is a constant.
+func tplTemplatePipelineCounter(t *testing.T) float64 {
+	t.Helper()
+	resp, err := http.Get(proxyURL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Skipf("proxy /metrics unavailable (%d) — instrumentation not enabled on this stack", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	const name = "loki_vl_proxy_template_pipeline_queries_total"
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.HasPrefix(line, name+" ") {
+			continue
+		}
+		v, convErr := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, name+" ")), 64)
+		if convErr != nil {
+			t.Fatalf("unparseable %s line %q: %v", name, line, convErr)
+		}
+		return v
+	}
+	t.Fatalf("%s not exposed on /metrics", name)
+	return 0
+}
+
 // TestTemplate_ConstantFormatStaysPushedDown guards the pushdown boundary: a
 // format stage with no `{{` action is expressible in LogsQL, so it must keep
 // going to VictoriaLogs rather than dragging the query onto the proxy-side path.
+//
+// Output alone cannot prove that — a proxy-side evaluation of `line_format ""`
+// blanks the lines too. The assertion is therefore on the ROUTING counter: it
+// must not move for the constant form and must move for a real template.
 func TestTemplate_ConstantFormatStaysPushedDown(t *testing.T) {
 	ensureTemplateDataIngested(t)
 
-	q := fmt.Sprintf(`{namespace=%q, container="db-migrator-services"} | json | line_format ""`, tplStreamNS)
+	sel := fmt.Sprintf(`{namespace=%q, container="db-migrator-services"}`, tplStreamNS)
+
+	before := tplTemplatePipelineCounter(t)
+	q := sel + ` | json | line_format ""`
 	proxyLines := tplLogLines(t, tplQuery(t, proxyURL, "logs", q))
 	lokiLines := tplLogLines(t, tplQuery(t, lokiURL, "logs", q))
+	afterConstant := tplTemplatePipelineCounter(t)
+
 	if len(proxyLines) != len(lokiLines) {
 		t.Errorf("line count proxy=%d loki=%d", len(proxyLines), len(lokiLines))
+	}
+	if len(proxyLines) == 0 {
+		t.Fatal("fixture returned no lines — the routing assertion below would be vacuous")
 	}
 	for _, line := range proxyLines {
 		if line != "" {
 			t.Fatalf("`line_format \"\"` must blank every line, got %q", line)
 		}
+	}
+	if afterConstant != before {
+		t.Errorf("a constant `line_format \"\"` took the proxy-side pipeline (counter %v → %v); it is expressible as a LogsQL format pipe and must be pushed down",
+			before, afterConstant)
+	}
+
+	// Control: the same selector with a REAL template must move the counter, so
+	// a counter that never moves cannot make the assertion above pass by default.
+	tplLogLines(t, tplQuery(t, proxyURL, "logs", sel+" | json | line_format `{{.message}}`"))
+	if afterTemplate := tplTemplatePipelineCounter(t); afterTemplate <= afterConstant {
+		t.Errorf("a `{{.message}}` template did NOT take the proxy-side pipeline (counter %v → %v)", afterConstant, afterTemplate)
+	}
+
+	// A bare rename is a field copy, also expressible in LogsQL.
+	beforeRename := tplTemplatePipelineCounter(t)
+	tplLogLines(t, tplQuery(t, proxyURL, "logs", sel+` | json | label_format alias=level`))
+	if afterRename := tplTemplatePipelineCounter(t); afterRename != beforeRename {
+		t.Errorf("a bare `label_format alias=level` took the proxy-side pipeline (counter %v → %v)", beforeRename, afterRename)
 	}
 }
 
@@ -607,12 +673,31 @@ func tplSet(lines []string) map[string]bool {
 	return out
 }
 
-// tplAssertClose compares two totals within a relative tolerance. The window
-// bounds now match Loki exactly (see TestWindowBounds_HalfOpenMatchesLoki), but
-// these fixtures are ingested twice — once per backend — so the first and last
-// evaluation points still depend on each backend's own view of the range edge.
-// The per-step equality assertion lives in the boundary test; here the totals
-// only need to agree.
+// tplAssertSeriesClose compares the two label sets AND each series' total. A
+// sum-only check passes when values are shuffled between series, which is
+// exactly the failure mode these tests exist to catch.
+//
+// The per-series totals carry a small tolerance rather than demanding equality:
+// the window bounds now match Loki exactly (TestWindowBounds_HalfOpenMatchesLoki
+// asserts that per step), but the two backends see this fixture through their
+// own ingest, so the first and last evaluation points can differ by one entry.
+func tplAssertSeriesClose(t *testing.T, what string, proxy, loki map[string]float64, tolerance float64) {
+	t.Helper()
+	for key, want := range loki {
+		got, ok := proxy[key]
+		if !ok {
+			t.Errorf("%s: proxy is missing series %s (Loki Σ=%v)", what, key, want)
+			continue
+		}
+		tplAssertClose(t, what+" "+key, got, want, tolerance)
+	}
+	for key := range proxy {
+		if _, ok := loki[key]; !ok {
+			t.Errorf("%s: proxy returned an extra series %s that Loki does not", what, key)
+		}
+	}
+}
+
 func tplAssertClose(t *testing.T, what string, got, want, tolerance float64) {
 	t.Helper()
 	if want == 0 {
@@ -643,8 +728,12 @@ const tplBoundaryEntries = 30 // 20 s apart → 10 minutes
 func ensureBoundaryDataIngested(t *testing.T) {
 	t.Helper()
 	tplBoundaryOnce.Do(func() {
-		waitForReady(t, proxyURL+"/ready", 30*time.Second)
-		waitForReady(t, lokiURL+"/ready", 30*time.Second)
+		// 90 s, not 30: on a cold stack Loki needs longer, and a readiness
+		// t.Fatal inside sync.Once poisons every later test in this file (the
+		// Once is spent, so the fixture is never ingested and each of them then
+		// compares two empty results).
+		waitForReady(t, proxyURL+"/ready", 90*time.Second)
+		waitForReady(t, lokiURL+"/ready", 90*time.Second)
 
 		tplBoundaryNS = "e2e-bound-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 		// Anchor on a whole minute so the query's step grid and the entry
@@ -787,5 +876,80 @@ func TestBinaryMetric_NoNameLabel(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestTemplate_CategorizedLabels checks the categorize-labels contract on the
+// proxy-side pipeline: the flag is honoured (the response declares the encoding
+// and the tuples are 3-element), the stream map carries only the original stream
+// labels, and what the pipeline produced comes back as `parsed`.
+func TestTemplate_CategorizedLabels(t *testing.T) {
+	ensureTemplateDataIngested(t)
+
+	q := fmt.Sprintf("{namespace=%q, container=\"db-migrator-services\"} | json | line_format `{{.message}}`", tplStreamNS)
+	params := url.Values{}
+	params.Set("query", q)
+	params.Set("start", strconv.FormatInt(tplStart.UnixNano(), 10))
+	params.Set("end", strconv.FormatInt(tplEnd.UnixNano(), 10))
+	params.Set("limit", "5000")
+
+	req, err := http.NewRequest(http.MethodGet, proxyURL+"/loki/api/v1/query_range?"+params.Encode(), nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("X-Loki-Response-Encoding-Flags", "categorize-labels")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, tplTruncate(string(raw)))
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("bad JSON: %v (%s)", err, tplTruncate(string(raw)))
+	}
+	data, _ := payload["data"].(map[string]interface{})
+	flags, _ := data["encodingFlags"].([]interface{})
+	if len(flags) == 0 {
+		t.Fatalf("response does not declare the categorize-labels encoding: %s", tplTruncate(string(raw)))
+	}
+
+	results := tplResults(t, payload)
+	if len(results) == 0 {
+		t.Fatal("no streams returned")
+	}
+	sawTuple := false
+	for _, item := range results {
+		stream, _ := item.(map[string]interface{})
+		labels, _ := stream["stream"].(map[string]interface{})
+		// `message` is produced by `| json`; under categorize-labels it must NOT
+		// be folded into the stream label map.
+		if _, leaked := labels["message"]; leaked {
+			t.Errorf("a parser-produced field leaked into the stream labels: %v", labels)
+		}
+		if _, ok := labels["namespace"]; !ok {
+			t.Errorf("stream labels lost the original selector label: %v", labels)
+		}
+		values, _ := stream["values"].([]interface{})
+		for _, pair := range values {
+			p, _ := pair.([]interface{})
+			if len(p) < 3 {
+				t.Fatalf("categorize-labels requires 3-element tuples, got %d: %v", len(p), p)
+			}
+			sawTuple = true
+			meta, _ := p[2].(map[string]interface{})
+			if parsed, ok := meta["parsed"].(map[string]interface{}); ok {
+				if _, ok := parsed["message"]; !ok {
+					t.Errorf("`parsed` should carry the json-extracted field, got %v", parsed)
+				}
+			}
+		}
+	}
+	if !sawTuple {
+		t.Fatal("no entries inspected")
 	}
 }

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`loki_vl_proxy_template_pipeline_queries_total`** counts queries routed to
+  the proxy-side LogQL pipeline instead of being pushed down to VictoriaLogs.
+  That route reads raw rows, so its rate is what an operator needs — and it is
+  the only externally visible proof of which side of the pushdown boundary a
+  query landed on.
 - **LogQL Go templates in `| line_format` and `| label_format` are evaluated.**
   Both quoting forms (`"…"` and `` `…` ``) now reach a Loki-compatible
   `text/template` engine (`internal/logql/template.go`) with Loki's function map:
@@ -27,6 +32,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The proxy-side pipeline's compile caches were plain maps written from every
+  request goroutine.** `extractorCache`, `lineFilterCache`, `anchoredCache` and
+  `labelFilterCache` were read and written concurrently, so a burst of distinct
+  queries could hit `fatal error: concurrent map writes` — which kills the
+  PROCESS, taking every other in-flight query with it. They share one
+  `compileCache` guarded by an `RWMutex`, with the 1024-entry bound now checked
+  under the write lock. Covered by a `-race` test that hammers
+  `NewPipeline`/`Process` from 32 goroutines.
+- **The `bytes` template function converted the wrong way.** Loki's `bytes`
+  PARSES a humanised size into a byte count (`"2kB"` → 2000, `"1KiB"` → 1024,
+  `"2048"` → 2048); the proxy rendered a number as a humanised string instead,
+  silently corrupting every `{{ .size | bytes }}`.
+- **A `__lvp_tpl:` marker reached VictoriaLogs on the vector-matching path.**
+  `proxyBinaryMetricVM` only recognised scalars, so a binary expression with
+  `on()`/`ignoring()` POSTed the marker text as a LogsQL query. Both binary entry
+  points now resolve their sides through one `fetchBinOpSides` helper.
+- **A partially parsed `label_format` list silently dropped assignments.**
+  `a="{{.x}}" b=c` (no comma) returned only the prefix; the stage is now rejected
+  as unsupported, as the parser's default branch already did.
+- **An unimplemented template function reported 502.** `statusFromUpstreamErr`
+  now maps `UnknownFuncError` and `errTemplateMetricUnsupported` to 400 — the
+  client's query is unsupported, the backend is healthy.
 - **The manual range-metric window counted boundary samples twice.**
   `aggregateManualWindow` closed its window on both ends where LogQL's range
   vector at time `t` selects `(t-range, t]`, so an entry landing exactly on a

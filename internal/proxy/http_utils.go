@@ -247,6 +247,14 @@ func statusFromUpstreamErr(err error) int {
 	if err == nil {
 		return http.StatusBadGateway
 	}
+	// A query the proxy-side pipeline cannot evaluate — an unimplemented
+	// template function, or a metric shape the template path declines — is the
+	// CLIENT's query being unsupported, not a backend fault. Reporting 502
+	// sends an operator to look at a healthy VictoriaLogs.
+	var unknownFunc *logql.UnknownFuncError
+	if errors.As(err, &unknownFunc) || errors.Is(err, errTemplateMetricUnsupported) {
+		return http.StatusBadRequest
+	}
 	if errors.Is(err, mw.ErrGuardRejected) {
 		return http.StatusServiceUnavailable
 	}
