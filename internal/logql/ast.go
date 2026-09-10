@@ -115,10 +115,22 @@ const (
 	ParserUnpack                    // unpack
 )
 
+// LabelExtraction is one `name="expression"` item of an explicit `| json` /
+// `| logfmt` field list (Loki: `| json status="response.code"`).
+type LabelExtraction struct {
+	Name string
+	Expr string
+}
+
 // ParserStage is a `| json` / `| logfmt` / `| regexp ...` stage.
 type ParserStage struct {
 	Type  ParserType
 	Param string
+	// Params holds the explicit field list, if any. String() deliberately omits
+	// it: the string translator has always seen the bare stage and VictoriaLogs
+	// extracts every field either way. The proxy-side pipeline evaluator uses it
+	// to reproduce Loki's "extract only these" semantics.
+	Params []LabelExtraction
 }
 
 func (s *ParserStage) String() string {
@@ -235,9 +247,22 @@ func (s *LineFormatStage) String() string {
 
 func (s *LineFormatStage) stage() {}
 
-// LabelFormatStage is a `| label_format ...` stage (raw expression).
+// LabelFormatAssign is one `dst=<template>` or `dst=src` item of a
+// `| label_format` stage. Tmpl is set for a quoted template, Src for a bare
+// label rename (`| label_format new=old`).
+type LabelFormatAssign struct {
+	Dst  string
+	Tmpl string
+	Src  string
+}
+
+// LabelFormatStage is a `| label_format ...` stage.
 type LabelFormatStage struct {
 	Raw string
+	// Assignments is the structured form of Raw. Raw is kept because the string
+	// translator still consumes it; Assignments survives quoting that Raw's
+	// token re-serialisation cannot represent faithfully.
+	Assignments []LabelFormatAssign
 }
 
 func (s *LabelFormatStage) String() string {

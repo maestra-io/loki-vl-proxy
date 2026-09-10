@@ -554,8 +554,11 @@ type drilldownFVEntry struct {
 var vlStatsNameKeyRE = regexp.MustCompile(`"__name__":"[^"]*",?`)
 
 // stripVLStatsNameKey removes VL's __name__ column marker from a stats_query_range
-// body. Called in the hybrid path where label translation is skipped — we need to
-// clean __name__ without invoking ensureDetectedLevel which would rename level→detected_level.
+// body. Called wherever a VL stats body reaches the client WITHOUT going through
+// translateStatsResponseLabels (which drops the key itself): the hybrid drilldown
+// path, and every side of a binary expression. Loki never emits __name__, so
+// leaving it in renames the series for Grafana — `sum(...) or vector(0)` came
+// back as {__name__="count(*)"} where Loki returns {}.
 func stripVLStatsNameKey(body []byte) []byte {
 	if !bytes.Contains(body, []byte(`"__name__"`)) {
 		return body
@@ -3385,69 +3388,10 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 		return params
 	}
 
-	leftIsScalar := translator.IsScalar(leftQL)
-	rightIsScalar := translator.IsScalar(rightQL)
-
-	var leftBody, rightBody []byte
-	var leftErr, rightErr error
-
-	// Run both non-scalar VL fetches concurrently.
-	if !leftIsScalar && !rightIsScalar {
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(leftQL))
-			if e != nil {
-				leftErr = e
-				return
-			}
-			defer resp.Body.Close()
-			leftBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-		}()
-		go func() {
-			defer wg.Done()
-			resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(rightQL))
-			if e != nil {
-				rightErr = e
-				return
-			}
-			defer resp.Body.Close()
-			rightBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-		}()
-		wg.Wait()
-		if leftErr != nil {
-			p.writeError(w, statusFromUpstreamErr(leftErr), "left query: "+leftErr.Error())
-			return
-		}
-		if rightErr != nil {
-			p.writeError(w, statusFromUpstreamErr(rightErr), "right query: "+rightErr.Error())
-			return
-		}
-	} else {
-		if leftIsScalar {
-			leftBody = []byte(`{"status":"success","data":{"resultType":"scalar","result":[0,"` + leftQL + `"]}}`)
-		} else {
-			resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(leftQL))
-			if e != nil {
-				p.writeError(w, statusFromUpstreamErr(e), "left query: "+e.Error())
-				return
-			}
-			defer resp.Body.Close()
-			leftBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-		}
-
-		if rightIsScalar {
-			rightBody = []byte(`{"status":"success","data":{"resultType":"scalar","result":[0,"` + rightQL + `"]}}`)
-		} else {
-			resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(rightQL))
-			if e != nil {
-				p.writeError(w, statusFromUpstreamErr(e), "right query: "+e.Error())
-				return
-			}
-			defer resp.Body.Close()
-			rightBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-		}
+	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams)
+	if sideErr != nil {
+		p.writeError(w, statusFromUpstreamErr(sideErr), sideErr.Error())
+		return
 	}
 
 	// Apply vector matching: on(), ignoring(), group_left(), group_right()
@@ -3517,78 +3461,9 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 	}
 
 	// Check if either side is a scalar or a nested binary marker.
-	leftIsScalar := translator.IsScalar(leftQL)
-	rightIsScalar := translator.IsScalar(rightQL)
-	leftIsMarker := strings.HasPrefix(leftQL, translator.BinaryMetricPrefix)
-	rightIsMarker := strings.HasPrefix(rightQL, translator.BinaryMetricPrefix)
-
-	var leftBody, rightBody []byte
-	var leftErr, rightErr error
-
-	// When either side is a nested binary marker, resolve it recursively.
-	// Otherwise fall through to the plain VL fetch paths.
-	if leftIsMarker || rightIsMarker {
-		leftBody, leftIsScalar, leftErr = p.resolveBinOpBody(r, leftQL, vlEndpoint, resultType, buildParams)
-		if leftErr == nil {
-			rightBody, rightIsScalar, rightErr = p.resolveBinOpBody(r, rightQL, vlEndpoint, resultType, buildParams)
-		}
-	} else if !leftIsScalar && !rightIsScalar {
-		// Run both non-scalar VL fetches concurrently.
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(leftQL))
-			if e != nil {
-				leftErr = e
-				return
-			}
-			defer resp.Body.Close()
-			leftBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-		}()
-		go func() {
-			defer wg.Done()
-			resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(rightQL))
-			if e != nil {
-				rightErr = e
-				return
-			}
-			defer resp.Body.Close()
-			rightBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-		}()
-		wg.Wait()
-	} else {
-		if leftIsScalar {
-			leftBody = []byte(`{"status":"success","data":{"resultType":"scalar","result":[0,"` + leftQL + `"]}}`)
-		} else {
-			resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(leftQL))
-			if e != nil {
-				p.writeError(w, statusFromUpstreamErr(e), "left query: "+e.Error())
-				return
-			}
-			defer resp.Body.Close()
-			leftBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-		}
-
-		if rightIsScalar {
-			rightBody = []byte(`{"status":"success","data":{"resultType":"scalar","result":[0,"` + rightQL + `"]}}`)
-		} else {
-			resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(rightQL))
-			if e != nil {
-				p.writeError(w, statusFromUpstreamErr(e), "right query: "+e.Error())
-				return
-			}
-			defer resp.Body.Close()
-			rightBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-		}
-	}
-
-	if leftErr != nil {
-		p.writeError(w, statusFromUpstreamErr(leftErr), "left query: "+leftErr.Error())
-		return
-	}
-	if rightErr != nil {
-		p.writeError(w, statusFromUpstreamErr(rightErr), "right query: "+rightErr.Error())
+	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams)
+	if sideErr != nil {
+		p.writeError(w, statusFromUpstreamErr(sideErr), sideErr.Error())
 		return
 	}
 
@@ -3602,6 +3477,92 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 	w.Write(result)
 }
 
+// fetchBinOpSides resolves both sides of a binary metric expression, whatever
+// shape they are: a scalar literal, a marker the proxy must evaluate itself
+// (nested binary expression or a template pipeline), or a plain LogsQL query
+// fetched from VictoriaLogs. Errors carry the failing side's name.
+//
+// Both binary entry points use this: the shapes are identical, and when the
+// marker branch existed in only one of them a `__lvp_tpl:` marker was POSTed to
+// VictoriaLogs as if it were a query.
+func (p *Proxy) fetchBinOpSides(
+	r *http.Request, leftQL, rightQL, vlEndpoint, resultType string, buildParams func(string) url.Values,
+) (leftBody, rightBody []byte, leftIsScalar, rightIsScalar bool, err error) {
+	leftIsScalar = translator.IsScalar(leftQL)
+	rightIsScalar = translator.IsScalar(rightQL)
+
+	if isBinOpMarker(leftQL) || isBinOpMarker(rightQL) {
+		leftBody, leftIsScalar, err = p.resolveBinOpBody(r, leftQL, vlEndpoint, resultType, buildParams)
+		if err != nil {
+			return nil, nil, false, false, fmt.Errorf("left query: %w", err)
+		}
+		rightBody, rightIsScalar, err = p.resolveBinOpBody(r, rightQL, vlEndpoint, resultType, buildParams)
+		if err != nil {
+			return nil, nil, false, false, fmt.Errorf("right query: %w", err)
+		}
+		return leftBody, rightBody, leftIsScalar, rightIsScalar, nil
+	}
+
+	if !leftIsScalar && !rightIsScalar {
+		// Two backend fetches: run them concurrently.
+		var wg sync.WaitGroup
+		var leftErr, rightErr error
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			leftBody, leftErr = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams)
+		}()
+		go func() {
+			defer wg.Done()
+			rightBody, rightErr = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams)
+		}()
+		wg.Wait()
+		if leftErr != nil {
+			return nil, nil, false, false, fmt.Errorf("left query: %w", leftErr)
+		}
+		if rightErr != nil {
+			return nil, nil, false, false, fmt.Errorf("right query: %w", rightErr)
+		}
+		return leftBody, rightBody, false, false, nil
+	}
+
+	if leftIsScalar {
+		leftBody = scalarBinOpBody(leftQL)
+	} else if leftBody, err = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams); err != nil {
+		return nil, nil, false, false, fmt.Errorf("left query: %w", err)
+	}
+	if rightIsScalar {
+		rightBody = scalarBinOpBody(rightQL)
+	} else if rightBody, err = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams); err != nil {
+		return nil, nil, false, false, fmt.Errorf("right query: %w", err)
+	}
+	return leftBody, rightBody, leftIsScalar, rightIsScalar, nil
+}
+
+// fetchBinOpSide POSTs one side to VictoriaLogs. VL's internal __name__ column
+// marker is stripped here: this route never reaches the label translator, which
+// is where the key is normally dropped.
+func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildParams func(string) url.Values) ([]byte, error) {
+	resp, err := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(query))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+	return stripVLStatsNameKey(raw), nil
+}
+
+func scalarBinOpBody(query string) []byte {
+	return []byte(`{"status":"success","data":{"resultType":"scalar","result":[0,"` + query + `"]}}`)
+}
+
+// isBinOpMarker reports whether a side is a marker the proxy must resolve
+// itself rather than POST to VictoriaLogs: a nested binary expression, or a
+// pipeline carrying a Go template (see template_pipeline.go).
+func isBinOpMarker(q string) bool {
+	return strings.HasPrefix(q, translator.BinaryMetricPrefix) || strings.HasPrefix(q, templateBinOpPrefix)
+}
+
 // resolveBinOpBody returns the result body for one side of a binary expression.
 // Handles scalar strings, nested binary markers, and plain VL queries.
 func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType string, buildParams func(string) url.Values) (body []byte, isScalar bool, err error) {
@@ -3612,13 +3573,17 @@ func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType 
 		body, err = p.evalBinaryMarker(r, query, vlEndpoint, resultType, buildParams)
 		return body, false, err
 	}
+	if strings.HasPrefix(query, templateBinOpPrefix) {
+		body, err = p.templateBinOpBody(r, query, vlEndpoint)
+		return body, false, err
+	}
 	resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(query))
 	if e != nil {
 		return nil, false, e
 	}
 	defer resp.Body.Close()
 	body, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-	return body, false, nil
+	return stripVLStatsNameKey(body), false, nil
 }
 
 // evalBinaryMarker recursively evaluates a __binary__: expression marker.

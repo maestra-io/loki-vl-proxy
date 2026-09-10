@@ -37,6 +37,7 @@ operational caveats that still matter in the current codebase.
 | Patterns surface | `/loki/api/v1/patterns` is optional (`-patterns-enabled`) and responses are clamped to `1000` patterns per request. |
 | `count_values()` aggregation | Rejected with 400, matching Loki. `count_values` is a PromQL operator that LogQL does not have — real Loki answers `parse error … unexpected IDENTIFIER` — so the proxy must not serve it: returning data where the reference errors is a silent divergence. To count entries grouped by a log field, use `sum by (<field>) (count_over_time(...))`. |
 | Log stream ordering above split interval | For queries spanning more than one windowing interval, log entries within each stream are sorted ascending by timestamp; however Grafana may display them in the requested `direction` based on the overall response. This is stable as of v1.21.1. |
+| Pipelines with a Go template or an `__error__` filter | VictoriaLogs cannot evaluate a `line_format` / `label_format` template, and has no parse-failure flag for `__error__`, so such a pipeline is evaluated per entry in the proxy: the backend is asked for the stream selector plus the leading line filters only, and rows a later stage would drop still cross the wire. The raw-row scan is capped by `-manual-range-metric-row-limit` (default 10 000), not by the query's `limit`; exceeding it is a 400. Constant formats (`\| line_format ""`) and bare renames (`\| label_format new=old`) stay pushed down. See `docs/configuration.md` → "LogQL Templates and `__error__` Filtering". |
 | OTel attribute translation in upstream queries | By default (`-translate-otel-attributes=true`), the LogQL→LogsQL translator rewrites known OTel semantic convention labels from underscore to dotted form (e.g., `k8s_container_name` → `k8s.container.name`). Deployments that store these fields with underscores (Vector, Promtail, Fluent-bit via Elasticsearch bulk ingest) should set `-translate-otel-attributes=false`. |
 
 ## Translation and Performance Caveats
@@ -51,7 +52,8 @@ This especially matters for:
 - parser and filter compatibility stages
 - some response shaping and label/field alias resolution
 - parts of binary and subquery compatibility behavior
-- formatting helpers such as `line_format` / `label_format`
+- Go templates in `line_format` / `label_format`, and filters on `__error__` —
+  both evaluated per entry in the proxy over rows fetched from VictoriaLogs
 - unwrap helper compatibility such as duration and byte parsing
 
 Treat those paths as supported compatibility work, not as zero-cost backend

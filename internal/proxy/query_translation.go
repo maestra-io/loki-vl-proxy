@@ -393,6 +393,12 @@ func (p *Proxy) translateBinOpSide(ctx context.Context, expr logqlpkg.Expr) (str
 	if lit, ok := expr.(*logqlpkg.LiteralExpr); ok {
 		return lit.String(), nil
 	}
+	// A side whose pipeline carries a Go template must be evaluated by the proxy
+	// (template_pipeline.go); hand the binary machinery a marker carrying the
+	// original LogQL instead of LogsQL VictoriaLogs would mis-evaluate.
+	if marker, ok := p.templateBinOpMarker(expr); ok {
+		return marker, nil
+	}
 	return p.translateQueryWithContext(ctx, expr.String())
 }
 
@@ -2130,7 +2136,8 @@ func (p *Proxy) proxyBareParserMetricQueryRange(w http.ResponseWriter, r *http.R
 				endT := time.Unix(0, endNanos)
 				stepD := time.Duration(stepNanos)
 				// statsSeries already capped to top-N in fetchBareParserCountBytesViaStats; pass 0 to avoid double-capping.
-				result := buildManualRangeMetricMatrix(statsAggFn, 0, statsSeries, startT, endT, stepD, spec.rangeWindow, 0)
+				// stats_query_range samples: timestamp = bucket start.
+				result := buildManualRangeMetricMatrix(statsAggFn, 0, statsSeries, startT, endT, stepD, spec.rangeWindow, 0, true)
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write(result) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter
 				elapsed := time.Since(start)
@@ -2199,7 +2206,8 @@ func (p *Proxy) tryUnwrapViaStatsFastPath(w http.ResponseWriter, r *http.Request
 	endT := time.Unix(0, endNanos)
 	stepD := time.Duration(stepNanos)
 	// Unwrap stats path is not capped upstream; bound it here at the matrix boundary.
-	result := buildManualRangeMetricMatrix(aggFunc, 0, uwSeries, startT, endT, stepD, spec.rangeWindow, p.resolvedMaxStatsQuerySeries())
+	// stats_query_range samples: timestamp = bucket start.
+	result := buildManualRangeMetricMatrix(aggFunc, 0, uwSeries, startT, endT, stepD, spec.rangeWindow, p.resolvedMaxStatsQuerySeries(), true)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(result) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter
 	elapsed := time.Since(start)

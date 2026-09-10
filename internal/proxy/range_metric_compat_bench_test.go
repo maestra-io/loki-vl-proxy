@@ -12,7 +12,7 @@ func BenchmarkAggregateManualWindowCount(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		aggregateManualWindow("count_over_time", 0, samples, 0, 990, 99.0)
+		aggregateManualWindow("count_over_time", 0, samples, 0, 990, 99.0, false)
 	}
 }
 
@@ -24,7 +24,7 @@ func BenchmarkAggregateManualWindowAvg(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		aggregateManualWindow("avg", 0, samples, 0, 990, 99.0)
+		aggregateManualWindow("avg", 0, samples, 0, 990, 99.0, false)
 	}
 }
 
@@ -36,6 +36,6 @@ func BenchmarkAggregateManualWindowQuantile(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		aggregateManualWindow("quantile", 0.5, samples, 0, 990, 99.0)
+		aggregateManualWindow("quantile", 0.5, samples, 0, 990, 99.0, false)
 	}
 }

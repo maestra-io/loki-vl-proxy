@@ -92,6 +92,13 @@ type Metrics struct {
 	// Tuple emission mode stats
 	tupleModes map[string]*atomic.Int64 // "mode" -> count
 
+	// templatePipelineQueries counts queries routed to the proxy-side LogQL
+	// pipeline (a Go template or an __error__ filter). That route reads raw rows
+	// instead of letting VictoriaLogs aggregate, so its rate is the signal an
+	// operator needs — and the only externally visible proof of which side of
+	// the pushdown boundary a query landed on.
+	templatePipelineQueries atomic.Int64
+
 	// Query-range windowing stats
 	windowCacheHits               atomic.Int64
 	windowCacheMisses             atomic.Int64
@@ -1232,6 +1239,15 @@ func (m *Metrics) RecordPatternsSnapshotMiss() {
 	m.patternsSnapshotMissesTotal.Add(1)
 }
 
+// RecordTemplatePipelineQuery counts one query served by the proxy-side LogQL
+// pipeline instead of being pushed down to VictoriaLogs.
+func (m *Metrics) RecordTemplatePipelineQuery() {
+	if m == nil {
+		return
+	}
+	m.templatePipelineQueries.Add(1)
+}
+
 // RecordTupleMode records the emitted tuple mode for a log query response.
 func (m *Metrics) RecordTupleMode(mode string) {
 	mode = strings.TrimSpace(mode)
@@ -1747,6 +1763,10 @@ func (m *Metrics) Handler(w http.ResponseWriter, r *http.Request) {
 	sb.WriteString("# HELP loki_vl_proxy_patterns_low_coverage_responses_total Pattern responses flagged as low coverage and likely degraded.\n")
 	sb.WriteString("# TYPE loki_vl_proxy_patterns_low_coverage_responses_total counter\n")
 	fmt.Fprintf(&sb, "loki_vl_proxy_patterns_low_coverage_responses_total %d\n", m.patternsLowCoverageResponsesTotal.Load())
+
+	sb.WriteString("# HELP loki_vl_proxy_template_pipeline_queries_total Queries evaluated by the proxy-side LogQL pipeline (Go template or __error__ filter) instead of being pushed down to VictoriaLogs.\n")
+	sb.WriteString("# TYPE loki_vl_proxy_template_pipeline_queries_total counter\n")
+	fmt.Fprintf(&sb, "loki_vl_proxy_template_pipeline_queries_total %d\n", m.templatePipelineQueries.Load())
 
 	sb.WriteString("# HELP loki_vl_proxy_response_tuple_mode_total Log response tuple mode emissions by client behavior.\n")
 	sb.WriteString("# TYPE loki_vl_proxy_response_tuple_mode_total counter\n")

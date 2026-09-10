@@ -167,6 +167,73 @@ the `missing _msg field; see …` placeholder — fall back to the default JSON 
 the remaining non-stream fields, so those entries stay readable. Only `""` (default) and
 `_msg` are accepted.
 
+### LogQL Templates and `__error__` Filtering
+
+Two families of pipeline stage have no VictoriaLogs equivalent, so the proxy
+evaluates them itself, entry by entry:
+
+- **Go templates** in `| line_format "…"` / `| label_format lbl="…"` (both the
+  double-quoted and the backtick-quoted literal). VictoriaLogs' `| format` pipe
+  substitutes field placeholders; it cannot run a conditional, a function pipe
+  or `__line__`.
+- **Filters on `__error__` / `__error_details__`.** Those labels exist only in
+  Loki's model: a parser records its own failure on the entry, so
+  `| json | __error__=""` EXCLUDES the lines that failed to parse.
+  VictoriaLogs' `unpack_json` just adds no fields, so a pushed-down query would
+  count them. `| drop __error__` is not a filter — it removes the label and
+  keeps every line, in Loki and here alike — and stays pushed down.
+
+When a query's pipeline contains either, VictoriaLogs is asked for the stream
+selector plus the leading line filters only, and the whole pipeline —
+`json` / `logfmt` / `regexp` / `pattern` / `unpack`, line and label filters,
+`drop` / `keep`, `decolorize`, and the format stages — runs in the proxy. This
+covers log queries, metric queries (the formatted label is available to the
+aggregation's `by (…)`), and each side of a binary expression such as
+`sum(count_over_time(… | line_format … [6h])) or vector(0)`.
+
+**Cost**: rows that a later stage would have dropped still cross the wire from
+VictoriaLogs, and the raw-row scan is capped by `-manual-range-metric-row-limit`
+(default 10 000) rather than by the query's own `limit`. Exceeding that cap is a
+400 naming the flag, not a silently short answer. Keep the stream selector and
+the leading line filters narrow — they are the part that still prunes at the
+backend.
+
+**Pushdown boundary**: a format stage carrying no `{{` action is a constant and
+a bare rename is a field copy, so both translate to LogsQL faithfully and are
+NOT pulled onto this path: `| line_format ""`, `| label_format env="prod"` and
+`| label_format new=old` keep going to VictoriaLogs. Anything with a `{{` —
+including a bare `{{.field}}` — is evaluated in the proxy. The counter
+`loki_vl_proxy_template_pipeline_queries_total` reports how many queries took
+that route.
+
+**Response shape**: under the `categorize-labels` encoding the stream map holds
+only the original stream labels, VictoriaLogs' other row fields are returned as
+`structuredMetadata`, and everything the pipeline itself produced (parser
+captures, `label_format` results) is returned as `parsed`. Without that encoding
+the labels are flattened into the stream map, as on the proxy's other log paths.
+
+Supported template functions mirror
+[Loki's list](https://grafana.com/docs/loki/latest/query/template_functions/):
+`lower`, `upper`, `title`, `trim`, `trimAll`, `trimPrefix`, `trimSuffix`,
+`trunc`, `substr`, `replace`, `repeat`, `indent`, `nindent`, `alignLeft`,
+`alignRight`, `default`, `contains`, `hasPrefix`, `hasSuffix`, `bytes`,
+`b64enc`, `b64dec`, `urlencode`, `urldecode`, `fromJson`, `toJson`,
+`regexReplaceAll`, `regexReplaceAllLiteral`, `count`, `now`, `date`, `toDate`,
+`toDateInZone`, `unixEpoch`, `unixEpochMillis`, `unixEpochNanos`, `unixToTime`,
+`duration`, `duration_seconds`, `int`, `float64`, `add`, `sub`, `mul`, `div`,
+`mod`, `addf`, `subf`, `mulf`, `divf`, `max`, `min`, `maxf`, `minf`, `ceil`,
+`floor`, `round`, the deprecated CamelCase aliases (`ToUpper`, `Replace`,
+`TrimPrefix`, …, which keep Go's `strings` argument order), the `__line__` and
+`__timestamp__` variables, and the `text/template` builtins (`if`/`else`,
+`range`, `with`, `and`/`or`/`not`, `eq`/`ne`/`lt`/`gt`, `printf`).
+
+A template naming a function the proxy does not implement is answered with
+**400 naming that function**. The proxy never emits template text as data — a
+wrong-looking number is harder to notice than an error. A template that is
+merely malformed (`{{.method` with no closing brace) is not a query error: Loki
+answers 200 there, so the stage becomes a no-op and the entry carries
+`__error__="TemplateFormatErr"`.
+
 ### Custom Drilldown Patterns
 
 Examples:

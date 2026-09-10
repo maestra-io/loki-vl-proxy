@@ -7,7 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`loki_vl_proxy_template_pipeline_queries_total`** counts queries routed to
+  the proxy-side LogQL pipeline instead of being pushed down to VictoriaLogs.
+  That route reads raw rows, so its rate is what an operator needs — and it is
+  the only externally visible proof of which side of the pushdown boundary a
+  query landed on.
+- **LogQL Go templates in `| line_format` and `| label_format` are evaluated.**
+  Both quoting forms (`"…"` and `` `…` ``) now reach a Loki-compatible
+  `text/template` engine (`internal/logql/template.go`) with Loki's function map:
+  `lower`/`upper`/`title`/`trim`/`trimAll`/`trimPrefix`/`trimSuffix`/`trunc`/
+  `substr`/`replace`/`repeat`/`indent`/`nindent`/`alignLeft`/`alignRight`/
+  `default`/`contains`/`hasPrefix`/`hasSuffix`/`bytes`, `b64enc`/`b64dec`/
+  `urlencode`/`urldecode`/`fromJson`/`toJson`, `regexReplaceAll`/
+  `regexReplaceAllLiteral`/`count`, `now`/`date`/`toDate`/`toDateInZone`/
+  `unixEpoch{,Millis,Nanos}`/`unixToTime`/`duration`/`duration_seconds`,
+  `int`/`float64`/`add`/`sub`/`mul`/`div`/`mod`/`addf`/`subf`/`mulf`/`divf`/
+  `max`/`min`/`maxf`/`minf`/`ceil`/`floor`/`round`, the deprecated CamelCase
+  aliases, `__line__`/`__timestamp__`, and the `if`/`else`/`range`/`with` and
+  `and`/`or`/`not`/`eq`/`ne`/`lt`/`gt`/`printf` builtins. A template naming a
+  function the proxy does not implement is a 400 naming that function — the
+  template text is never emitted as data.
+
 ### Fixed
+
+- **The proxy-side pipeline's compile caches were plain maps written from every
+  request goroutine.** `extractorCache`, `lineFilterCache`, `anchoredCache` and
+  `labelFilterCache` were read and written concurrently, so a burst of distinct
+  queries could hit `fatal error: concurrent map writes` — which kills the
+  PROCESS, taking every other in-flight query with it. They share one
+  `compileCache` guarded by an `RWMutex`, with the 1024-entry bound now checked
+  under the write lock. Covered by a `-race` test that hammers
+  `NewPipeline`/`Process` from 32 goroutines.
+- **The `bytes` template function converted the wrong way.** Loki's `bytes`
+  PARSES a humanised size into a byte count (`"2kB"` → 2000, `"1KiB"` → 1024,
+  `"2048"` → 2048); the proxy rendered a number as a humanised string instead,
+  silently corrupting every `{{ .size | bytes }}`.
+- **A `__lvp_tpl:` marker reached VictoriaLogs on the vector-matching path.**
+  `proxyBinaryMetricVM` only recognised scalars, so a binary expression with
+  `on()`/`ignoring()` POSTed the marker text as a LogsQL query. Both binary entry
+  points now resolve their sides through one `fetchBinOpSides` helper.
+- **A partially parsed `label_format` list silently dropped assignments.**
+  `a="{{.x}}" b=c` (no comma) returned only the prefix; the stage is now rejected
+  as unsupported, as the parser's default branch already did.
+- **An unimplemented template function reported 502.** `statusFromUpstreamErr`
+  now maps `UnknownFuncError` and `errTemplateMetricUnsupported` to 400 — the
+  client's query is unsupported, the backend is healthy.
+- **The manual range-metric window counted boundary samples twice.**
+  `aggregateManualWindow` closed its window on both ends where LogQL's range
+  vector at time `t` selects `(t-range, t]`, so an entry landing exactly on a
+  bucket edge was folded into two adjacent windows. On entries 20 s apart in 1 m
+  tumbling buckets the proxy returned 4 per step against Loki's 3 (Σ=40 vs 30,
+  10 of 11 steps wrong); every step now matches Loki exactly. The window is
+  half-open for RAW entries and stays closed on the left for PRE-BUCKETED
+  VictoriaLogs stats samples, whose timestamp is a bucket start standing for
+  `[ts, ts+step)` — the two callers now say which they pass. Affects every query
+  on the manual path (`rate`, `count_over_time`, the unwrap family), not only
+  the template path.
+- **`sum(...) or vector(0)` returned `{__name__="count(*)"}` where Loki returns
+  `{}`.** Every side of a binary metric expression is fetched straight from
+  VictoriaLogs and combined without passing through the label translator, so
+  VL's internal `__name__` column marker survived into the response and renamed
+  the series for Grafana. Each side is now run through `stripVLStatsNameKey`.
+- **A Go template in the pipeline was pushed to VictoriaLogs, which cannot
+  evaluate it.** The string translator rewrote only the bare `{{.field}}` shape
+  into a LogsQL `| format` placeholder; conditionals, function pipes, `__line__`
+  and backtick-quoted templates went through verbatim, so VictoriaLogs returned
+  the TEMPLATE TEXT as the log line or as the label value — and every later
+  stage then read that. Three production shapes were wrong:
+  `| line_format` followed by `| regexp` extracted nothing, so the trailing
+  label filter passed every line (908 rows where Loki returned 0);
+  `sum by (<label from label_format>) (rate(...))` collapsed three series into
+  one keyed by the template source and carried undivided counts (Σ=657 against
+  Loki's 10.95); and `| json | line_format ` + "`{{.message}}`" + ` printed its
+  own backticks. Such a pipeline is now evaluated per entry in the proxy
+  (`internal/logql/pipeline.go`, `internal/proxy/template_pipeline.go`) — for
+  log queries, for metric queries, and per side of a binary expression such as
+  `… or vector(0)` — with VictoriaLogs asked only for the stream selector plus
+  the leading line filters. `rate()` over that path divides by the range seconds
+  like every other manual range aggregation. A format stage with no `{{` action
+  (`| line_format ""`, `| label_format env="prod"`) and a bare rename
+  (`| label_format new=old`) stay pushed down.
+- **`| json | __error__=""` counted the lines Loki excludes.** The parse-failure
+  labels exist only in Loki's model — a parser records its failure on the entry
+  — while VictoriaLogs' `unpack_json` simply adds no fields, so a pushed-down
+  query counted the malformed lines. A pipeline that FILTERS on `__error__` /
+  `__error_details__` now takes the same proxy-side path: `__error__=""`
+  excludes parse failures, `__error__!=""` keeps only them, and
+  `| drop __error__` keeps everything (it removes the label, it does not
+  filter). Over 15 well-formed JSON lines and 6 malformed ones,
+  `sum by (level) (count_over_time(… | json | __error__="" [20m]))` now returns
+  5/3/7 with no empty group, as Loki does.
 
 - **Grouping by the derived level scanned a million raw rows and OOM-killed the
   backend.** `-derived-level-group-by` makes the translator inject
