@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   computes a field and never drops a line, so it no longer influences that
   decision: the query is now a native `stats by (level) count()` that reads no
   raw rows.
+
+  Which query "uses a parser stage" is read from the CLIENT's LogQL rather than
+  sniffed out of the translated LogsQL (`statsCompatSpec.UserParserStages`). The
+  first version of this fix stripped the injected pipes with a regex, which also
+  removed the user's own translated `| json` / `| logfmt` and could then route a
+  genuinely-parsed query onto a path with different parse-failure semantics. The
+  two are indistinguishable once the query is a string, so the question is
+  answered at the source instead.
 - **`sum by (level)` came back as `detected_level`.** Both labels translate to
   VL's `level` column, so the response cannot be disambiguated on its own — but
   the original query can. Loki answers `sum by (level)` with `level` and
@@ -50,6 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`-manual-range-metric-row-limit` is enforced with an overflow probe.** The
+  request asks for `limit+1` rows and reports truncation only when more than
+  `limit` came back — a response of exactly `limit` rows can be a complete
+  result that happens to land on the cap, and comparing `>=` turned every one of
+  those into a 400.
 - **`-manual-range-metric-row-limit` now defaults to 10 000, down from
   1 000 000, and hitting it is an error rather than a silent truncation.** The
   limit is executed by VictoriaLogs as a sort over that many raw rows, so the
