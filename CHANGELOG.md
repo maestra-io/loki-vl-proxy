@@ -7,7 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **LogQL Go templates in `| line_format` and `| label_format` are evaluated.**
+  Both quoting forms (`"…"` and `` `…` ``) now reach a Loki-compatible
+  `text/template` engine (`internal/logql/template.go`) with Loki's function map:
+  `lower`/`upper`/`title`/`trim`/`trimAll`/`trimPrefix`/`trimSuffix`/`trunc`/
+  `substr`/`replace`/`repeat`/`indent`/`nindent`/`alignLeft`/`alignRight`/
+  `default`/`contains`/`hasPrefix`/`hasSuffix`/`bytes`, `b64enc`/`b64dec`/
+  `urlencode`/`urldecode`/`fromJson`/`toJson`, `regexReplaceAll`/
+  `regexReplaceAllLiteral`/`count`, `now`/`date`/`toDate`/`toDateInZone`/
+  `unixEpoch{,Millis,Nanos}`/`unixToTime`/`duration`/`duration_seconds`,
+  `int`/`float64`/`add`/`sub`/`mul`/`div`/`mod`/`addf`/`subf`/`mulf`/`divf`/
+  `max`/`min`/`maxf`/`minf`/`ceil`/`floor`/`round`, the deprecated CamelCase
+  aliases, `__line__`/`__timestamp__`, and the `if`/`else`/`range`/`with` and
+  `and`/`or`/`not`/`eq`/`ne`/`lt`/`gt`/`printf` builtins. A template naming a
+  function the proxy does not implement is a 400 naming that function — the
+  template text is never emitted as data.
+
 ### Fixed
+
+- **A Go template in the pipeline was pushed to VictoriaLogs, which cannot
+  evaluate it.** The string translator rewrote only the bare `{{.field}}` shape
+  into a LogsQL `| format` placeholder; conditionals, function pipes, `__line__`
+  and backtick-quoted templates went through verbatim, so VictoriaLogs returned
+  the TEMPLATE TEXT as the log line or as the label value — and every later
+  stage then read that. Three production shapes were wrong:
+  `| line_format` followed by `| regexp` extracted nothing, so the trailing
+  label filter passed every line (908 rows where Loki returned 0);
+  `sum by (<label from label_format>) (rate(...))` collapsed three series into
+  one keyed by the template source and carried undivided counts (Σ=657 against
+  Loki's 10.95); and `| json | line_format ` + "`{{.message}}`" + ` printed its
+  own backticks. Such a pipeline is now evaluated per entry in the proxy
+  (`internal/logql/pipeline.go`, `internal/proxy/template_pipeline.go`) — for
+  log queries, for metric queries, and per side of a binary expression such as
+  `… or vector(0)` — with VictoriaLogs asked only for the stream selector plus
+  the leading line filters. `rate()` over that path divides by the range seconds
+  like every other manual range aggregation. A format stage with no `{{` action
+  (`| line_format ""`, `| label_format env="prod"`) and a bare rename
+  (`| label_format new=old`) stay pushed down.
+- **`| json | __error__=""` counted the lines Loki excludes.** The parse-failure
+  labels exist only in Loki's model — a parser records its failure on the entry
+  — while VictoriaLogs' `unpack_json` simply adds no fields, so a pushed-down
+  query counted the malformed lines. A pipeline that FILTERS on `__error__` /
+  `__error_details__` now takes the same proxy-side path: `__error__=""`
+  excludes parse failures, `__error__!=""` keeps only them, and
+  `| drop __error__` keeps everything (it removes the label, it does not
+  filter). Over 15 well-formed JSON lines and 6 malformed ones,
+  `sum by (level) (count_over_time(… | json | __error__="" [20m]))` now returns
+  5/3/7 with no empty group, as Loki does.
 
 - **Grouping by the derived level scanned a million raw rows and OOM-killed the
   backend.** `-derived-level-group-by` makes the translator inject

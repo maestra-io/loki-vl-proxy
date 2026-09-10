@@ -393,6 +393,12 @@ func (p *Proxy) translateBinOpSide(ctx context.Context, expr logqlpkg.Expr) (str
 	if lit, ok := expr.(*logqlpkg.LiteralExpr); ok {
 		return lit.String(), nil
 	}
+	// A side whose pipeline carries a Go template must be evaluated by the proxy
+	// (template_pipeline.go); hand the binary machinery a marker carrying the
+	// original LogQL instead of LogsQL VictoriaLogs would mis-evaluate.
+	if marker, ok := p.templateBinOpMarker(expr); ok {
+		return marker, nil
+	}
 	return p.translateQueryWithContext(ctx, expr.String())
 }
 

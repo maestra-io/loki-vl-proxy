@@ -33,7 +33,7 @@ env:
   # <upstream tag without the v>-maestra.<fork revision>. Bump the left half on
   # every rebase onto a new upstream tag, the right half on every fork-only
   # change. Quoted: an unquoted version scalar is a YAML float trap.
-  IMAGE_VERSION: "1.63.1-maestra.6"
+  IMAGE_VERSION: "1.63.1-maestra.7"
 
 jobs:
   build-and-push:

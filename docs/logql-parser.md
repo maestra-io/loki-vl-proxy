@@ -117,9 +117,10 @@ Expr (interface)
 │   └── Stage (interface)
 │       ├── *LineFilterStage         |= "text" / |~ "re" / |> "pattern"
 │       ├── *ParserStage             | json / | logfmt / | regexp / | pattern / | unpack
+│       │                            (+ Params: the explicit field list, | json a="b.c")
 │       ├── *LabelFilterStage        | level="error" (raw, opaque)
 │       ├── *LineFormatStage         | line_format "{{.msg}}"
-│       ├── *LabelFormatStage        | label_format dst=src (raw, opaque)
+│       ├── *LabelFormatStage        | label_format dst=src (raw + parsed Assignments)
 │       ├── *UnwrapStage             | unwrap bytes(label)
 │       ├── *DropStage               | drop a, b, c=~"re"
 │       ├── *KeepStage               | keep a, b
@@ -135,7 +136,9 @@ Expr (interface)
 
 Two node types capture content without parsing it:
 
-- **`LabelFilterStage`** / **`LabelFormatStage`** — the inner expression grammar for `| level > 1` or `| label_format dst=src` is complex and context-dependent. These stages capture the raw text after the keyword so the translator sees exactly what Loki would see.
+- **`LabelFilterStage`** — the inner expression grammar for `| level > 1` is complex and context-dependent, so the stage captures the raw text after the keyword and the translator sees exactly what Loki would see. `internal/logql/pipeline.go` parses that text when it has to evaluate the filter itself.
+
+- **`LabelFormatStage`** — keeps the same `Raw` text for the translator, but also carries `Assignments` (`dst` plus either a template or a source label). The raw form is a token re-serialisation and cannot always round-trip a quoted template; the structured form is what the proxy-side evaluator uses.
 
 - **`OpaqueMetricExpr`** — metric-level functions that aren't yet expressible in the AST (e.g. `label_replace`, `label_join`). The parser captures the full raw text including balanced parentheses and returns it verbatim so VictoriaLogs receives the original expression unchanged.
 

@@ -176,12 +176,24 @@ The proxy's minimum tracked capability profile is `vl-v1.30-plus`. All features 
 
 **Parser stage (`| json` / `| logfmt`) + range metric:** Even when `range == step`, if the translated VL query contains an `unpack_json` or `unpack_logfmt` stage, the fast stats path is disabled. VL's unpack pipes do not model Loki's `__error__` filtering (Loki excludes lines that fail to parse; VL may include them). These queries fall back to the manual log-fetch path.
 
+**Go template or `__error__` filter in the pipeline:** routed to a dedicated
+proxy-side path before every other decision. VictoriaLogs can neither evaluate a
+`line_format` / `label_format` template nor flag a parse failure, so the backend
+is asked for the stream selector plus the leading line filters only and the
+whole pipeline is evaluated per entry. This is the most expensive route in the
+table — it is chosen because the pushed-down alternative returns wrong numbers,
+not slow ones. A constant format (`| line_format ""`) or a bare rename
+(`| label_format new=old`) is exempt. See `docs/configuration.md`.
+
 ### Query Routing Decision
 
 The proxy chooses between native VL stats and the manual log-fetch path based on:
 
 ```
 LogQL metric query
+  │
+  ├─ pipeline has a {{…}} template or an __error__ filter?
+  │   └─ YES → proxy-side pipeline evaluation (template_pipeline.go)
   │
   ├─ has parser stage (| json, | logfmt, etc.)?
   │   ├─ NO  → native VL stats (translator emits | stats …)

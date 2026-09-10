@@ -88,6 +88,30 @@ type parser struct {
 	input string
 }
 
+// parserMark snapshots the scanner + lookahead so a speculative parse can be
+// rewound. The scanner is a pure (src, pos, braceDepth) cursor, so copying it
+// is a complete restore point.
+type parserMark struct {
+	sc  scanner
+	cur Token
+}
+
+func (p *parser) mark() parserMark { return parserMark{sc: *p.sc, cur: p.cur} }
+
+func (p *parser) reset(m parserMark) {
+	*p.sc = m.sc
+	p.cur = m.cur
+}
+
+// peekTyp reports the type of the token after p.cur without consuming it.
+func (p *parser) peekTyp() TokType {
+	m := p.mark()
+	p.advance()
+	typ := p.cur.Typ
+	p.reset(m)
+	return typ
+}
+
 func (p *parser) advance() Token {
 	prev := p.cur
 	p.cur = p.sc.next()
@@ -433,13 +457,11 @@ func (p *parser) parsePipeBody() (Stage, error) {
 	switch kw {
 	case "json":
 		p.advance()
-		p.consumeExplicitFieldList()
-		return &ParserStage{Type: ParserJSON}, nil
+		return &ParserStage{Type: ParserJSON, Params: p.consumeExplicitFieldList()}, nil
 
 	case "logfmt":
 		p.advance()
-		p.consumeExplicitFieldList()
-		return &ParserStage{Type: ParserLogfmt}, nil
+		return &ParserStage{Type: ParserLogfmt, Params: p.consumeExplicitFieldList()}, nil
 
 	case "regexp":
 		p.advance()
@@ -495,8 +517,9 @@ func (p *parser) parsePipeBody() (Stage, error) {
 
 	case "label_format":
 		p.advance()
+		assignments := p.parseLabelFormatAssignments()
 		raw := p.consumeRestOfStage()
-		return &LabelFormatStage{Raw: raw}, nil
+		return &LabelFormatStage{Raw: raw, Assignments: assignments}, nil
 	}
 
 	// Unknown keyword after `|`: consume the identifier and the rest of the
@@ -656,22 +679,62 @@ func (p *parser) parseDropKeepList() (labels []string, matchers []DropMatcher, e
 // consumeExplicitFieldList consumes an optional comma-separated field list
 // after | json or | logfmt. Each item is a bare name or name="alias" form.
 // e.g. `| json method, http_code="status"` — consumed and ignored; VL handles them.
-func (p *parser) consumeExplicitFieldList() {
+func (p *parser) consumeExplicitFieldList() []LabelExtraction {
+	var out []LabelExtraction
 	for p.cur.Typ == TokIdent {
-		p.advance() // field name
+		name := p.advance().Val // field name
+		item := LabelExtraction{Name: name}
 		// Optional ="alias" assignment
 		if p.cur.Typ == TokEq {
 			p.advance()
-			if p.cur.Typ == TokString || p.cur.Typ == TokIdent {
-				p.advance()
+			if p.cur.Typ == TokString || p.cur.Typ == TokIdent || p.cur.Typ == TokRawString {
+				item.Expr = p.advance().Val
 			}
 		}
+		out = append(out, item)
 		if p.cur.Typ == TokComma {
 			p.advance()
 		} else {
 			break
 		}
 	}
+	return out
+}
+
+// parseLabelFormatAssignments reads the `dst=<tmpl>, dst2=src` list of a
+// label_format stage from the token stream, before consumeRestOfStage
+// re-serialises the same tokens into Raw. It stops at the first token that is
+// not part of an assignment so Raw still captures whatever it could not read.
+func (p *parser) parseLabelFormatAssignments() []LabelFormatAssign {
+	var out []LabelFormatAssign
+	mark := p.mark()
+	for p.cur.Typ == TokIdent {
+		dst := p.cur.Val
+		if p.peekTyp() != TokEq {
+			break
+		}
+		p.advance() // dst
+		p.advance() // =
+		var a LabelFormatAssign
+		a.Dst = dst
+		switch p.cur.Typ {
+		case TokString, TokRawString:
+			a.Tmpl = p.advance().Val
+		case TokIdent:
+			a.Src = p.advance().Val
+		default:
+			p.reset(mark)
+			return nil
+		}
+		out = append(out, a)
+		if p.cur.Typ != TokComma {
+			break
+		}
+		p.advance()
+	}
+	// Rewind: Raw is built by consumeRestOfStage over the same tokens.
+	p.reset(mark)
+	return out
 }
 
 // consumeBalancedParens consumes tokens including nested parentheses until the

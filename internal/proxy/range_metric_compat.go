@@ -365,6 +365,14 @@ func (p *Proxy) rejectMultiStageSlidingRange(w http.ResponseWriter, r *http.Requ
 }
 
 func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
+	// A pipeline carrying a Go template (| line_format / | label_format) cannot
+	// be evaluated by VictoriaLogs at all — see template_pipeline.go. It must be
+	// caught before every branch below, because the translated LogsQL looks
+	// perfectly ordinary (the template became a `| format` pipe) and would
+	// otherwise be routed straight to the native stats endpoint.
+	if p.handleTemplateMetricRange(w, r, originalLogql, logsqlQuery) {
+		return true
+	}
 	// A genuine two-stage aggregation (inner range grouping + outer aggregation)
 	// is not expressible in this layer's single-fold model — see
 	// isMultiStageStatsQuery — so VictoriaLogs runs both stages natively.
@@ -510,6 +518,9 @@ func isMultiStageStatsQuery(logsqlQuery string) bool {
 }
 
 func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
+	if p.handleTemplateMetricInstant(w, r, originalLogql, logsqlQuery) {
+		return true
+	}
 	if isMultiStageStatsQuery(logsqlQuery) && rangeAggregationHasOwnGrouping(originalLogql) {
 		return false
 	}

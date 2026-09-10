@@ -1,0 +1,597 @@
+package proxy
+
+import (
+	"bufio"
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	logqlpkg "github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
+	fj "github.com/valyala/fastjson"
+)
+
+// LogQL's `| line_format` and `| label_format` carry arbitrary Go templates.
+// The string translator can only rewrite the trivial `{{.field}}` shape into a
+// LogsQL `| format` placeholder; conditionals, function pipes and `__line__`
+// pass through verbatim, so VictoriaLogs emits the template TEXT as the line or
+// as the label value. Every later stage then reads that garbage: a `| regexp`
+// after a `| line_format` matches nothing, and `sum by (<formatted label>)`
+// collapses every series into one.
+//
+// So a pipeline containing a template stage is evaluated HERE, entry by entry.
+// VictoriaLogs is asked only for the stream selector plus the leading line
+// filters — both index-backed and safe to push down — and internal/logql's
+// Pipeline reproduces the rest with Loki's semantics.
+//
+// Trade-off: rows that later stages would have dropped still cross the wire.
+// Pushing a template down as LogsQL `format`/`replace_regexp` pipes when it
+// happens to be expressible is a possible optimisation; correctness first.
+
+// templatePlan is the compiled proxy-side execution plan for one such query.
+type templatePlan struct {
+	pipeline   *logqlpkg.Pipeline
+	baseLogsQL string // reduced LogsQL sent to VictoriaLogs
+}
+
+// templatePlanFor builds a plan when logqlQuery's log pipeline contains a
+// template stage. It returns (nil, nil) when the query needs no proxy-side
+// evaluation, and an error when the query contains a template this proxy cannot
+// evaluate — that error must reach the client as a 400 rather than silently
+// falling back to emitting template text.
+func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templatePlan, error) {
+	expr, err := logqlpkg.Parse(strings.TrimSpace(logqlQuery))
+	if err != nil {
+		return nil, nil //nolint:nilerr // unparseable queries keep their existing route
+	}
+	lq := innermostLogQuery(expr)
+	if lq == nil || !logqlpkg.NeedsProxyEvaluation(lq.Pipeline) {
+		return nil, nil
+	}
+
+	pipeline, err := logqlpkg.NewPipeline(lq.Pipeline)
+	if err != nil {
+		return nil, err
+	}
+
+	reduced := &logqlpkg.LogQuery{Selector: lq.Selector, Pipeline: leadingLineFilters(lq.Pipeline)}
+	baseLogsQL, err := p.translateQueryWithContext(ctx, reduced.String())
+	if err != nil {
+		return nil, err
+	}
+	return &templatePlan{pipeline: pipeline, baseLogsQL: baseLogsQL}, nil
+}
+
+// innermostLogQuery unwraps aggregations down to the log query they range over.
+// A binary expression has two of them, so it is left to its own per-side route.
+func innermostLogQuery(expr logqlpkg.Expr) *logqlpkg.LogQuery {
+	for {
+		switch e := expr.(type) {
+		case *logqlpkg.LogQuery:
+			return e
+		case *logqlpkg.VectorAggregation:
+			expr = e.Inner
+		case *logqlpkg.RangeAggregation:
+			if e.Step != "" { // subquery: the inner expression is itself a metric
+				return nil
+			}
+			expr = e.Inner
+		default:
+			return nil
+		}
+	}
+}
+
+// leadingLineFilters returns the run of line filters at the head of the
+// pipeline — the only stages that can be pushed down without changing what the
+// proxy-side evaluator sees, because they read the raw line.
+func leadingLineFilters(stages []logqlpkg.Stage) []logqlpkg.Stage {
+	var out []logqlpkg.Stage
+	for _, s := range stages {
+		lf, ok := s.(*logqlpkg.LineFilterStage)
+		if !ok {
+			return out
+		}
+		out = append(out, lf)
+	}
+	return out
+}
+
+// templateEntry is one entry that survived the pipeline.
+type templateEntry struct {
+	ts     int64 // unix nanoseconds
+	line   string
+	labels map[string]string
+}
+
+// fetchTemplatePipelineEntries runs the reduced LogsQL against VictoriaLogs and
+// returns the entries that survive the proxy-side pipeline.
+func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *templatePlan, start, end time.Time) ([]templateEntry, error) {
+	params := url.Values{}
+	params.Set("query", plan.baseLogsQL)
+	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
+	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
+	// Same raw-row contract as collectRangeMetricSamples: the cap is a safety
+	// limit VictoriaLogs executes as a sort, and hitting it is reported rather
+	// than folded into a smaller-but-plausible number. One extra row is the
+	// overflow probe — a response of exactly rowLimit rows is ambiguous.
+	rowLimit := p.rangeMetricRowLimit
+	if rowLimit <= 0 {
+		rowLimit = defaultManualRangeMetricRowLimit
+	}
+	params.Set("limit", strconv.Itoa(rowLimit+1))
+
+	resp, err := p.vlPost(ctx, "/select/logsql/query", params)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := readBodyLimited(resp.Body, maxUpstreamErrorBodyBytes)
+		return nil, p.redactedBackendStatusError("backend returned", resp.StatusCode, body)
+	}
+
+	fjp := vlFJParserPool.Get()
+	defer vlFJParserPool.Put(fjp)
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+
+	out := make([]templateEntry, 0, 256)
+	rowsScanned := 0
+	for scanner.Scan() {
+		raw := scanner.Bytes()
+		if len(raw) == 0 {
+			continue
+		}
+		rowsScanned++
+		if rowsScanned > rowLimit {
+			return nil, &rawRowScanTruncatedError{limit: rowLimit}
+		}
+		v, parseErr := fjp.ParseBytes(raw)
+		if parseErr != nil {
+			continue
+		}
+		ts, ok := vlRowTimestampNanos(v)
+		if !ok {
+			continue
+		}
+		entry := logqlpkg.Entry{
+			TS:     time.Unix(0, ts),
+			Line:   string(v.GetStringBytes("_msg")),
+			Labels: p.templateEntryLabels(v),
+		}
+		if !plan.pipeline.Process(&entry) {
+			continue
+		}
+		out = append(out, templateEntry{ts: ts, line: entry.Line, labels: entry.Labels})
+	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		return nil, fmt.Errorf("scanning VL response: %w", scanErr)
+	}
+	return out, nil
+}
+
+// templateEntryLabels builds the Loki-named label set a template sees: stream
+// labels plus every other non-internal field VictoriaLogs stored with the row
+// (Loki's structured metadata), all translated back to Loki naming.
+func (p *Proxy) templateEntryLabels(v *fj.Value) map[string]string {
+	labels := make(map[string]string, 8)
+	if obj, err := v.Object(); err == nil {
+		obj.Visit(func(key []byte, val *fj.Value) {
+			k := string(key)
+			if k == "_msg" || k == "_time" || k == "_stream" || isVLInternalField(k) {
+				return
+			}
+			sv := string(val.GetStringBytes())
+			if sv == "" {
+				sv = strings.Trim(val.String(), `"`)
+			}
+			if strings.TrimSpace(sv) != "" {
+				labels[k] = sv
+			}
+		})
+	}
+	for k, val := range parseStreamLabels(string(v.GetStringBytes("_stream"))) {
+		labels[k] = val
+	}
+	return p.labelTranslator.TranslateLabelsMap(labels)
+}
+
+func vlRowTimestampNanos(v *fj.Value) (int64, bool) {
+	rawTS := string(v.GetStringBytes("_time"))
+	if rawTS == "" {
+		return 0, false
+	}
+	normTS, ok := formatEntryTimestamp(rawTS)
+	if !ok {
+		return 0, false
+	}
+	ts, err := strconv.ParseInt(normTS, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	if ts < 1e12 {
+		ts *= int64(time.Second)
+	}
+	return ts, true
+}
+
+// ─── log queries ────────────────────────────────────────────────────────────
+
+// proxyTemplateLogQuery serves a `streams` query whose pipeline needs
+// proxy-side template evaluation. It reports whether it wrote a response.
+func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, logqlQuery string) bool {
+	plan, err := p.templatePlanFor(r.Context(), logqlQuery)
+	if err != nil {
+		p.writeError(w, http.StatusBadRequest, err.Error())
+		return true
+	}
+	if plan == nil {
+		return false
+	}
+
+	start, err := parseTimestamp(r.FormValue("start"))
+	if err != nil {
+		p.writeError(w, http.StatusBadRequest, "invalid start timestamp: "+err.Error())
+		return true
+	}
+	end, err := parseTimestamp(r.FormValue("end"))
+	if err != nil {
+		p.writeError(w, http.StatusBadRequest, "invalid end timestamp: "+err.Error())
+		return true
+	}
+
+	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end)
+	if err != nil {
+		p.writeError(w, templateFetchErrorStatus(err), err.Error())
+		return true
+	}
+
+	limit := p.maxLines
+	if v := r.FormValue("limit"); v != "" {
+		if n, convErr := strconv.Atoi(sanitizeLimit(v)); convErr == nil && n > 0 {
+			limit = n
+		}
+	}
+	backward := !strings.EqualFold(r.FormValue("direction"), "forward")
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].ts == entries[j].ts {
+			return i < j
+		}
+		if backward {
+			return entries[i].ts > entries[j].ts
+		}
+		return entries[i].ts < entries[j].ts
+	})
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+
+	writeLokiStreamQueryResponse(w, groupTemplateEntriesIntoStreams(entries), false)
+	return true
+}
+
+// groupTemplateEntriesIntoStreams collapses entries sharing a label set into one
+// Loki stream, preserving the order they were given in.
+func groupTemplateEntriesIntoStreams(entries []templateEntry) []map[string]interface{} {
+	order := make([]string, 0, 8)
+	byKey := make(map[string]map[string]interface{}, 8)
+	for _, e := range entries {
+		key := canonicalLabelsKey(e.labels)
+		stream, ok := byKey[key]
+		if !ok {
+			stream = map[string]interface{}{"stream": e.labels, "values": make([]interface{}, 0, 16)}
+			byKey[key] = stream
+			order = append(order, key)
+		}
+		values, _ := stream["values"].([]interface{})
+		stream["values"] = append(values, []interface{}{strconv.FormatInt(e.ts, 10), e.line})
+	}
+	out := make([]map[string]interface{}, 0, len(order))
+	for _, key := range order {
+		out = append(out, byKey[key])
+	}
+	return out
+}
+
+// ─── metric queries ─────────────────────────────────────────────────────────
+
+// templateFetchErrorStatus maps a fetch failure to a status. Hitting the raw-row
+// cap is the client's query being too broad for this path, not a backend fault.
+func templateFetchErrorStatus(err error) int {
+	var truncated *rawRowScanTruncatedError
+	if errors.As(err, &truncated) {
+		return http.StatusBadRequest
+	}
+	return statusFromUpstreamErr(err)
+}
+
+// errTemplateMetricUnsupported marks a metric shape the template path declines,
+// so the caller can fall back to its normal routing.
+var errTemplateMetricUnsupported = errors.New("template pipeline: unsupported metric shape")
+
+// collectTemplatePipelineSamples turns the surviving entries into the same
+// per-series sample map the manual range-metric path consumes, so rate(),
+// count_over_time(), quantile_over_time() and friends keep their existing —
+// correct, window-divided — evaluation in buildManualRangeMetric{Matrix,Vector}.
+func (p *Proxy) collectTemplatePipelineSamples(
+	ctx context.Context,
+	plan *templatePlan,
+	spec statsCompatSpec,
+	field, unwrapConv string,
+	start, end time.Time,
+) (map[string]manualSeriesSamples, error) {
+	entries, err := p.fetchTemplatePipelineEntries(ctx, plan, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	seriesMap := make(map[string]manualSeriesSamples, 8)
+	for i := range entries {
+		e := &entries[i]
+		value, ok := templateSampleValue(e, field, unwrapConv)
+		if !ok {
+			continue
+		}
+		metric := templateMetricLabels(e.labels, spec)
+		key := canonicalLabelsKey(metric)
+		current := seriesMap[key]
+		if current.Metric == nil {
+			current.Metric = metric
+		}
+		current.Samples = append(current.Samples, rangeMetricSample{ts: e.ts, value: value})
+		seriesMap[key] = current
+	}
+	for key, series := range seriesMap {
+		sort.Slice(series.Samples, func(i, j int) bool { return series.Samples[i].ts < series.Samples[j].ts })
+		seriesMap[key] = series
+	}
+	return seriesMap, nil
+}
+
+// templateSampleValue mirrors extractManualSampleValueFJ over a post-pipeline entry.
+func templateSampleValue(e *templateEntry, field, unwrapConv string) (float64, bool) {
+	switch field {
+	case "__count__":
+		return 1, true
+	case "__bytes__":
+		return float64(len(e.line)), true
+	}
+	raw, ok := e.labels[field]
+	if !ok {
+		return 0, false
+	}
+	switch unwrapConv {
+	case "duration":
+		return parseDuration(raw)
+	case "bytes":
+		return parseBytes(raw)
+	default:
+		f, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		return f, err == nil
+	}
+}
+
+// templateMetricLabels applies the query's by()/without() grouping to the
+// post-pipeline label set.
+func templateMetricLabels(labels map[string]string, spec statsCompatSpec) map[string]string {
+	if spec.ByExplicit && len(spec.GroupBy) == 0 {
+		return map[string]string{}
+	}
+	names := spec.GroupBy
+	if len(spec.OrigGroupBy) == len(spec.GroupBy) && len(spec.OrigGroupBy) > 0 {
+		names = spec.OrigGroupBy
+	}
+	if len(names) == 0 {
+		out := make(map[string]string, len(labels))
+		for k, v := range labels {
+			if !strings.HasPrefix(k, "__") && v != "" {
+				out[k] = v
+			}
+		}
+		return out
+	}
+	out := make(map[string]string, len(names))
+	for _, n := range names {
+		if v, ok := labels[n]; ok && v != "" {
+			out[n] = v
+		}
+	}
+	return out
+}
+
+// templateMetricPlan carries everything the manual metric builders need.
+type templateMetricPlan struct {
+	plan       *templatePlan
+	spec       statsCompatSpec
+	origSpec   originalRangeMetricSpec
+	manualFunc string
+	field      string
+	quantile   float64
+}
+
+// buildTemplateMetricPlan prepares a metric query whose pipeline needs
+// proxy-side template evaluation. ok=false means "not our case, keep routing".
+func (p *Proxy) buildTemplateMetricPlan(ctx context.Context, originalLogql, logsqlQuery string) (*templateMetricPlan, bool, error) {
+	plan, err := p.templatePlanFor(ctx, originalLogql)
+	if err != nil {
+		return nil, true, err
+	}
+	if plan == nil {
+		return nil, false, nil
+	}
+	origSpec, hasOrigSpec := parseOriginalRangeMetricSpec(originalLogql)
+	if !hasOrigSpec || origSpec.Window <= 0 {
+		return nil, true, fmt.Errorf("invalid range metric query")
+	}
+	statsSpec, _ := parseStatsCompatSpec(logsqlQuery)
+	manualFunc := normalizeManualMetricFunction(statsSpec, origSpec)
+	if manualFunc == "" || !isManualRangeStatsFunc(manualFunc) && manualFunc != "count_over_time" && manualFunc != "bytes_over_time" && manualFunc != "bytes_rate" {
+		return nil, true, fmt.Errorf("%w: %s", errTemplateMetricUnsupported, origSpec.Func)
+	}
+
+	// Grouping is applied to the POST-pipeline label set, so the labels are the
+	// Loki names the user wrote — never the VL-translated ones.
+	byLabels := parseOriginalByLabels(originalLogql)
+	spec := statsCompatSpec{
+		GroupBy:     byLabels,
+		OrigGroupBy: byLabels,
+		ByExplicit:  len(byLabels) == 0 && hasOuterAggregationWithoutBy(originalLogql),
+		Func:        statsSpec.Func,
+		Field:       statsSpec.Field,
+	}
+
+	field, quantile, err := templateMetricField(statsSpec, origSpec, manualFunc)
+	if err != nil {
+		return nil, true, err
+	}
+	return &templateMetricPlan{
+		plan: plan, spec: spec, origSpec: origSpec,
+		manualFunc: manualFunc, field: field, quantile: quantile,
+	}, true, nil
+}
+
+// templateMetricField mirrors resolveManualMetricField but keeps Loki label
+// names, because the template pipeline produces Loki-named labels.
+func templateMetricField(statsSpec statsCompatSpec, origSpec originalRangeMetricSpec, manualFunc string) (string, float64, error) {
+	switch manualFunc {
+	case "rate", "count_over_time":
+		return "__count__", 0, nil
+	case "bytes_over_time", "bytes_rate":
+		return "__bytes__", 0, nil
+	case "quantile":
+		phi, field, ok := parseStatsQuantileSpec(statsSpec.Field)
+		if !ok || strings.TrimSpace(origSpec.UnwrapField) == "" {
+			return "", 0, fmt.Errorf("invalid aggregation %s without unwrap", unwrapErrorFuncName(origSpec.Func))
+		}
+		_ = field
+		return origSpec.UnwrapField, phi, nil
+	}
+	if strings.TrimSpace(origSpec.UnwrapField) == "" {
+		return "", 0, fmt.Errorf("invalid aggregation %s without unwrap", unwrapErrorFuncName(origSpec.Func))
+	}
+	return origSpec.UnwrapField, 0, nil
+}
+
+// templateMetricRangeBody evaluates a range metric query over a template
+// pipeline and returns the Loki-shaped matrix body.
+func (p *Proxy) templateMetricRangeBody(r *http.Request, mp *templateMetricPlan) ([]byte, error) {
+	startTS, err := parseTimestamp(r.FormValue("start"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid start timestamp: %w", err)
+	}
+	endTS, err := parseTimestamp(r.FormValue("end"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid end timestamp: %w", err)
+	}
+	step := parseLokiDuration(formatVLStep(r.FormValue("step")))
+	if step <= 0 {
+		step = time.Minute
+	}
+	series, err := p.collectTemplatePipelineSamples(
+		r.Context(), mp.plan, mp.spec, mp.field, mp.origSpec.UnwrapConv,
+		startTS.Add(-mp.origSpec.Window), endTS)
+	if err != nil {
+		return nil, err
+	}
+	return buildManualRangeMetricMatrix(mp.manualFunc, mp.quantile, series,
+		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries()), nil
+}
+
+// templateMetricInstantBody evaluates an instant metric query over a template
+// pipeline and returns the Loki-shaped vector body.
+func (p *Proxy) templateMetricInstantBody(r *http.Request, mp *templateMetricPlan) ([]byte, error) {
+	evalTS, err := parseTimestamp(r.FormValue("time"))
+	if err != nil {
+		evalTS = time.Now()
+	}
+	series, err := p.collectTemplatePipelineSamples(
+		r.Context(), mp.plan, mp.spec, mp.field, mp.origSpec.UnwrapConv,
+		evalTS.Add(-mp.origSpec.Window), evalTS)
+	if err != nil {
+		return nil, err
+	}
+	return buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window), nil
+}
+
+// handleTemplateMetricRange answers a range metric query over a template
+// pipeline. It reports whether it wrote a response.
+func (p *Proxy) handleTemplateMetricRange(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
+	return p.handleTemplateMetric(w, r, originalLogql, logsqlQuery, p.templateMetricRangeBody)
+}
+
+// handleTemplateMetricInstant answers an instant metric query over a template pipeline.
+func (p *Proxy) handleTemplateMetricInstant(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
+	return p.handleTemplateMetric(w, r, originalLogql, logsqlQuery, p.templateMetricInstantBody)
+}
+
+func (p *Proxy) handleTemplateMetric(
+	w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string,
+	build func(*http.Request, *templateMetricPlan) ([]byte, error),
+) bool {
+	mp, mine, err := p.buildTemplateMetricPlan(r.Context(), originalLogql, logsqlQuery)
+	if !mine {
+		return false
+	}
+	if err != nil {
+		p.writeError(w, http.StatusBadRequest, err.Error())
+		return true
+	}
+	body, err := build(r, mp)
+	if err != nil {
+		p.writeError(w, templateFetchErrorStatus(err), err.Error())
+		return true
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(body) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter -- pre-built JSON, Content-Type set above
+	return true
+}
+
+// templateBinOpPrefix marks one side of a binary metric expression whose
+// pipeline needs proxy-side template evaluation. The binary machinery works on
+// TRANSLATED LogsQL strings, so the original LogQL is carried inside the marker
+// — the same trick the translator uses for nested binary expressions.
+const templateBinOpPrefix = "__lvp_tpl:"
+
+// templateBinOpMarker returns a marker for expr when its pipeline carries a Go
+// template, so `sum(count_over_time({...} | line_format … [6h])) or vector(0)`
+// evaluates its left side here instead of in VictoriaLogs.
+func (p *Proxy) templateBinOpMarker(expr logqlpkg.Expr) (string, bool) {
+	lq := innermostLogQuery(expr)
+	if lq == nil || !logqlpkg.NeedsProxyEvaluation(lq.Pipeline) {
+		return "", false
+	}
+	return templateBinOpPrefix + base64.StdEncoding.EncodeToString([]byte(expr.String())), true
+}
+
+// templateBinOpBody resolves a marked binary-expression side.
+func (p *Proxy) templateBinOpBody(r *http.Request, marker, vlEndpoint string) ([]byte, error) {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(marker, templateBinOpPrefix))
+	if err != nil {
+		return nil, fmt.Errorf("invalid template marker: %w", err)
+	}
+	originalLogql := string(raw)
+	logsqlQuery, err := p.translateQueryWithContext(r.Context(), originalLogql)
+	if err != nil {
+		return nil, err
+	}
+	mp, mine, err := p.buildTemplateMetricPlan(r.Context(), originalLogql, logsqlQuery)
+	if err != nil {
+		return nil, err
+	}
+	if !mine {
+		return nil, fmt.Errorf("%w: %s", errTemplateMetricUnsupported, originalLogql)
+	}
+	if vlEndpoint == "stats_query_range" {
+		return p.templateMetricRangeBody(r, mp)
+	}
+	return p.templateMetricInstantBody(r, mp)
+}

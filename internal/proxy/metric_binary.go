@@ -3519,8 +3519,8 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 	// Check if either side is a scalar or a nested binary marker.
 	leftIsScalar := translator.IsScalar(leftQL)
 	rightIsScalar := translator.IsScalar(rightQL)
-	leftIsMarker := strings.HasPrefix(leftQL, translator.BinaryMetricPrefix)
-	rightIsMarker := strings.HasPrefix(rightQL, translator.BinaryMetricPrefix)
+	leftIsMarker := isBinOpMarker(leftQL)
+	rightIsMarker := isBinOpMarker(rightQL)
 
 	var leftBody, rightBody []byte
 	var leftErr, rightErr error
@@ -3602,6 +3602,13 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 	w.Write(result)
 }
 
+// isBinOpMarker reports whether a side is a marker the proxy must resolve
+// itself rather than POST to VictoriaLogs: a nested binary expression, or a
+// pipeline carrying a Go template (see template_pipeline.go).
+func isBinOpMarker(q string) bool {
+	return strings.HasPrefix(q, translator.BinaryMetricPrefix) || strings.HasPrefix(q, templateBinOpPrefix)
+}
+
 // resolveBinOpBody returns the result body for one side of a binary expression.
 // Handles scalar strings, nested binary markers, and plain VL queries.
 func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType string, buildParams func(string) url.Values) (body []byte, isScalar bool, err error) {
@@ -3610,6 +3617,10 @@ func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType 
 	}
 	if strings.HasPrefix(query, translator.BinaryMetricPrefix) {
 		body, err = p.evalBinaryMarker(r, query, vlEndpoint, resultType, buildParams)
+		return body, false, err
+	}
+	if strings.HasPrefix(query, templateBinOpPrefix) {
+		body, err = p.templateBinOpBody(r, query, vlEndpoint)
 		return body, false, err
 	}
 	resp, e := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(query))
