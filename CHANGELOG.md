@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Label-matcher regex flags escaped the anchors.** `AnchorLabelMatcherRegex`
+  hoisted leading inline flags in front of `^…$`, so `(?m)foo` became
+  `(?m)^(?:foo)$` — and under `(?m)` the anchors match at LINE boundaries, which
+  let the value `"foo\nbar"` satisfy a matcher for `foo`. Flags are now scoped
+  to the body (`^(?:(?m:foo))$`), nesting successive groups in order. An empty
+  pattern is anchored too (`=~""` matches only the empty value, where before it
+  returned unanchored and matched anything).
+- **A line filter containing the text `| stats ` looked like a second stats
+  stage.** The multi-stage detector scanned raw text, so `{...} |= "| stats "`
+  routed a one-stage query away from the stats-compat layer. It now scans with
+  quoted spans blanked (`stripQuotedSpans`), so only real pipe stages count.
+- **Two-stage aggregations with `range > step` are rejected instead of answered
+  wrongly.** VictoriaLogs buckets `stats_query_range` by `step` (tumbling) while
+  a LogQL range aggregation is a sliding `range` window; they agree only while
+  `range <= step`. `query_range` outside that now returns 400 naming the
+  mismatch and the two workarounds. Instant queries and single-stage sliding
+  queries are unaffected. See `docs/KNOWN_ISSUES.md`.
+
 - **An outer aggregation over a range grouping dropped one of the two clauses.**
   `sum by (app) (quantile_over_time(...) by (namespace))` carries an inner range
   grouping AND an outer grouping; a single LogsQL stats stage holds only one, so

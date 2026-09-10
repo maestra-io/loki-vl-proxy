@@ -44,16 +44,34 @@ func TestAnchorLabelMatcherRegex(t *testing.T) {
 			want: "^(?:api-.*)$",
 		},
 		{
-			// Leading inline flags are hoisted so they still apply to the whole
-			// pattern and the emitted LogsQL stays readable.
-			name: "case-insensitive flag is hoisted out front",
+			// Flags are SCOPED to the body, never hoisted in front of the
+			// anchors — see the multiline case below for why.
+			name: "case-insensitive flag is scoped to the body",
 			in:   "(?i)prod",
-			want: "(?i)^(?:prod)$",
+			want: "^(?:(?i:prod))$",
 		},
 		{
-			name: "multiple flags hoisted",
+			name: "multiple flags in one group stay together",
 			in:   "(?is)prod",
-			want: "(?is)^(?:prod)$",
+			want: "^(?:(?is:prod))$",
+		},
+		{
+			// The reason flags must not be hoisted: a hoisted (?m) makes ^ and $
+			// match at line boundaries, so "foo\nbar" would pass a matcher for
+			// "foo". Scoped, the anchors keep meaning "the whole value".
+			name: "multiline flag is scoped so the anchors stay value-anchored",
+			in:   "(?m)foo",
+			want: "^(?:(?m:foo))$",
+		},
+		{
+			name: "successive flag groups nest in order",
+			in:   "(?i)(?s)foo",
+			want: "^(?:(?i:(?s:foo)))$",
+		},
+		{
+			name: "negated flag group",
+			in:   "(?-s)foo",
+			want: "^(?:(?-s:foo))$",
 		},
 		{
 			// A scoped group carries its own body and must stay inside.
@@ -72,14 +90,16 @@ func TestAnchorLabelMatcherRegex(t *testing.T) {
 			want: "^(?:kafka-[23])$",
 		},
 		{
-			name: "empty pattern is left alone",
+			// An empty pattern is still a matcher: Loki's `=~""` matches only
+			// the empty value. Returning it unanchored made it match anything.
+			name: "empty pattern anchors to the empty value",
 			in:   "",
-			want: "",
+			want: "^(?:)$",
 		},
 		{
-			name: "flags with no body are left alone",
+			name: "flags with no body anchor to the empty value",
 			in:   "(?i)",
-			want: "(?i)",
+			want: "^(?:(?i:))$",
 		},
 	}
 
@@ -130,10 +150,24 @@ func TestAnchorLabelMatcherRegexMatchesLokiSemantics(t *testing.T) {
 		{"api-.*", "api-gw", true},
 		{"api-.*", "my-api-gw", false},
 
-		// Flags survive the hoist.
+		// Flags still apply once scoped to the body.
 		{"(?i)prod", "PROD", true},
 		{"(?i)prod", "prod", true},
 		{"(?i)prod", "production", false},
+
+		// The multiline hole: a value with a newline must never satisfy a
+		// matcher for one of its lines, whatever flags the author set.
+		{"(?m)foo", "foo", true},
+		{"(?m)foo", "foo\nbar", false},
+		{"(?m)foo", "bar\nfoo", false},
+		{"(?s)foo", "foo\nbar", false},
+		{"foo", "foo\nbar", false},
+
+		// Empty patterns match only the empty value.
+		{"", "", true},
+		{"", "anything", false},
+		{"(?i)", "", true},
+		{"(?i)", "x", false},
 
 		// Character class.
 		{"kafka-[23]", "kafka-2", true},

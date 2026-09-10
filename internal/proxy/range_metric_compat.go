@@ -330,12 +330,39 @@ func parseOriginalByLabels(logql string) []string {
 	return out
 }
 
+// rejectMultiStageSlidingRange answers a two-stage range query that the native
+// backend cannot evaluate faithfully. Returns true when it wrote a response.
+//
+// VL's stats_query_range buckets by `step` (tumbling); a LogQL range
+// aggregation is a SLIDING window of `range` evaluated every `step`. They
+// coincide only while range <= step, which is the case that is allowed through.
+func (p *Proxy) rejectMultiStageSlidingRange(w http.ResponseWriter, r *http.Request, originalLogql string) bool {
+	step, stepOk := parsePositiveStepDuration(r.FormValue("step"))
+	origSpec, hasOrigSpec := parseOriginalRangeMetricSpec(originalLogql)
+	if !stepOk || !hasOrigSpec || origSpec.Window <= step {
+		return false
+	}
+	p.writeError(w, http.StatusBadRequest, fmt.Sprintf(
+		"unsupported query: an aggregation over a range aggregation with its own grouping "+
+			"(for example `sum by (a) (max_over_time({...}[%s]) by (b))`) is evaluated by the "+
+			"backend in tumbling %s buckets, which does not match LogQL's sliding %s window. "+
+			"Use a step >= the range, or drop one of the two grouping clauses.",
+		formatLogQLDuration(origSpec.Window), formatLogQLDuration(step), formatLogQLDuration(origSpec.Window)))
+	return true
+}
+
 func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
 	// A genuine two-stage aggregation (inner range grouping + outer aggregation)
 	// is not expressible in this layer's single-fold model — see
-	// isMultiStageStatsQuery. Let VictoriaLogs run both stages.
+	// isMultiStageStatsQuery — so VictoriaLogs runs both stages natively.
+	//
+	// VL's stats_query_range buckets by `step` (tumbling), while a LogQL range
+	// aggregation is a SLIDING window of `range` evaluated every `step`. The two
+	// coincide only while range <= step. Beyond that the native result is wrong,
+	// and evaluating a sliding TWO-stage fold is not something this layer can do
+	// (it folds once, per series). Refuse rather than return a plausible number.
 	if isMultiStageStatsQuery(logsqlQuery) {
-		return false
+		return p.rejectMultiStageSlidingRange(w, r, originalLogql)
 	}
 	// Queries containing | math are multi-stage VL rate pipelines built by the translator
 	// (e.g. sum(rate({...} | json [w]))). For non-sliding windows (range == step), VL can
@@ -428,10 +455,16 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 // `stats … as __lvp_inner | math … | stats …`, and the manual path implements
 // their per-step accumulation on purpose. They are identified by `| math `.
 func isMultiStageStatsQuery(logsqlQuery string) bool {
-	if strings.Contains(logsqlQuery, "| math ") {
+	// Count PIPE stages only. A line filter carrying the literal text — e.g.
+	// `{...} |= "| stats "`, translated to `~"| stats "` — is data, not a stage,
+	// and a raw scan would read a one-stage query as two and route it away from
+	// the compat layer. stripQuotedSpans blanks quoted contents in place, so
+	// offsets and every unquoted stage marker survive.
+	scanned := stripQuotedSpans(logsqlQuery)
+	if strings.Contains(scanned, "| math ") {
 		return false
 	}
-	return strings.Count(logsqlQuery, "| stats ") >= 2
+	return strings.Count(scanned, "| stats ") >= 2
 }
 
 func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {

@@ -861,6 +861,58 @@ func testInstantGrouping(t *testing.T, p *proxyProc, ns, slowNS string, now time
 		}
 	})
 
+	// A two-stage aggregation is executed by VL, which buckets by `step`
+	// (tumbling). LogQL's range aggregation is a SLIDING window of `range`, so
+	// the two agree only while range <= step. Beyond that the proxy refuses
+	// instead of returning a plausible wrong number.
+	t.Run("two-stage range query rejects range > step", func(t *testing.T) {
+		logql := `sum by (container) (max_over_time(` + bothNS + ` | json | unwrap Duration [1h]) by (namespace))`
+
+		params := url.Values{}
+		params.Set("query", logql)
+		params.Set("start", strconv.FormatInt(now.Add(-time.Hour).Unix(), 10))
+		params.Set("end", strconv.FormatInt(now.Unix(), 10))
+		params.Set("step", "300") // 5m step under a 1h range → sliding
+
+		resp, err := http.PostForm("http://"+p.listenAddr+"/loki/api/v1/query_range", params)
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("range > step: expected HTTP 400, got %d: %s", resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), "tumbling") {
+			t.Errorf("error should explain the tumbling/sliding mismatch, got: %s", body)
+		}
+
+		// step >= range is exactly representable, so it must still answer.
+		params.Set("step", "3600")
+		okResp, err := http.PostForm("http://"+p.listenAddr+"/loki/api/v1/query_range", params)
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		okBody, _ := io.ReadAll(okResp.Body)
+		_ = okResp.Body.Close()
+		if okResp.StatusCode != http.StatusOK {
+			t.Fatalf("step >= range: expected HTTP 200, got %d: %s", okResp.StatusCode, okBody)
+		}
+
+		// And the single-stage sliding form is untouched by the guard.
+		params.Set("query", `max_over_time(`+bothNS+` | json | unwrap Duration [1h]) by (namespace)`)
+		params.Set("step", "300")
+		singleResp, err := http.PostForm("http://"+p.listenAddr+"/loki/api/v1/query_range", params)
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		singleBody, _ := io.ReadAll(singleResp.Body)
+		_ = singleResp.Body.Close()
+		if singleResp.StatusCode != http.StatusOK {
+			t.Fatalf("single-stage sliding: expected HTTP 200, got %d: %s", singleResp.StatusCode, singleBody)
+		}
+	})
+
 	t.Run("max_over_time by namespace stays grouped", func(t *testing.T) {
 		logql := `max_over_time(` + bothNS + ` | json | unwrap Duration [1h]) by (namespace)`
 		assertGroupedBy(t, queryInstant(t, p, logql, now), []string{"namespace"},
