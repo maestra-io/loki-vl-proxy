@@ -327,10 +327,10 @@ func TestQueryRange_OrVectorFillsEmptyResultWithConstant(t *testing.T) {
 	}
 }
 
-// A failing upstream call must carry the translated LogsQL VERBATIM: a
-// sha256 of the query cannot be pasted into VictoriaLogs, and reproducing a
-// backend 400 was the slowest step of every field report. Successful calls stay
-// quiet unless -log-translated-queries asks for them.
+// The translated LogsQL reaches the log only behind -log-translated-queries —
+// a query literal can carry credentials or user text, so verbatim logging is
+// opt-in even on a failure. With the flag on, both failures and successes carry
+// it; with it off, a failure still names the query by digest.
 func TestUpstreamLog_CarriesFullLogsQLOnFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -338,8 +338,9 @@ func TestUpstreamLog_CarriesFullLogsQLOnFailure(t *testing.T) {
 		logTranslated bool
 		wantQuery     bool
 	}{
-		{"backend 400", http.StatusBadRequest, false, true},
-		{"backend 500", http.StatusInternalServerError, false, true},
+		{"backend 400, flag off", http.StatusBadRequest, false, false},
+		{"backend 400, flag on", http.StatusBadRequest, true, true},
+		{"backend 500, flag off", http.StatusInternalServerError, false, false},
 		{"success, flag off", http.StatusOK, false, false},
 		{"success, flag on", http.StatusOK, true, true},
 	} {
@@ -376,8 +377,10 @@ func TestUpstreamLog_CarriesFullLogsQLOnFailure(t *testing.T) {
 			if got := strings.Contains(out, "logsql.query=") && strings.Contains(out, "nginx"); got != tc.wantQuery {
 				t.Fatalf("full LogsQL in the log = %v, want %v:\n%s", got, tc.wantQuery, out)
 			}
-			if strings.Contains(out, "logsql.query=sha256:") || strings.Contains(out, `"logsql.query":"sha256:`) {
-				t.Fatalf("logsql.query is still a hash:\n%s", out)
+			// With the flag off a failure still names the query — by digest.
+			if !tc.logTranslated && tc.status >= http.StatusBadRequest &&
+				(!strings.Contains(out, "logsql.query=") || !strings.Contains(out, "sha256:")) {
+				t.Fatalf("failure log carries no query digest:\n%s", out)
 			}
 		})
 	}

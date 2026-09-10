@@ -953,11 +953,16 @@ func fillOrVectorConstant(body []byte, value float64, r *http.Request, isRange b
 	have := map[int64]bool{}
 	var values []interface{}
 	if unlabelled != nil {
-		values, _ = unlabelled["values"].([]interface{})
-		for _, raw := range values {
-			if pt, _ := raw.([]interface{}); len(pt) >= 1 {
-				have[int64(parsePointValue(pt[0]))] = true
+		// Keep only well-formed points: the sort below indexes pt[0], and a
+		// null or empty point in the upstream body would panic there.
+		existing, _ := unlabelled["values"].([]interface{})
+		for _, raw := range existing {
+			pt, _ := raw.([]interface{})
+			if len(pt) < 1 {
+				continue
 			}
+			have[int64(parsePointValue(pt[0]))] = true
+			values = append(values, raw)
 		}
 	}
 	for _, ts := range grid {

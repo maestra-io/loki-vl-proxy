@@ -157,8 +157,11 @@ type templateEntry struct {
 // AGGREGATION over a truncated scan is silently wrong, so it does; a LOG query
 // is already a "newest N lines" request (VictoriaLogs sorts by _time desc), so
 // it does not.
-func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *templatePlan, start, end time.Time, truncationFatal bool) ([]templateEntry, error) {
-	entries, err := p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.baseLogsQL, start, end, truncationFatal)
+// forward says the client asked for the OLDEST entries first. VictoriaLogs is
+// free to return rows in any order, so the cap below would otherwise keep an
+// arbitrary subset; the query carries an explicit sort matching the direction.
+func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *templatePlan, start, end time.Time, truncationFatal, forward bool) ([]templateEntry, error) {
+	entries, err := p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.baseLogsQL, start, end, truncationFatal, forward)
 	// The pushed-down stages are an optimisation; VictoriaLogs rejecting them is
 	// not a reason to fail a panel Loki answers.
 	var rejected *templatePushdownRejectedError
@@ -166,13 +169,18 @@ func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *template
 		errors.As(err, &rejected) {
 		slog.WarnContext(ctx, "template pipeline pushdown rejected by backend, retrying with line filters only",
 			"status", rejected.status)
-		return p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.fallbackLogsQL, start, end, truncationFatal)
+		return p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.fallbackLogsQL, start, end, truncationFatal, forward)
 	}
 	return entries, err
 }
 
-func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *templatePlan, logsql string, start, end time.Time, truncationFatal bool) ([]templateEntry, error) {
+func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *templatePlan, logsql string, start, end time.Time, truncationFatal, forward bool) ([]templateEntry, error) {
 	params := url.Values{}
+	if forward {
+		logsql += " | sort by (_time)"
+	} else {
+		logsql += " | sort by (_time desc)"
+	}
 	params.Set("query", logsql)
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
@@ -342,7 +350,8 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 		return true
 	}
 
-	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false)
+	backward := !strings.EqualFold(r.FormValue("direction"), "forward")
+	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false, !backward)
 	if err != nil {
 		p.writeError(w, templateFetchErrorStatus(err), err.Error())
 		return true
@@ -354,8 +363,6 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 			limit = n
 		}
 	}
-	backward := !strings.EqualFold(r.FormValue("direction"), "forward")
-
 	sort.SliceStable(entries, func(i, j int) bool {
 		// Equal timestamps are NOT ordered here: SliceStable already preserves
 		// their input order, and returning i<j makes the comparator inconsistent
@@ -421,10 +428,18 @@ type templatePushdownRejectedError struct {
 func (e *templatePushdownRejectedError) Error() string { return e.err.Error() }
 func (e *templatePushdownRejectedError) Unwrap() error { return e.err }
 
+// StatusCode is the backend's own status: a rejected query is the CLIENT's
+// query being unacceptable, so it must not surface as a 502.
+func (e *templatePushdownRejectedError) StatusCode() int { return e.status }
+
 func templateFetchErrorStatus(err error) int {
 	var truncated *rawRowScanTruncatedError
 	if errors.As(err, &truncated) {
 		return http.StatusBadRequest
+	}
+	var rejected *templatePushdownRejectedError
+	if errors.As(err, &rejected) && rejected.status > 0 {
+		return rejected.status
 	}
 	return statusFromUpstreamErr(err)
 }
@@ -444,7 +459,7 @@ func (p *Proxy) collectTemplatePipelineSamples(
 	field, unwrapConv string,
 	start, end time.Time,
 ) (map[string]manualSeriesSamples, error) {
-	entries, err := p.fetchTemplatePipelineEntries(ctx, plan, start, end, true)
+	entries, err := p.fetchTemplatePipelineEntries(ctx, plan, start, end, true, false)
 	if err != nil {
 		return nil, err
 	}

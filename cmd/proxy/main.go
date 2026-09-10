@@ -410,7 +410,7 @@ func run(
 	logStatsInterval := fs.Duration("log-stats-interval", 10*time.Second, "How often to print a request statistics summary (total, errors, latency, cache rate)")
 	logRateThreshold := fs.Int("log-rate-threshold", 10, "When traffic exceeds this rate (req/s), replace per-request logs with periodic summaries. Errors are always logged.")
 	debugLogRawQueries := fs.Bool("debug-log-raw-queries", false, "When true, debug logs include raw LogQL/LogsQL and backend params verbatim. Default false (redacted to sha256+len).")
-	logTranslatedQueries := fs.Bool("log-translated-queries", false, "When true, every SUCCESSFUL upstream call logs the translated LogsQL it sent (logsql.query). Failures (4xx/5xx/transport) always log it, with or without this flag.")
+	logTranslatedQueries := fs.Bool("log-translated-queries", false, "When true, upstream calls log the translated LogsQL verbatim (logsql.query) — failures and successes alike. Default false: query literals can carry credentials or user text, so a failure logs only the sha256 digest.")
 	metadataDefaultLookback := fs.Duration("metadata-default-lookback", 12*time.Hour, "Default time window for /labels, /label/{name}/values, and /series when the client omits start/end. 0 disables (unbounded scan).")
 	drilldownScanTimeout := fs.Duration("drilldown-scan-timeout", 5*time.Second, "Per-request timeout for the detected_fields / detected_field_values log scan path. Caps the time a single Drilldown panel can spend scanning logs with a parser filter. 0 disables the cap (use VL's natural response time).")
 

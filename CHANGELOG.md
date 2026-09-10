@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`-log-translated-queries`** writes the translated LogsQL (`logsql.query`) of
-  every SUCCESSFUL upstream call to the request log. Failures always carry it
-  now — verbatim, not as a `sha256:…` digest, because a hash cannot be pasted
-  into VictoriaLogs and reproducing a backend 4xx was the slowest step of every
-  field report.
+- **`-log-translated-queries`** writes the translated LogsQL (`logsql.query`)
+  verbatim for both failed and successful upstream calls, so a backend 4xx can
+  be pasted straight into VictoriaLogs instead of being reproduced by hand. It
+  is off by default — a query literal can carry credentials or user text — and
+  with it off a failure still names its query by `sha256:…` digest.
 - **`loki_vl_proxy_template_pipeline_queries_total`** counts queries routed to
   the proxy-side LogQL pipeline instead of being pushed down to VictoriaLogs.
   That route reads raw rows, so its rate is what an operator needs — and it is

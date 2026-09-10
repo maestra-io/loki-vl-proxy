@@ -2614,11 +2614,12 @@ func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
 				continue
 			}
 			shifted := ns + deltaNs
-			// VL emits whole-second numbers; keep that form so downstream
-			// parsing and the Loki contract are unchanged. SetArrayItem is the
-			// only mutator that reaches an array ELEMENT — Value.Set addresses
-			// object keys and silently does nothing here.
-			newTS, parseErr := fj.Parse(strconv.FormatInt(shifted/int64(time.Second), 10))
+			// VL emits whole-second numbers and the Loki contract keeps that
+			// form — but a sub-second step (`500ms`, `0.5`) shifts off the
+			// second boundary, and truncating there would emit the ORIGINAL
+			// label. SetArrayItem is the only mutator that reaches an array
+			// ELEMENT — Value.Set addresses object keys and does nothing here.
+			newTS, parseErr := fj.Parse(formatUnixSecondsNumber(shifted))
 			if parseErr != nil {
 				continue
 			}

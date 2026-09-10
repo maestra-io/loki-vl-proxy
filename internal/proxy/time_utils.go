@@ -417,3 +417,13 @@ func patternBackendQueryLimit(start, end, step string, patternLimit int) int {
 	}
 	return limit
 }
+
+// formatUnixSecondsNumber renders a nanosecond timestamp as the JSON number
+// VictoriaLogs and Loki use for stats points: whole seconds when it lands on a
+// second boundary, fractional seconds otherwise (a sub-second step).
+func formatUnixSecondsNumber(nanos int64) string {
+	if nanos%int64(time.Second) == 0 {
+		return strconv.FormatInt(nanos/int64(time.Second), 10)
+	}
+	return strconv.FormatFloat(float64(nanos)/float64(time.Second), 'f', -1, 64)
+}

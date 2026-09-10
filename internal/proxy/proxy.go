@@ -2213,6 +2213,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Route using the original LogQL AST — more reliable than re-parsing translated markers.
+	accountedByNestedHandler := false
 	parsedForRouting, _ := logqlpkg.Parse(logqlQuery)
 	if ra, ok := parsedForRouting.(*logqlpkg.RangeAggregation); ok && ra.Step != "" {
 		// Subquery: max_over_time(rate(...)[1h:5m])
@@ -2224,6 +2225,10 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if binOp, ok := parsedForRouting.(*logqlpkg.BinOpExpr); ok && p.serveOrVectorFallback(sc, r, binOp, true) {
 		// `<expr> or vector(N)` — served by the left side plus the constant.
+		// That nested handler did this request's accounting, so the tail below
+		// skips it: counting again would double every counter and the
+		// query-tracker total.
+		accountedByNestedHandler = true
 	} else if binOp, ok := parsedForRouting.(*logqlpkg.BinOpExpr); ok {
 		// Binary metric expression: sum(rate(...)) / sum(rate(...))
 		// translateBinOpSide handles scalar literals (e.g. * 100) without translation.
@@ -2288,6 +2293,9 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		cacheTap.Release()
 	}
 
+	if accountedByNestedHandler {
+		return
+	}
 	elapsed := time.Since(start)
 	p.metrics.RecordRequest("query_range", sc.code, elapsed)
 	p.queryTracker.Record("query_range", logqlQuery, elapsed, sc.code >= 400)
@@ -2448,9 +2456,9 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// side runs on its own and the constant fills what it does not cover.
 	if parsed, perr := logqlpkg.Parse(logqlQuery); perr == nil {
 		if binOp, isBin := parsed.(*logqlpkg.BinOpExpr); isBin {
-			sc := &statusCapture{ResponseWriter: w, code: 200}
-			if p.serveOrVectorFallback(sc, r, binOp, false) {
-				p.metrics.RecordRequest("query", sc.code, time.Since(start))
+			// The nested handleQuery accounts for this request; recording it
+			// here as well would double the counters.
+			if p.serveOrVectorFallback(w, r, binOp, false) {
 				return
 			}
 		}

@@ -105,15 +105,15 @@ func (p *Proxy) recordUpstreamObservation(ctx context.Context, system, method, r
 			"error.message", err.Error(),
 		)
 	}
-	// The query IS the point of this log line on a failure: a hash cannot be
-	// pasted into VictoriaLogs, so a 4xx/5xx always carries the LogsQL verbatim.
-	// A successful query is only written when -log-translated-queries asks for it
-	// (or -debug-log-raw-queries is on).
+	// A failure needs the query to be reproducible, but a query literal can carry
+	// credentials, an email address or user text, so the verbatim text is opt-in:
+	// -log-translated-queries (or -debug-log-raw-queries) turns it on for BOTH
+	// failures and successes. Off, a failure still names the query by digest.
 	if len(backendQuery) > 0 {
-		failed := err != nil || statusCode >= http.StatusBadRequest
-		if failed || p.logTranslatedQueries || p.debugLogRawQueries {
+		verbatim := p.logTranslatedQueries || p.debugLogRawQueries
+		if verbatim || err != nil || statusCode >= http.StatusBadRequest {
 			if q := strings.TrimSpace(backendQuery[0]); q != "" {
-				logAttrs = append(logAttrs, "logsql.query", q)
+				logAttrs = append(logAttrs, "logsql.query", redactQuery(q, verbatim))
 			}
 		}
 	}
