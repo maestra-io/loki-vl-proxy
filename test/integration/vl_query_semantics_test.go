@@ -93,6 +93,7 @@ type vlRecord struct {
 	container string
 	app       string
 	msg       map[string]interface{} // marshalled into _msg
+	rawMsg    string                 // verbatim _msg, bypassing JSON marshalling
 	extra     map[string]string      // additional top-level VL fields
 }
 
@@ -101,15 +102,18 @@ func (r vlRecord) marshal(now time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	msgText := string(msgBytes)
+	if r.rawMsg != "" {
+		msgText = r.rawMsg
+	}
 	rec := map[string]string{
-		"_time":                     now.Add(r.tsOffset).UTC().Format(time.RFC3339Nano),
-		"_msg":                      string(msgBytes),
-		"kubernetes.pod_namespace":  r.namespace,
-		"kubernetes.pod_name":       r.pod,
-		"kubernetes.container_name": r.container,
-		"kubernetes.pod_node_name":  "node-1",
-		"kubernetes.pod_labels.app": r.app,
-
+		"_time":                         now.Add(r.tsOffset).UTC().Format(time.RFC3339Nano),
+		"_msg":                          msgText,
+		"kubernetes.pod_namespace":      r.namespace,
+		"kubernetes.pod_name":           r.pod,
+		"kubernetes.container_name":     r.container,
+		"kubernetes.pod_node_name":      "node-1",
+		"kubernetes.pod_labels.app":     r.app,
 		"kubernetes.pod_labels.product": "prod",
 	}
 	// An empty app means "this pod carries no `app` pod-label at all" — the
@@ -586,9 +590,11 @@ func TestVLQuerySemantics(t *testing.T) {
 	tieNS := fmt.Sprintf("apptie-%d", runID)
 
 	chainNS := fmt.Sprintf("appchain-%d", runID)
+	parseNS := fmt.Sprintf("appparse-%d", runID)
 
 	records := append(trowFixture(trowNS), levelFixture(mainNS, slowNS, tieNS)...)
 	records = append(records, chainFallbackFixture(chainNS)...)
+	records = append(records, parseFailureFixture(parseNS)...)
 	ingest(t, base, records, now)
 
 	// LVP_TEST_PROXY_LOG=1 makes the proxy log every translated LogsQL query and
@@ -618,7 +624,7 @@ func TestVLQuerySemantics(t *testing.T) {
 		testJSONLineFormat(t, p, slowNS, now)
 	})
 	t.Run("PanelCompareDefects", func(t *testing.T) {
-		testPanelCompareDefects(t, base, p, mainNS, chainNS, now)
+		testPanelCompareDefects(t, base, p, mainNS, chainNS, parseNS, now)
 	})
 	t.Run("LabelMatcherAnchoring", func(t *testing.T) {
 		testLabelMatcherAnchoring(t, p, mainNS, tieNS, now)
@@ -1140,6 +1146,45 @@ func testLabelMatcherAnchoring(t *testing.T, p *proxyProc, mainNS, tieNS string,
 // and reach the `app` Loki label only through the SECOND field of the
 // -field-mapping fallback chain. That is the production shape behind panel S6:
 // trow's pods label themselves with app.kubernetes.io/name, not app.
+// parseFailureFixture holds 15 well-formed JSON lines (error=5, warn=3, info=7)
+// plus 6 lines that are NOT JSON at all. A query with a user `| json` stage must
+// exclude the 6, the way Loki does; a native VL aggregation would count them.
+func parseFailureFixture(ns string) []vlRecord {
+	var out []vlRecord
+	for _, lvl := range []struct {
+		name string
+		n    int
+	}{{"error", 5}, {"warn", 3}, {"info", 7}} {
+		for i := 0; i < lvl.n; i++ {
+			out = append(out, vlRecord{
+				tsOffset:  -25*time.Minute + time.Duration(len(out))*time.Second,
+				namespace: ns,
+				pod:       ns + "-0",
+				container: "c",
+				app:       "svc-p",
+				msg: map[string]interface{}{
+					"message": fmt.Sprintf("ok %s %d", lvl.name, i),
+					"level":   lvl.name,
+				},
+				extra: map[string]string{"loglevel": lvl.name},
+			})
+		}
+	}
+	for i := 0; i < 6; i++ {
+		out = append(out, vlRecord{
+			tsOffset:  -24*time.Minute + time.Duration(i)*time.Second,
+			namespace: ns,
+			pod:       ns + "-0",
+			container: "c",
+			app:       "svc-p",
+			// rawMsg bypasses JSON marshalling: this line is not JSON, so a
+			// `| json` stage fails on it and Loki drops it from the aggregation.
+			rawMsg: fmt.Sprintf("this is not json at all #%d", i),
+		})
+	}
+	return out
+}
+
 func chainFallbackFixture(ns string) []vlRecord {
 	var out []vlRecord
 	for i := 0; i < 6; i++ {
@@ -1165,7 +1210,7 @@ func chainFallbackFixture(ns string) []vlRecord {
 // testPanelCompareDefects covers the defects found by comparing the deployed
 // proxy against central Loki panel by panel on the same data (10.09.2026).
 // Expected values are Loki's, measured on that run.
-func testPanelCompareDefects(t *testing.T, base string, p *proxyProc, ns, chainNS string, now time.Time) {
+func testPanelCompareDefects(t *testing.T, base string, p *proxyProc, ns, chainNS, parseNS string, now time.Time) {
 	sel := fmt.Sprintf(`{namespace=%q}`, ns)
 
 	// S4/S5. Grouping by the derived level made the translator inject
@@ -1214,6 +1259,32 @@ func testPanelCompareDefects(t *testing.T, base string, p *proxyProc, ns, chainN
 			assertVectorEquals(t, queryInstant(t, capped, logql, now), want)
 			assertVectorEquals(t, queryRange(t, capped, logql, now.Add(-time.Hour), now, time.Hour), want)
 		}
+	})
+
+	// Finding 2 on PR #13: -derived-level-group-by injects parser pipes of its
+	// own, and an earlier fix stripped them from the TRANSLATED query with a
+	// regex — which also removed the USER's `| json`, after which the compat
+	// layer could pick a path with different parse-failure semantics. The
+	// namespace mixes 15 well-formed JSON lines (error=5, warn=3, info=7) with 6
+	// that are not JSON at all, so the two paths cannot agree by luck.
+	//
+	// Expected values measured against grafana/loki 3.7.1 on the same shape:
+	//
+	//	| json | drop __error__, __error_details__  ->  5/3/7 plus {}=6
+	//
+	// Dropping the error LABEL does not drop the LINE — the 6 unparsed rows stay
+	// and group under no level. (`| json` with no error handling at all is a 400
+	// in Loki, and `| json | __error__=""` excludes them; see the PR notes.)
+	t.Run("user parser stage survives derived-level injection", func(t *testing.T) {
+		logql := fmt.Sprintf(
+			`sum by (level) (count_over_time({namespace=%q} | json | drop __error__, __error_details__ [1h]))`,
+			parseNS)
+		assertVectorEquals(t, queryInstant(t, p, logql, now), map[string]string{
+			"{level=error}": "5",
+			"{level=warn}":  "3",
+			"{level=info}":  "7",
+			"{}":            "6",
+		})
 	})
 
 	// S6. A Loki label backed by a fallback chain cannot be a VL group-by key:

@@ -194,7 +194,7 @@ func TestShouldUseManualRangeMetricCompat_ParserStageRate(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldUseManualRangeMetricCompat(tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep)
+			got := shouldUseManualRangeMetricCompat(tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep, false)
 			if got != tc.wantManual {
 				t.Errorf("shouldUseManualRangeMetricCompat(%q, %q, rangeEqualsStep=%v) = %v, want %v",
 					tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep, got, tc.wantManual)
@@ -964,7 +964,7 @@ func TestShouldUseManualRangeMetricCompat_WithoutSlidingWindowNowUsesManualPath(
 	// buildManualMetricLabels correctly expands _stream into all stream labels.
 	// Previously this fell back to native VL tumbling stats, producing wrong results.
 	want := true
-	got := shouldUseManualRangeMetricCompat(`app:="api"`, "rate", false /* sliding */)
+	got := shouldUseManualRangeMetricCompat(`app:="api"`, "rate", false /* sliding */, false)
 	if got != want {
 		t.Errorf("sliding-window without() should use manual path, got %v", got)
 	}
@@ -1048,7 +1048,7 @@ func TestShouldUseManualRangeMetricCompat_ParserStageGuardRemoved(t *testing.T) 
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldUseManualRangeMetricCompat(tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep)
+			got := shouldUseManualRangeMetricCompat(tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep, false)
 			if got != tc.wantManual {
 				t.Errorf("shouldUseManualRangeMetricCompat(%q, %q, rangeEqualsStep=%v) = %v, want %v",
 					tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep, got, tc.wantManual)
