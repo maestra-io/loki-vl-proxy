@@ -9,7 +9,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=${VERSION} -X main.revision=${REVISION} -X main.buildTime=${BUILD_TIME}" -o /loki-vl-proxy ./cmd/proxy && \
     CGO_ENABLED=0 go build -ldflags="-s -w" -o /healthcheck ./cmd/healthcheck
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=builder /loki-vl-proxy /usr/local/bin/loki-vl-proxy
 COPY --from=builder /healthcheck /usr/local/bin/healthcheck
 USER nonroot
