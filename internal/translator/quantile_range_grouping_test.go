@@ -113,3 +113,81 @@ func TestRangeGroupingParityAcrossUnwrapFuncs(t *testing.T) {
 		t.Errorf("quantile_over_time got %s, want it to contain %q", got, want)
 	}
 }
+
+// TestOuterAggregationOverRangeGroupingKeepsBoth locks the two-clause case:
+// `sum by (app) (quantile_over_time(...) by (namespace))` carries an inner
+// range grouping AND an outer aggregation grouping. Both must survive.
+//
+// A single stats stage can only hold one of them, so the outer clause used to
+// be dropped silently — the query returned per-namespace quantiles with no
+// sum applied, which is a plausible-looking wrong answer rather than an error.
+// The inner grouping owns the first stage; the outer aggregation gets its own.
+func TestOuterAggregationOverRangeGroupingKeepsBoth(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "sum by over quantile with range grouping",
+			in:   `sum by (app) (quantile_over_time(0.95, {ns="a"} | json | unwrap D [5m]) by (namespace))`,
+			want: `ns:="a" | unpack_json | stats by (namespace) quantile(0.95, D) as __lvp_inner | stats by (app) sum(__lvp_inner)`,
+		},
+		{
+			// The same defect lived in the generic unwrap path, not just in
+			// quantile_over_time's own translator.
+			name: "sum by over max_over_time with range grouping",
+			in:   `sum by (app) (max_over_time({ns="a"} | json | unwrap D [5m]) by (namespace))`,
+			want: `ns:="a" | unpack_json | stats by (namespace) max(D) as __lvp_inner | stats by (app) sum(__lvp_inner)`,
+		},
+		{
+			name: "max by over avg_over_time with range grouping",
+			in:   `max by (app) (avg_over_time({ns="a"} | json | unwrap D [5m]) by (namespace))`,
+			want: `ns:="a" | unpack_json | stats by (namespace) avg(D) as __lvp_inner | stats by (app) max(__lvp_inner)`,
+		},
+		{
+			name: "multi-label outer grouping",
+			in:   `sum by (app, container) (quantile_over_time(0.5, {ns="a"} | json | unwrap D [5m]) by (namespace))`,
+			want: `ns:="a" | unpack_json | stats by (namespace) quantile(0.5, D) as __lvp_inner | stats by (app, container) sum(__lvp_inner)`,
+		},
+		{
+			name: "multi-label inner grouping",
+			in:   `sum by (app) (quantile_over_time(0.5, {ns="a"} | json | unwrap D [5m]) by (namespace, pod))`,
+			want: `ns:="a" | unpack_json | stats by (namespace, pod) quantile(0.5, D) as __lvp_inner | stats by (app) sum(__lvp_inner)`,
+		},
+		// --- shapes that must NOT change -----------------------------------
+		{
+			// Outer aggregation with NO range grouping still collapses into a
+			// single stage; adding a second one here would be a regression.
+			name: "outer by without range grouping stays single-stage",
+			in:   `sum by (app) (quantile_over_time(0.95, {ns="a"} | json | unwrap D [5m]))`,
+			want: `ns:="a" | unpack_json | stats by (app) quantile(0.95, D)`,
+		},
+		{
+			name: "bare outer aggregation over range grouping stays ungrouped",
+			in:   `sum(quantile_over_time(0.95, {ns="a"} | json | unwrap D [5m]) by (namespace))`,
+			want: `ns:="a" | unpack_json | stats by (namespace) quantile(0.95, D) as __lvp_inner | stats sum(__lvp_inner)`,
+		},
+		{
+			name: "range grouping with no outer aggregation stays single-stage",
+			in:   `quantile_over_time(0.95, {ns="a"} | json | unwrap D [5m]) by (namespace)`,
+			want: `ns:="a" | unpack_json | stats by (namespace) quantile(0.95, D)`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := TranslateLogQL(tc.in)
+			if err != nil {
+				t.Fatalf("TranslateLogQL(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("TranslateLogQL(%q)\n got: %s\nwant: %s", tc.in, got, tc.want)
+			}
+			// Whatever the shape, neither clause may vanish.
+			if !strings.Contains(got, "by (namespace") && strings.Contains(tc.in, "by (namespace") {
+				t.Errorf("inner range grouping dropped: %s", got)
+			}
+		})
+	}
+}

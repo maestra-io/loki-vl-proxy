@@ -331,6 +331,12 @@ func parseOriginalByLabels(logql string) []string {
 }
 
 func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
+	// A genuine two-stage aggregation (inner range grouping + outer aggregation)
+	// is not expressible in this layer's single-fold model — see
+	// isMultiStageStatsQuery. Let VictoriaLogs run both stages.
+	if isMultiStageStatsQuery(logsqlQuery) {
+		return false
+	}
 	// Queries containing | math are multi-stage VL rate pipelines built by the translator
 	// (e.g. sum(rate({...} | json [w]))). For non-sliding windows (range == step), VL can
 	// execute them natively — no manual decomposition needed. For sliding windows (range >
@@ -405,7 +411,33 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 	return p.proxyManualRangeMetricRange(w, r, spec, origSpec, manualFunc)
 }
 
+// isMultiStageStatsQuery reports whether the translated LogsQL aggregates TWICE
+// — an inner `| stats by (...) <fn>() as __lvp_inner` feeding an outer
+// `| stats [by (...)] <fn>(__lvp_inner)`.
+//
+// The stats-compat layer models ONE aggregation: it reads raw rows and folds
+// them with a single function, and parseStatsCompatSpec takes its grouping from
+// the FIRST stats stage. On a two-stage query that silently returns the INNER
+// result, relabelled with the OUTER query's by() names — e.g.
+// `sum by (container) (max_over_time(... ) by (namespace))` came back as
+// {container="<namespace value>"} carrying the per-namespace max, with the sum
+// never applied. VictoriaLogs executes both stages correctly on its own, so
+// these queries must fall through to the native stats path.
+//
+// Rate pipelines are the deliberate exception: the translator builds them as
+// `stats … as __lvp_inner | math … | stats …`, and the manual path implements
+// their per-step accumulation on purpose. They are identified by `| math `.
+func isMultiStageStatsQuery(logsqlQuery string) bool {
+	if strings.Contains(logsqlQuery, "| math ") {
+		return false
+	}
+	return strings.Count(logsqlQuery, "| stats ") >= 2
+}
+
 func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
+	if isMultiStageStatsQuery(logsqlQuery) {
+		return false
+	}
 	spec, ok := parseStatsCompatSpec(logsqlQuery)
 	if !ok {
 		return false

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An outer aggregation over a range grouping dropped one of the two clauses.**
+  `sum by (app) (quantile_over_time(...) by (namespace))` carries an inner range
+  grouping AND an outer grouping; a single LogsQL stats stage holds only one, so
+  the outer `sum by (app)` was discarded and the query returned per-namespace
+  quantiles with no sum applied — a plausible-looking wrong number, not an
+  error. The inner grouping now keeps the first stage and the outer aggregation
+  gets its own (`| stats by (app) sum(__lvp_inner)`). The same defect was in the
+  generic unwrap path (`max_over_time`, `avg_over_time`, `stdvar_over_time`),
+  not only in `quantile_over_time`.
+- **The stats-compat layer served the INNER result for two-stage aggregations.**
+  It models one fold and read its grouping from the FIRST stats stage, so
+  `sum by (container) (max_over_time(...) by (namespace))` came back as
+  `{container="<namespace value>"}` holding the per-namespace max — the outer
+  sum never ran, and the label was the inner one renamed. `sum(... by (ns))` was
+  already wrong this way before the change above. Genuine two-stage
+  aggregations now fall through to VictoriaLogs, which executes both stages
+  correctly; `| math` rate pipelines keep their existing manual handling.
 - **`count_values()` stays rejected with 400 — it is not a LogQL operator.** An
   earlier revision of this branch implemented it as a post-aggregation; real
   Loki 3.7.1 answers `parse error at line 1, col 1: syntax error: unexpected

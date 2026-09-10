@@ -805,6 +805,62 @@ func testInstantGrouping(t *testing.T, p *proxyProc, ns, slowNS string, now time
 		}
 	})
 
+	// An outer aggregation OVER a range grouping carries two clauses; a single
+	// stats stage can hold only one, and the outer one used to be dropped —
+	// yielding per-namespace quantiles with no sum applied, which looks like a
+	// real answer. Assert the numbers, not just the shape.
+	t.Run("outer sum by over range grouping applies both", func(t *testing.T) {
+		// Establish the inner stage's own answer first: one max per namespace.
+		// Every assertion below is stated against these measured values rather
+		// than against constants, so the fixture and the test cannot drift.
+		inner := queryInstant(t, p,
+			`max_over_time(`+bothNS+` | json | unwrap Duration [1h]) by (namespace)`, now)
+		perNS := map[string]float64{}
+		for _, s := range inner.Data.Result {
+			perNS[s.Metric["namespace"]] = seriesValue(t, s)
+		}
+		if len(perNS) != 2 {
+			t.Fatalf("inner query returned %d namespaces, want 2: %v", len(perNS), perNS)
+		}
+
+		outer := queryInstant(t, p,
+			`sum by (namespace) (max_over_time(`+bothNS+` | json | unwrap Duration [1h]) by (namespace))`, now)
+
+		// Summing by the SAME label the inner stage grouped by is the identity,
+		// so every namespace must come back with its inner value intact. If the
+		// outer clause were dropped the result would coincidentally match here,
+		// which is why the label-set assertion below carries the weight.
+		assertGroupedBy(t, outer, []string{"namespace"}, map[string]bool{ns: true, slowNS: true})
+		for _, s := range outer.Data.Result {
+			nsName := s.Metric["namespace"]
+			if got, want := seriesValue(t, s), perNS[nsName]; got != want {
+				t.Errorf("sum by (namespace) over %s = %v, want %v", nsName, got, want)
+			}
+		}
+
+		// Collapsing to a DIFFERENT grouping proves the outer stage really ran:
+		// summing across both namespaces must total their inner values, and the
+		// namespace label must be gone.
+		collapsed := queryInstant(t, p,
+			`sum by (container) (max_over_time(`+bothNS+` | json | unwrap Duration [1h]) by (namespace))`, now)
+		if len(collapsed.Data.Result) != 1 {
+			t.Fatalf("sum by (container) returned %d series, want 1: %s",
+				len(collapsed.Data.Result), describeSeries(collapsed))
+		}
+		got := seriesValue(t, collapsed.Data.Result[0])
+		want := 0.0
+		for _, v := range perNS {
+			want += v
+		}
+		if got != want {
+			t.Errorf("sum by (container) = %v, want %v (sum of %v)", got, want, perNS)
+		}
+		if _, leaked := collapsed.Data.Result[0].Metric["namespace"]; leaked {
+			t.Errorf("outer grouping did not replace the inner one: %v",
+				collapsed.Data.Result[0].Metric)
+		}
+	})
+
 	t.Run("max_over_time by namespace stays grouped", func(t *testing.T) {
 		logql := `max_over_time(` + bothNS + ` | json | unwrap Duration [1h]) by (namespace)`
 		assertGroupedBy(t, queryInstant(t, p, logql, now), []string{"namespace"},

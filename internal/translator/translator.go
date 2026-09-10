@@ -1808,12 +1808,23 @@ func tryTranslateMetricQueryM(logql string, labelFn LabelTranslateFunc, mapping 
 			statsExpr := logsqlFunc + "(" + unwrapField + ")"
 			innerBy := unwrapInnerGrouping(query, byLabels, outerAgg, labelFn, rangeByExplicit, rangeByLabels)
 
+			// An explicit range grouping owns the inner stats stage, so an outer
+			// aggregation needs a stage of its own — otherwise one of the two
+			// groupings is silently dropped. Without a range grouping the outer
+			// labels still collapse into the single inner stage, as before.
+			outerBy := ""
+			twoStage := outerAgg != "" && byLabels == ""
+			if outerAgg != "" && byLabels != "" && rangeByExplicit {
+				twoStage = true
+				outerBy = normalizeByLabels(byLabels, labelFn)
+			}
+
 			// stdvar_over_time uses stddev + square, since VL doesn't have stdvar().
 			if funcName == "stdvar_over_time" {
-				if outerAgg != "" && byLabels == "" {
+				if twoStage {
 					innerAliased := buildStatsQuery(logsqlQuery, statsExpr, innerBy, "__lvp_inner")
 					withVariance := innerAliased + " " + logsql.PipeMath{Alias: "__lvp_inner_var", Expr: "__lvp_inner*__lvp_inner"}.String()
-					if outerResult, ok := applyOuterAggregation(withVariance, outerAgg, "__lvp_inner_var"); ok {
+					if outerResult, ok := applyOuterAggregation(withVariance, outerAgg, "__lvp_inner_var", outerBy); ok {
 						return outerResult, true
 					}
 				}
@@ -1821,10 +1832,13 @@ func tryTranslateMetricQueryM(logql string, labelFn LabelTranslateFunc, mapping 
 				return fmt.Sprintf("%s^:%s|||2", BinaryMetricPrefix, baseStddev), true
 			}
 
-			if outerAgg != "" && byLabels == "" {
+			if twoStage {
 				innerAliased := buildStatsQuery(logsqlQuery, statsExpr, innerBy, "__lvp_inner")
-				if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner"); ok {
+				if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner", outerBy); ok {
 					result = outerResult
+					// The outer grouping is already on its own stage; the trailing
+					// addByClause below would re-insert it into the INNER stage.
+					unwrapByLabelsEmbedded = true
 				} else {
 					result = buildStatsQuery(logsqlQuery, statsExpr, innerBy, "")
 				}
@@ -1858,7 +1872,7 @@ func tryTranslateMetricQueryM(logql string, labelFn LabelTranslateFunc, mapping 
 		if translatedInner, ok := tryTranslateMetricQueryM(innerExpr, labelFn, mapping); ok && translatedInner != "" {
 			// Alias the last stats result so the outer aggregation can reference it.
 			innerAliased := translatedInner + " as __lvp_inner"
-			if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner"); ok {
+			if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner", ""); ok {
 				if isGroup {
 					return outerResult + groupMarker, true
 				}
@@ -1893,7 +1907,7 @@ func buildRateLikeQuery(logsqlQuery, originalQuery, statsExpr, duration, outerAg
 	withRate := innerAliased + " " + logsql.PipeMath{Alias: "__lvp_rate", Expr: "__lvp_inner/" + strconv.FormatFloat(seconds, 'f', -1, 64)}.String()
 
 	if outerAgg != "" && byLabels == "" {
-		if outerResult, ok := applyOuterAggregation(withRate, outerAgg, "__lvp_rate"); ok {
+		if outerResult, ok := applyOuterAggregation(withRate, outerAgg, "__lvp_rate", ""); ok {
 			return outerResult, true
 		}
 	}
@@ -1954,7 +1968,16 @@ func outerAggregationStatsFn(outerAgg string) (statsFn string, pow2 bool) {
 	}
 }
 
-func applyOuterAggregation(baseQuery, outerAgg, field string) (string, bool) {
+// applyOuterAggregation appends the outer aggregation as a SECOND stats stage
+// over an already-aggregated inner result.
+//
+// outerBy carries the outer aggregation's own grouping labels (already
+// translated), and must be passed whenever the inner stage consumed a DIFFERENT
+// grouping — e.g. `sum by (app) (quantile_over_time(...) by (namespace))`. The
+// inner stage groups by namespace, so the outer `by (app)` has nowhere to live
+// except its own stage; folding both into one stats clause silently drops one
+// of them. Empty outerBy emits an ungrouped stage, as `sum(...)` requires.
+func applyOuterAggregation(baseQuery, outerAgg, field, outerBy string) (string, bool) {
 	statsFn, pow2 := outerAggregationStatsFn(outerAgg)
 	if statsFn == "" {
 		return "", false
@@ -1966,6 +1989,11 @@ func applyOuterAggregation(baseQuery, outerAgg, field string) (string, bool) {
 		rawFunc = statsFn + "(" + field + ")"
 	}
 	pipe := logsql.PipeStats{Funcs: []logsql.StatsFuncAlias{{Func: logsql.DeferredExpr{Raw: rawFunc}}}}
+	for _, label := range strings.Split(outerBy, ",") {
+		if label = strings.TrimSpace(label); label != "" {
+			pipe.By = append(pipe.By, logsql.GroupKey{Field: label})
+		}
+	}
 	result := baseQuery + " " + pipe.String()
 	if pow2 {
 		result = fmt.Sprintf("%s^:%s|||2", BinaryMetricPrefix, result)
@@ -2494,9 +2522,18 @@ func tryTranslateQuantileOverTimeM(innerExpr, outerAgg, byLabels string, labelFn
 	statsExpr := "quantile(" + phi + ", " + unwrapField + ")"
 	innerBy := unwrapInnerGrouping(query, byLabels, outerAgg, labelFn, rangeByExplicit, rangeByLabels)
 
-	if outerAgg != "" && byLabels == "" {
+	// Same two-stage rule as the generic unwrap path above: an explicit range
+	// grouping owns the inner stage, so an outer aggregation gets its own.
+	outerBy := ""
+	twoStage := outerAgg != "" && byLabels == ""
+	if outerAgg != "" && byLabels != "" && rangeByExplicit {
+		twoStage = true
+		outerBy = normalizeByLabels(byLabels, labelFn)
+	}
+
+	if twoStage {
 		innerAliased := buildStatsQuery(logsqlQuery, statsExpr, innerBy, "__lvp_inner")
-		if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner"); ok {
+		if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner", outerBy); ok {
 			return outerResult, true
 		}
 	}
