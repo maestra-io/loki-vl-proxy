@@ -439,7 +439,144 @@ func applyMatrixStddevAgg(body []byte, funcName string) []byte {
 
 // applyMatrixSortTopkAgg applies topk/bottomk/sort to a matrix (query_range) result.
 // It ranks series by their last value and trims to the requested K.
+// applyMatrixTopkPerTimestamp implements topk/bottomk over a matrix the way Loki
+// does: the selection is made INDEPENDENTLY AT EACH TIMESTAMP.
+//
+// Ranking once by each series' last value and trimming globally — as the shared
+// sort path does — returns exactly k series for the whole range, so a series
+// that was in the top k earlier in the window disappears entirely. Loki returns
+// the union across steps (10 series for a topk(5) over a busy range), with each
+// series carrying samples only at the steps where it made the cut.
+func applyMatrixTopkPerTimestamp(body []byte, postAgg instantMetricPostAgg) []byte {
+	var resp struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string `json:"resultType"`
+			Result     []struct {
+				Metric map[string]interface{} `json:"metric"`
+				Values [][]interface{}        `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Status != "success" || resp.Data.ResultType != "matrix" {
+		return body
+	}
+
+	k := postAgg.k
+	const maxTopK = 10000
+	if k <= 0 {
+		return body
+	}
+	if k > maxTopK {
+		k = maxTopK
+	}
+
+	type sample struct {
+		series int
+		value  float64
+		raw    interface{}
+	}
+	perTS := make(map[float64][]sample)
+	var tsOrder []float64
+	seenTS := make(map[float64]struct{})
+
+	for si, s := range resp.Data.Result {
+		for _, v := range s.Values {
+			if len(v) < 2 {
+				continue
+			}
+			ts, err := parseFloat(v[0])
+			if err != nil {
+				continue
+			}
+			val, err := parseFloat(v[1])
+			if err != nil {
+				continue
+			}
+			if _, ok := seenTS[ts]; !ok {
+				seenTS[ts] = struct{}{}
+				tsOrder = append(tsOrder, ts)
+			}
+			perTS[ts] = append(perTS[ts], sample{series: si, value: val, raw: v[1]})
+		}
+	}
+	sort.Float64s(tsOrder)
+
+	ascending := postAgg.name == "bottomk"
+	kept := make([][][]interface{}, len(resp.Data.Result))
+	for _, ts := range tsOrder {
+		bucket := perTS[ts]
+		sort.SliceStable(bucket, func(i, j int) bool {
+			if bucket[i].value == bucket[j].value {
+				// Stable tie-break by original series order, so equal values do
+				// not reshuffle between steps.
+				return bucket[i].series < bucket[j].series
+			}
+			if ascending {
+				return bucket[i].value < bucket[j].value
+			}
+			return bucket[i].value > bucket[j].value
+		})
+		n := k
+		if n > len(bucket) {
+			n = len(bucket)
+		}
+		for _, sm := range bucket[:n] {
+			kept[sm.series] = append(kept[sm.series], []interface{}{ts, sm.raw})
+		}
+	}
+
+	// Membership is per-timestamp; the ORDER of the surviving series is not
+	// semantically meaningful, but ranking them keeps the response readable and
+	// preserves the ordering callers already relied on.
+	type survivor struct {
+		idx  int
+		rank float64
+	}
+	survivors := make([]survivor, 0, len(resp.Data.Result))
+	for si := range resp.Data.Result {
+		if len(kept[si]) == 0 {
+			continue
+		}
+		last := kept[si][len(kept[si])-1]
+		v, _ := parseFloat(last[1])
+		survivors = append(survivors, survivor{idx: si, rank: v})
+	}
+	sort.SliceStable(survivors, func(i, j int) bool {
+		if survivors[i].rank == survivors[j].rank {
+			return survivors[i].idx < survivors[j].idx
+		}
+		if ascending {
+			return survivors[i].rank < survivors[j].rank
+		}
+		return survivors[i].rank > survivors[j].rank
+	})
+
+	result := make([]map[string]interface{}, 0, len(survivors))
+	for _, sv := range survivors {
+		result = append(result, map[string]interface{}{
+			"metric": resp.Data.Result[sv.idx].Metric,
+			"values": kept[sv.idx],
+		})
+	}
+
+	out, err := json.Marshal(map[string]interface{}{
+		"status": "success",
+		"data": map[string]interface{}{
+			"resultType": "matrix",
+			"result":     result,
+		},
+	})
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 func applyMatrixSortTopkAgg(body []byte, postAgg instantMetricPostAgg) []byte {
+	if postAgg.name == "topk" || postAgg.name == "bottomk" {
+		return applyMatrixTopkPerTimestamp(body, postAgg)
+	}
 	var resp struct {
 		Status string `json:"status"`
 		Data   struct {

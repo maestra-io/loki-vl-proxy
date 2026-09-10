@@ -368,6 +368,10 @@ func TestCollectRangeMetric_LargeResponse_SingleStream(t *testing.T) {
 	defer vlBackend.Close()
 
 	p := newGapTestProxy(t, vlBackend.URL)
+	// This test deliberately exercises the large-response path. The default
+	// raw-row cap is 10_000 and a scan that REACHES it is reported as
+	// incomplete, so raise it here — the subject is streaming, not the cap.
+	p.rangeMetricRowLimit = lineCount * 2
 	params := url.Values{}
 	params.Set("query", `rate({app="api"}[2m])`)
 	params.Set("start", strconv.FormatInt(base.Unix(), 10))

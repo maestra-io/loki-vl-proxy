@@ -47,7 +47,13 @@ func normalizeObservedRoute(route string) string {
 	return route
 }
 
-func (p *Proxy) recordUpstreamObservation(ctx context.Context, system, method, route, serverAddress string, serverPort int, statusCode int, duration time.Duration, err error) {
+// recordUpstreamObservation logs one upstream call. backendQuery is optional and
+// is included ONLY on a failed call: when VictoriaLogs rejects a query, the
+// translated LogsQL is the single most useful fact for triage and it appears
+// nowhere else in the logs at info level. Without it, a 400/502 from VL is a
+// dead end — which is exactly what happened while triaging the 10.09.2026
+// level-materialisation failures.
+func (p *Proxy) recordUpstreamObservation(ctx context.Context, system, method, route, serverAddress string, serverPort int, statusCode int, duration time.Duration, err error, backendQuery ...string) {
 	meta := requestRouteMetaFromContext(ctx)
 	requestType := deriveUpstreamRequestType(route)
 	observedRoute := normalizeObservedRoute(route)
@@ -98,6 +104,14 @@ func (p *Proxy) recordUpstreamObservation(ctx context.Context, system, method, r
 			"error.type", "transport",
 			"error.message", err.Error(),
 		)
+	}
+	// The query is the point of this log line on a failure. It is redacted the
+	// same way every other query log is, so -debug-log-raw-queries still governs
+	// whether the literal text is written.
+	if (err != nil || statusCode >= http.StatusBadRequest) && len(backendQuery) > 0 {
+		if q := strings.TrimSpace(backendQuery[0]); q != "" {
+			logAttrs = append(logAttrs, "logsql.query", redactQuery(q, p.debugLogRawQueries))
+		}
 	}
 	p.log.Log(ctx, level, "upstream_request", logAttrs...)
 }
@@ -597,7 +611,7 @@ func (p *Proxy) vlGetInner(ctx context.Context, path string, params url.Values) 
 	if err != nil {
 		err = p.sanitizeUpstreamError(err)
 		mappedStatus := statusFromUpstreamErr(err)
-		p.recordUpstreamObservation(ctx, "vl", http.MethodGet, path, u.Hostname(), serverPort, mappedStatus, duration, err)
+		p.recordUpstreamObservation(ctx, "vl", http.MethodGet, path, u.Hostname(), serverPort, mappedStatus, duration, err, params.Get("query"))
 		if shouldRecordBreakerFailure(err) {
 			p.breaker.RecordFailure()
 		}
@@ -606,10 +620,10 @@ func (p *Proxy) vlGetInner(ctx context.Context, path string, params url.Values) 
 	p.observeBackendVersionFromHeaders(resp.Header)
 	if err := decodeCompressedHTTPResponse(resp); err != nil {
 		_ = resp.Body.Close()
-		p.recordUpstreamObservation(ctx, "vl", http.MethodGet, path, u.Hostname(), serverPort, http.StatusBadGateway, duration, err)
+		p.recordUpstreamObservation(ctx, "vl", http.MethodGet, path, u.Hostname(), serverPort, http.StatusBadGateway, duration, err, params.Get("query"))
 		return nil, fmt.Errorf("decode backend response: %w", err)
 	}
-	p.recordUpstreamObservation(ctx, "vl", http.MethodGet, path, u.Hostname(), serverPort, resp.StatusCode, duration, nil)
+	p.recordUpstreamObservation(ctx, "vl", http.MethodGet, path, u.Hostname(), serverPort, resp.StatusCode, duration, nil, params.Get("query"))
 	// Any completed HTTP response proves backend reachability; keep breaker for transport failures only.
 	p.breaker.RecordSuccess()
 	return resp, nil
@@ -677,16 +691,16 @@ func (p *Proxy) vlPostHTTP(ctx context.Context, path string, params url.Values) 
 	if err != nil {
 		err = p.sanitizeUpstreamError(err)
 		mappedStatus := statusFromUpstreamErr(err)
-		p.recordUpstreamObservation(ctx, "vl", http.MethodPost, path, u.Hostname(), serverPort, mappedStatus, duration, err)
+		p.recordUpstreamObservation(ctx, "vl", http.MethodPost, path, u.Hostname(), serverPort, mappedStatus, duration, err, params.Get("query"))
 		return nil, err
 	}
 	p.observeBackendVersionFromHeaders(resp.Header)
 	if err := decodeCompressedHTTPResponse(resp); err != nil {
 		_ = resp.Body.Close()
-		p.recordUpstreamObservation(ctx, "vl", http.MethodPost, path, u.Hostname(), serverPort, http.StatusBadGateway, duration, err)
+		p.recordUpstreamObservation(ctx, "vl", http.MethodPost, path, u.Hostname(), serverPort, http.StatusBadGateway, duration, err, params.Get("query"))
 		return nil, fmt.Errorf("decode backend response: %w", err)
 	}
-	p.recordUpstreamObservation(ctx, "vl", http.MethodPost, path, u.Hostname(), serverPort, resp.StatusCode, duration, nil)
+	p.recordUpstreamObservation(ctx, "vl", http.MethodPost, path, u.Hostname(), serverPort, resp.StatusCode, duration, nil, params.Get("query"))
 	return resp, nil
 }
 

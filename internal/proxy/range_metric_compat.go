@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -26,6 +27,18 @@ type statsCompatSpec struct {
 	ByExplicit  bool     // true when "by ()" was present — aggregate all into one series
 	Func        string
 	Field       string
+
+	// UserParserStages records whether the CLIENT's LogQL carried a parser stage
+	// (| json, | logfmt, | pattern, | regexp, | unpack). It is read from the
+	// original query, never sniffed out of the translated LogsQL: the translator
+	// injects parser pipes of its own for -derived-level-group-by, and those are
+	// indistinguishable from the user's once the query is a string.
+	//
+	// The distinction decides whether Loki's "parse-failed lines are excluded
+	// from the aggregation" semantics apply — which only a user's parser can
+	// trigger — so getting it wrong either returns rows Loki would drop or
+	// forces a raw-row scan that need not happen.
+	UserParserStages bool
 }
 
 type originalRangeMetricSpec struct {
@@ -361,7 +374,7 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 	// coincide only while range <= step. Beyond that the native result is wrong,
 	// and evaluating a sliding TWO-stage fold is not something this layer can do
 	// (it folds once, per series). Refuse rather than return a plausible number.
-	if isMultiStageStatsQuery(logsqlQuery) {
+	if isMultiStageStatsQuery(logsqlQuery) && rangeAggregationHasOwnGrouping(originalLogql) {
 		return p.rejectMultiStageSlidingRange(w, r, originalLogql)
 	}
 	// Queries containing | math are multi-stage VL rate pipelines built by the translator
@@ -378,12 +391,13 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 		origSpec, hasOrigSpec := parseOriginalRangeMetricSpec(originalLogql)
 		if stepOk && hasOrigSpec && origSpec.Window > 0 && origSpec.Window <= step {
 			spec, specOk := parseStatsCompatSpec(logsqlQuery)
+			spec.UserParserStages = logqlUsesParserStage(originalLogql)
 			// Parser stages without an explicit drop-error opt-in require the manual path
 			// to preserve Loki's error-exclusion semantics. Use origSpec.BaseQuery (the inner
 			// LogQL stream selector + pipeline without the range window) for the drop-error
 			// check — hasDropErrorOnlyPostParserStage requires the pipeline without outer
 			// aggregation or range window brackets.
-			if !specOk || !queryUsesParserStages(spec.BaseQuery) || hasDropErrorOnlyPostParserStage(origSpec.BaseQuery) {
+			if !specOk || !spec.UserParserStages || hasDropErrorOnlyPostParserStage(origSpec.BaseQuery) {
 				return false
 			}
 			// Parser stage without drop-error — fall through to the manual path below.
@@ -393,6 +407,7 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 	if !ok {
 		return false
 	}
+	spec.UserParserStages = logqlUsesParserStage(originalLogql)
 	if !isManualRangeStatsFunc(spec.Func) {
 		return false
 	}
@@ -415,10 +430,10 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 	// VL's count-all semantics (parse failures counted). Use origSpec.BaseQuery — the inner
 	// pipeline without outer aggregation or range brackets — so hasDropErrorOnlyPostParserStage
 	// can correctly identify the drop-error clause.
-	if noSlidingOverlap && queryUsesParserStages(spec.BaseQuery) && hasOrigSpec && hasDropErrorOnlyPostParserStage(origSpec.BaseQuery) {
+	if noSlidingOverlap && spec.UserParserStages && hasOrigSpec && hasDropErrorOnlyPostParserStage(origSpec.BaseQuery) {
 		return false
 	}
-	if !shouldUseManualRangeMetricCompat(spec.BaseQuery, manualFunc, noSlidingOverlap) {
+	if !shouldUseManualRangeMetricCompat(spec.BaseQuery, manualFunc, noSlidingOverlap, spec.UserParserStages) {
 		return false
 	}
 	if !hasOrigSpec || origSpec.Window <= 0 {
@@ -454,6 +469,33 @@ func (p *Proxy) handleStatsCompatRange(w http.ResponseWriter, r *http.Request, o
 // Rate pipelines are the deliberate exception: the translator builds them as
 // `stats … as __lvp_inner | math … | stats …`, and the manual path implements
 // their per-step accumulation on purpose. They are identified by `| math `.
+// rangeAggregationHasOwnGrouping reports whether the RANGE aggregation carries
+// its own `by (...)` / `without (...)` clause, as in
+// `sum by (app) (max_over_time({...}[5m]) by (ns))`.
+//
+// That is the only shape the two-stage translation introduces. An outer
+// aggregation over an UNGROUPED range aggregation — `max(quantile_over_time(…))`
+// — has also always produced two stats stages, but the compat layer has handled
+// it correctly for far longer, so it must not be diverted.
+func rangeAggregationHasOwnGrouping(logql string) bool {
+	logql = strings.TrimSpace(stripOuterLabelReplace(logql))
+	loc := outerAggregationRE.FindStringIndex(logql)
+	if loc == nil || loc[0] != 0 || loc[1] >= len(logql) {
+		// No outer aggregation: a trailing clause here belongs to the range
+		// aggregation itself, which is a single stage.
+		return false
+	}
+	inner := strings.TrimSpace(logql[loc[1]:])
+	if !strings.HasPrefix(inner, "(") || !strings.HasSuffix(inner, ")") {
+		return false
+	}
+	inner = strings.TrimSpace(inner[1 : len(inner)-1])
+	return outerByAfterRE.MatchString(inner) || rangeWithoutAfterRE.MatchString(inner)
+}
+
+// rangeWithoutAfterRE is outerByAfterRE's `without (...)` twin.
+var rangeWithoutAfterRE = regexp.MustCompile(`\)\s+without\s*\(([^)]*)\)\s*$`)
+
 func isMultiStageStatsQuery(logsqlQuery string) bool {
 	// Count PIPE stages only. A line filter carrying the literal text — e.g.
 	// `{...} |= "| stats "`, translated to `~"| stats "` — is data, not a stage,
@@ -468,13 +510,14 @@ func isMultiStageStatsQuery(logsqlQuery string) bool {
 }
 
 func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request, originalLogql, logsqlQuery string) bool {
-	if isMultiStageStatsQuery(logsqlQuery) {
+	if isMultiStageStatsQuery(logsqlQuery) && rangeAggregationHasOwnGrouping(originalLogql) {
 		return false
 	}
 	spec, ok := parseStatsCompatSpec(logsqlQuery)
 	if !ok {
 		return false
 	}
+	spec.UserParserStages = logqlUsesParserStage(originalLogql)
 	if !isManualRangeStatsFunc(spec.Func) {
 		return false
 	}
@@ -488,7 +531,7 @@ func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request,
 	// Instant queries with parser stages and explicit drop-error: use native VL stats.
 	// VL correctly evaluates [time-range, time] for instant queries; the drop-error opt-in
 	// means parse-failed lines are intentionally excluded — count-all semantics are acceptable.
-	if queryUsesParserStages(spec.BaseQuery) && hasOrigSpec && hasDropErrorOnlyPostParserStage(origSpec.BaseQuery) {
+	if spec.UserParserStages && hasOrigSpec && hasDropErrorOnlyPostParserStage(origSpec.BaseQuery) {
 		return false
 	}
 	// Instant queries have no step: the range window is the entire lookback interval,
@@ -498,9 +541,9 @@ func (p *Proxy) handleStatsCompatInstant(w http.ResponseWriter, r *http.Request,
 	// so that bare outer aggregations (sum without by()) correctly collapse all streams into
 	// one series via ByExplicit=true. Native VL stats returns per-stream series for such
 	// queries; the manual path aggregates them into the expected single series.
-	if queryUsesParserStages(spec.BaseQuery) {
+	if spec.UserParserStages {
 		// Parser+no-drop-error → always manual for correct stream-collapse semantics.
-	} else if !shouldUseManualRangeMetricCompat(spec.BaseQuery, manualFunc, true) {
+	} else if !shouldUseManualRangeMetricCompat(spec.BaseQuery, manualFunc, true, spec.UserParserStages) {
 		return false
 	}
 	if !hasOrigSpec || origSpec.Window <= 0 {
@@ -578,7 +621,7 @@ func parseTopKWrapper(logql string) (k int, descending bool, ok bool) {
 // step. When true, VL's native rate() — which buckets by the step interval —
 // is semantically identical to LogQL rate()[range]. Pass false to keep the
 // sliding-window manual path for cases where range != step.
-func shouldUseManualRangeMetricCompat(baseQuery, manualFunc string, rangeEqualsStep bool) bool {
+func shouldUseManualRangeMetricCompat(baseQuery, manualFunc string, rangeEqualsStep, userParserStages bool) bool {
 	manualFunc = strings.TrimSpace(manualFunc)
 	if manualFunc == "rate_counter" {
 		return true
@@ -596,7 +639,7 @@ func shouldUseManualRangeMetricCompat(baseQuery, manualFunc string, rangeEqualsS
 		return !rangeEqualsStep
 	}
 
-	if !queryUsesParserStages(baseQuery) {
+	if !userParserStages {
 		return false
 	}
 
@@ -693,7 +736,7 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 
 	series, err := p.collectRangeMetricSamples(r.Context(), spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, field, origSpec.UnwrapConv, startTS.Add(-origSpec.Window), endTS)
 	if err != nil {
-		p.writeError(w, http.StatusBadGateway, err.Error())
+		p.writeError(w, statusForRangeMetricCollectError(err), err.Error())
 		return true
 	}
 
@@ -720,7 +763,7 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 
 	series, err := p.collectRangeMetricSamples(r.Context(), spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, field, origSpec.UnwrapConv, evalTS.Add(-origSpec.Window), evalTS)
 	if err != nil {
-		p.writeError(w, http.StatusBadGateway, err.Error())
+		p.writeError(w, statusForRangeMetricCollectError(err), err.Error())
 		return true
 	}
 
@@ -734,7 +777,7 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 // parser stages and an explicit groupBy — served from VL's stats_query_range endpoint.
 // Returns nil, false when the fast path is not applicable or VL returns an error.
 func (p *Proxy) collectStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool) {
-	if statsAggFunc == "" || queryUsesParserStages(spec.BaseQuery) {
+	if statsAggFunc == "" || spec.UserParserStages {
 		return nil, false
 	}
 	for _, g := range spec.GroupBy {
@@ -759,7 +802,7 @@ func (p *Proxy) collectStatsFastPathHits(ctx context.Context, spec statsCompatSp
 // Returns nil, false when inapplicable, on error, or when VL returns 0 series
 // (non-indexed JSON fields still need parser stages to evaluate correctly).
 func (p *Proxy) collectParserStageStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool) {
-	if statsAggFunc == "" || !queryUsesParserStages(spec.BaseQuery) || len(spec.GroupBy) == 0 {
+	if statsAggFunc == "" || !spec.UserParserStages || len(spec.GroupBy) == 0 {
 		return nil, false
 	}
 	if !strings.Contains(spec.BaseQuery, "| delete __error__") {
@@ -971,18 +1014,58 @@ type metricSeriesCacheEntry struct {
 	key          string
 }
 
+// statusForRangeMetricCollectError maps a collection failure to a status. Hitting
+// the row cap is the CLIENT's query being too broad for this path, not a backend
+// fault, so it must not read as 502 — an operator chasing a 502 looks at the
+// backend, which is healthy.
+func statusForRangeMetricCollectError(err error) int {
+	var truncated *rawRowScanTruncatedError
+	if errors.As(err, &truncated) {
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
+}
+
+// defaultManualRangeMetricRowLimit caps the raw-row scan of the manual
+// compatibility path. Lowered from 1,000,000 on 10.09.2026 — see
+// collectRangeMetricSamples for why that number was dangerous.
+const defaultManualRangeMetricRowLimit = 10_000
+
+// rawRowScanTruncatedError reports that the manual path hit its row cap, so any
+// number it could return would be short by an unknown amount.
+type rawRowScanTruncatedError struct{ limit int }
+
+func (e *rawRowScanTruncatedError) Error() string {
+	return fmt.Sprintf(
+		"query needs more than %d raw log rows to evaluate; the result would be silently incomplete. "+
+			"Narrow the time range or the stream selector, add a by(...) grouping so the aggregation runs "+
+			"in the backend, or raise -manual-range-metric-row-limit if this instance can afford the scan",
+		e.limit)
+}
+
 func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string, groupBy, origGroupBy []string, byExplicit bool, field, unwrapConv string, start, end time.Time) (map[string]manualSeriesSamples, error) {
 	params := url.Values{}
 	params.Set("query", baseQuery)
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
-	// Keep this high to avoid truncating series for compatibility stats functions.
-	// Configurable via -manual-range-metric-row-limit; default 1,000,000.
+	// This path reads RAW ROWS and folds them client-side, and VictoriaLogs
+	// executes a `limit` by sorting: the request becomes
+	// `| sort by (_time) desc limit N`. At N=1,000,000 over a busy namespace
+	// that sort is what OOM-killed both 4Gi VLSingle instances five times on
+	// 10.09.2026 — taking every other query on the cluster down with it.
+	//
+	// The limit is therefore a safety cap, not a tuning knob, and truncation is
+	// reported rather than folded into a smaller-but-plausible number: a
+	// silently short aggregate is indistinguishable from a real drop in traffic.
 	rowLimit := p.rangeMetricRowLimit
 	if rowLimit <= 0 {
-		rowLimit = 1_000_000
+		rowLimit = defaultManualRangeMetricRowLimit
 	}
-	params.Set("limit", strconv.Itoa(rowLimit))
+	// Ask for ONE MORE row than the cap allows. A response of exactly rowLimit
+	// rows is ambiguous — it can be a complete result that happens to land on
+	// the cap — so the extra row is the overflow probe: seeing it proves there
+	// was more to read, and not seeing it proves there was not.
+	params.Set("limit", strconv.Itoa(rowLimit+1))
 
 	resp, err := p.vlPost(ctx, "/select/logsql/query", params)
 	if err != nil {
@@ -1010,11 +1093,13 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 
+	rowsScanned := 0
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
 			continue
 		}
+		rowsScanned++
 
 		v, parseErr := fjp.ParseBytes(line)
 		if parseErr != nil {
@@ -1094,6 +1179,9 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
 		return nil, fmt.Errorf("scanning VL response: %w", scanErr)
+	}
+	if rowsScanned > rowLimit {
+		return nil, &rawRowScanTruncatedError{limit: rowLimit}
 	}
 
 	for key, series := range seriesMap {
@@ -1274,7 +1362,24 @@ func addGroupByParsedLabelsFJ(metricLabels map[string]string, v *fj.Value, group
 	}
 }
 
+// logqlUsesParserStage reports whether the CLIENT's LogQL carries a parser
+// stage. Quoted spans are blanked first, so a line filter such as
+// `|= "| json "` is read as data rather than as a pipeline stage.
+//
+// This is the structural counterpart to queryUsesParserStages: it looks at what
+// the client wrote, so nothing the translator injects can be mistaken for it.
+func logqlUsesParserStage(logql string) bool {
+	return logqlParserStageRE.MatchString(stripQuotedSpans(logql))
+}
+
+var logqlParserStageRE = regexp.MustCompile(`\|\s*(json|logfmt|pattern|regexp|unpack)\b`)
+
+// queryUsesParserStages reports whether a TRANSLATED query contains parser
+// pipes. It answers a question about the response's SHAPE (which fields exist),
+// not about Loki's error-exclusion semantics — for that use
+// statsCompatSpec.UserParserStages, which is derived from the client's query.
 func queryUsesParserStages(baseQuery string) bool {
+
 	// `| unpack_logfmt` exposes pre-parsed fields without transforming the
 	// log line — VL's stats_query_range handles it natively in tens of ms.
 	// Excluding it from the "parser stages" check lets queries with a

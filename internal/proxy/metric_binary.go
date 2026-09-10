@@ -2814,6 +2814,8 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 		slotResults[i] = make([]trimTranslateResult, len(s.items))
 	}
 
+	wantsRawLevelLabel := groupsByRawLevelLabel(originalQuery)
+
 	// Workspace maps reused across items (same pattern as translateStatsResponseLabelsWithContext).
 	translated := make(map[string]string, 8)
 	syntheticLabels := make(map[string]string, 8)
@@ -2895,10 +2897,19 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 			beforeSyntheticCount := len(syntheticLabels)
 			hadLevel := syntheticLabels["level"] != ""
 			ensureDetectedLevel(syntheticLabels)
-			if hadLevel && !hadStream && syntheticLabels["detected_level"] != "" {
+			// Return the label the client actually grouped by: both `level` and
+			// `detected_level` translate to VL's `level` column, so only the
+			// original query distinguishes them (same rule as the instant path).
+			if hadLevel && !hadStream && syntheticLabels["detected_level"] != "" && !wantsRawLevelLabel {
 				delete(syntheticLabels, "level")
 				delete(translated, "level")
 			}
+			if wantsRawLevelLabel && syntheticLabels["level"] != "" {
+				delete(syntheticLabels, "detected_level")
+				delete(translated, "detected_level")
+			}
+			dropEmptyDerivedLevelLabels(syntheticLabels)
+			dropEmptyDerivedLevelLabels(translated)
 			if hadStream {
 				ensureSyntheticServiceName(syntheticLabels)
 				if !serviceSignal && strings.TrimSpace(syntheticLabels["service_name"]) == unknownServiceName {

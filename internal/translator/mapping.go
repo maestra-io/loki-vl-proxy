@@ -44,6 +44,13 @@ type MappingOptions struct {
 	// DerivedLevelFields lists the VL fields that may carry a raw log level once
 	// _msg has been unpacked. Empty disables level derivation.
 	DerivedLevelFields []string
+	// MaterializeChainLabels lists Loki labels that are GROUPED BY in this query
+	// and are backed by a multi-field fallback chain. A matcher on such a label
+	// expands to an OR over the chain, but a grouping cannot: VL would group by
+	// a field literally named e.g. `app`, which does not exist, yielding
+	// {app=""}. These labels get a coalesce chain that materialises the field.
+	MaterializeChainLabels []string
+
 	// MaterializeLevel appends the unpack + coalesce + normalise pipe chain so
 	// VL exposes a real `level` field (needed for `sum by (level)`).
 	MaterializeLevel bool
@@ -258,6 +265,52 @@ func (m *MappingOptions) levelNormalizePipes() []string {
 			Regex:       levelValuePattern(canonical),
 			Replacement: canonical,
 		}.String())
+	}
+	return pipes
+}
+
+// groupingLabelFn wraps a label translation function so labels materialised by
+// chainCoalescePipes are left alone: they name a field this query creates.
+func (m *MappingOptions) groupingLabelFn(labelFn LabelTranslateFunc) LabelTranslateFunc {
+	if m == nil || len(m.MaterializeChainLabels) == 0 {
+		return labelFn
+	}
+	keep := make(map[string]struct{}, len(m.MaterializeChainLabels))
+	for _, l := range m.MaterializeChainLabels {
+		keep[l] = struct{}{}
+	}
+	return func(label string) string {
+		if _, ok := keep[label]; ok {
+			return label
+		}
+		if labelFn == nil {
+			return label
+		}
+		return labelFn(label)
+	}
+}
+
+// chainCoalescePipes materialises each grouped fallback-chain label into a real
+// VL field, so `| stats by (<label>)` has something to group on.
+//
+// Same first-non-empty-wins construction as levelNormalizePipes: VictoriaLogs
+// has no coalesce pipe, so the `| format if (<field>:*)` stages run from the
+// LOWEST priority field to the highest and each present one overwrites, leaving
+// the highest-priority present field as the value.
+func (m *MappingOptions) chainCoalescePipes() []string {
+	if m == nil || len(m.MaterializeChainLabels) == 0 {
+		return nil
+	}
+	var pipes []string
+	for _, label := range m.MaterializeChainLabels {
+		chain := m.expand(label)
+		if len(chain) < 2 {
+			continue
+		}
+		for i := len(chain) - 1; i >= 0; i-- {
+			quoted := quoteVLField(chain[i])
+			pipes = append(pipes, "| format if ("+quoted+":*) \"<"+chain[i]+">\" as "+label)
+		}
 	}
 	return pipes
 }
