@@ -3,6 +3,11 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -281,5 +286,77 @@ func TestGuardExtractedLabelShadowing_RestoresAfterTheLastParser(t *testing.T) {
 	}
 	if restore < lastParser {
 		t.Fatalf("the label is restored BEFORE the last parser stage:\n%s", got)
+	}
+}
+
+// Both operands of a binary range expression must be fetched on the CLIENT's
+// bucket grid. Without the offset VictoriaLogs answers on the epoch grid, and
+// relabelling those buckets onto a `:05` grid only renames them — the operands
+// then carry `:00–:60` contents under `:05` labels.
+func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
+	base := time.Unix(1700000700, 0).UTC() // 25 minutes past the hour — NOT step-aligned
+	const step = 3600
+
+	var gotOffsets, gotStarts []string
+	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		gotOffsets = append(gotOffsets, r.Form.Get("offset"))
+		gotStarts = append(gotStarts, r.Form.Get("start"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w,
+			`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"a"},"values":[[%d,"2"],[%d,"4"]]}]}}`,
+			base.Unix()-step, base.Unix())
+	}))
+	defer vlBackend.Close()
+
+	p := newGapTestProxy(t, vlBackend.URL)
+	params := url.Values{}
+	params.Set("query", `sum(count_over_time({app="a"}[1h])) / sum(count_over_time({app="b"}[1h]))`)
+	params.Set("start", strconv.FormatInt(base.Unix(), 10))
+	params.Set("end", strconv.FormatInt(base.Unix()+2*step, 10))
+	params.Set("step", strconv.Itoa(step))
+	rec := httptest.NewRecorder()
+	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?"+params.Encode(), nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(gotOffsets) < 2 {
+		t.Fatalf("expected both operands to be fetched, got %d upstream calls", len(gotOffsets))
+	}
+	// (start mod step) = 1500s, plus the microsecond that makes the bucket
+	// right-closed: every operand must carry it.
+	for i, off := range gotOffsets {
+		if off != "-1500.000001s" {
+			t.Fatalf("operand %d fetched without the client-grid offset: offset=%q start=%q", i, off, gotStarts[i])
+		}
+	}
+	// And both operands must open one step before the client's start.
+	for i, start := range gotStarts {
+		if want := strconv.FormatInt(base.Unix()-step, 10); start != want {
+			t.Fatalf("operand %d start = %q, want %q", i, start, want)
+		}
+	}
+
+	var resp struct {
+		Data struct {
+			Result []struct {
+				Values [][]interface{} `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data.Result) != 1 {
+		t.Fatalf("expected one combined series, got %s", rec.Body.String())
+	}
+	// The bucket labelled `base-step` is the point at `base`; the one at `base`
+	// is the point at `base+step`. Both land on the client's :25 grid.
+	for i, pt := range resp.Data.Result[0].Values {
+		ts := int64(pt[0].(float64))
+		if want := base.Unix() + int64(i)*step; ts != want {
+			t.Fatalf("point %d at %d, want %d (operands off the client grid?)", i, ts, want)
+		}
 	}
 }

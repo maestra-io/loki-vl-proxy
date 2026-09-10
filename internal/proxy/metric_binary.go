@@ -2802,9 +2802,9 @@ func trimStatsQueryRangeResponseFromStart(body []byte, startNs int64) []byte {
 // clampStatsQRToRequestWindow drops points outside the client's [start, end]
 // after the bucket-to-Loki-grid relabel: the extra step fetched below `start`
 // lands before it, and the bucket at `end` lands past it.
-func clampStatsQRToRequestWindow(body []byte, r *http.Request) []byte {
-	startNs, hasStart := parseLokiTimeToUnixNano(r.FormValue("start"))
-	endNs, hasEnd := parseLokiTimeToUnixNano(r.FormValue("end"))
+func clampStatsQRToRequestWindow(body []byte, startRaw, endRaw string) []byte {
+	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)
+	endNs, hasEnd := parseLokiTimeToUnixNano(endRaw)
 	if !hasStart && !hasEnd {
 		return body
 	}
@@ -3557,31 +3557,28 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 
 	isRange := vlEndpoint == "stats_query_range"
 
+	// One resolution of `now`/`now±d` for the whole request, and each range
+	// operand goes through the SAME builder the single-operand paths use: it
+	// carries the bucket-grid offset, without which VictoriaLogs answers on the
+	// epoch grid while fetchBinOpSide relabels the points onto the client's —
+	// with a 1h step and a `:05` start the operands would be `:00–:60` buckets
+	// wearing `:05` labels, and no relabelling can fix their contents.
+	startRaw := freezeRelativeRangeBound(r.FormValue("start"))
+	endRaw := freezeRelativeRangeBound(r.FormValue("end"))
+	stepRaw := r.FormValue("step")
+
 	buildParams := func(query string) url.Values {
-		params := url.Values{"query": {query}}
 		if isRange {
-			if s := r.FormValue("start"); s != "" {
-				// A VL bucket is labelled by its START, a LogQL point by the
-				// bucket's END: every side is relabelled one step forward in
-				// fetchBinOpSide, so the window opens one step earlier to keep a
-				// bucket behind the point at `start`.
-				params.Set("start", formatVLStatsTimestamp(shiftRangeStartOneStep(s, r.FormValue("step"))))
-			}
-			if e := r.FormValue("end"); e != "" {
-				params.Set("end", formatVLStatsTimestamp(e))
-			}
-			if step := r.FormValue("step"); step != "" {
-				params.Set("step", formatVLStep(step))
-			}
-		} else {
-			if t := r.FormValue("time"); t != "" {
-				params.Set("time", formatVLStatsTimestamp(t))
-			}
+			return p.buildLokiGridStatsParams(query, startRaw, endRaw, stepRaw)
+		}
+		params := url.Values{"query": {query}}
+		if t := r.FormValue("time"); t != "" {
+			params.Set("time", formatVLStatsTimestamp(t))
 		}
 		return params
 	}
 
-	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams)
+	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams, startRaw, stepRaw)
 	if sideErr != nil {
 		p.writeError(w, statusFromUpstreamErr(sideErr), sideErr.Error())
 		return
@@ -3603,7 +3600,7 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 	}
 
 	if isRange {
-		result = clampStatsQRToRequestWindow(result, r)
+		result = clampStatsQRToRequestWindow(result, startRaw, endRaw)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3613,32 +3610,29 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, leftQL, rightQL, vlEndpoint, resultType string) {
 	isRange := vlEndpoint == "stats_query_range"
 
+	// One resolution of `now`/`now±d` for the whole request, and each range
+	// operand goes through the SAME builder the single-operand paths use: it
+	// carries the bucket-grid offset, without which VictoriaLogs answers on the
+	// epoch grid while fetchBinOpSide relabels the points onto the client's —
+	// with a 1h step and a `:05` start the operands would be `:00–:60` buckets
+	// wearing `:05` labels, and no relabelling can fix their contents.
+	startRaw := freezeRelativeRangeBound(r.FormValue("start"))
+	endRaw := freezeRelativeRangeBound(r.FormValue("end"))
+	stepRaw := r.FormValue("step")
+
 	buildParams := func(query string) url.Values {
-		params := url.Values{"query": {query}}
 		if isRange {
-			if s := r.FormValue("start"); s != "" {
-				// A VL bucket is labelled by its START, a LogQL point by the
-				// bucket's END: every side is relabelled one step forward in
-				// fetchBinOpSide, so the window opens one step earlier to keep a
-				// bucket behind the point at `start`.
-				params.Set("start", formatVLStatsTimestamp(shiftRangeStartOneStep(s, r.FormValue("step"))))
-			}
-			if e := r.FormValue("end"); e != "" {
-				params.Set("end", formatVLStatsTimestamp(e))
-			}
-			if step := r.FormValue("step"); step != "" {
-				params.Set("step", formatVLStep(step))
-			}
-		} else {
-			if t := r.FormValue("time"); t != "" {
-				params.Set("time", formatVLStatsTimestamp(t))
-			}
+			return p.buildLokiGridStatsParams(query, startRaw, endRaw, stepRaw)
+		}
+		params := url.Values{"query": {query}}
+		if t := r.FormValue("time"); t != "" {
+			params.Set("time", formatVLStatsTimestamp(t))
 		}
 		return params
 	}
 
 	// Check if either side is a scalar or a nested binary marker.
-	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams)
+	leftBody, rightBody, leftIsScalar, rightIsScalar, sideErr := p.fetchBinOpSides(r, leftQL, rightQL, vlEndpoint, resultType, buildParams, startRaw, stepRaw)
 	if sideErr != nil {
 		p.writeError(w, statusFromUpstreamErr(sideErr), sideErr.Error())
 		return
@@ -3647,7 +3641,7 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 	// Combine results with arithmetic at proxy level
 	result := combineBinaryMetricResults(leftBody, rightBody, op, resultType, leftIsScalar, rightIsScalar, leftQL, rightQL)
 	if isRange {
-		result = clampStatsQRToRequestWindow(result, r)
+		result = clampStatsQRToRequestWindow(result, startRaw, endRaw)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3664,16 +3658,17 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 // VictoriaLogs as if it were a query.
 func (p *Proxy) fetchBinOpSides(
 	r *http.Request, leftQL, rightQL, vlEndpoint, resultType string, buildParams func(string) url.Values,
+	gridStartRaw, gridStepRaw string,
 ) (leftBody, rightBody []byte, leftIsScalar, rightIsScalar bool, err error) {
 	leftIsScalar = translator.IsScalar(leftQL)
 	rightIsScalar = translator.IsScalar(rightQL)
 
 	if isBinOpMarker(leftQL) || isBinOpMarker(rightQL) {
-		leftBody, leftIsScalar, err = p.resolveBinOpBody(r, leftQL, vlEndpoint, resultType, buildParams)
+		leftBody, leftIsScalar, err = p.resolveBinOpBody(r, leftQL, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 		if err != nil {
 			return nil, nil, false, false, fmt.Errorf("left query: %w", err)
 		}
-		rightBody, rightIsScalar, err = p.resolveBinOpBody(r, rightQL, vlEndpoint, resultType, buildParams)
+		rightBody, rightIsScalar, err = p.resolveBinOpBody(r, rightQL, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 		if err != nil {
 			return nil, nil, false, false, fmt.Errorf("right query: %w", err)
 		}
@@ -3687,11 +3682,11 @@ func (p *Proxy) fetchBinOpSides(
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			leftBody, leftErr = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams)
+			leftBody, leftErr = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams, gridStartRaw, gridStepRaw)
 		}()
 		go func() {
 			defer wg.Done()
-			rightBody, rightErr = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams)
+			rightBody, rightErr = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams, gridStartRaw, gridStepRaw)
 		}()
 		wg.Wait()
 		if leftErr != nil {
@@ -3705,12 +3700,12 @@ func (p *Proxy) fetchBinOpSides(
 
 	if leftIsScalar {
 		leftBody = scalarBinOpBody(leftQL)
-	} else if leftBody, err = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams); err != nil {
+	} else if leftBody, err = p.fetchBinOpSide(r, leftQL, vlEndpoint, buildParams, gridStartRaw, gridStepRaw); err != nil {
 		return nil, nil, false, false, fmt.Errorf("left query: %w", err)
 	}
 	if rightIsScalar {
 		rightBody = scalarBinOpBody(rightQL)
-	} else if rightBody, err = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams); err != nil {
+	} else if rightBody, err = p.fetchBinOpSide(r, rightQL, vlEndpoint, buildParams, gridStartRaw, gridStepRaw); err != nil {
 		return nil, nil, false, false, fmt.Errorf("right query: %w", err)
 	}
 	return leftBody, rightBody, leftIsScalar, rightIsScalar, nil
@@ -3719,7 +3714,7 @@ func (p *Proxy) fetchBinOpSides(
 // fetchBinOpSide POSTs one side to VictoriaLogs. VL's internal __name__ column
 // marker is stripped here: this route never reaches the label translator, which
 // is where the key is normally dropped.
-func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildParams func(string) url.Values) ([]byte, error) {
+func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildParams func(string) url.Values, gridStartRaw, gridStepRaw string) ([]byte, error) {
 	resp, err := p.vlPost(r.Context(), "/select/logsql/"+vlEndpoint, buildParams(query))
 	if err != nil {
 		return nil, err
@@ -3728,7 +3723,7 @@ func (p *Proxy) fetchBinOpSide(r *http.Request, query, vlEndpoint string, buildP
 	raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
 	body := stripVLStatsNameKey(raw)
 	if vlEndpoint == "stats_query_range" {
-		body = shiftStatsQRToLokiGrid(body, r.FormValue("start"), r.FormValue("step"))
+		body = shiftStatsQRToLokiGrid(body, gridStartRaw, gridStepRaw)
 	}
 	return body, nil
 }
@@ -3746,12 +3741,12 @@ func isBinOpMarker(q string) bool {
 
 // resolveBinOpBody returns the result body for one side of a binary expression.
 // Handles scalar strings, nested binary markers, and plain VL queries.
-func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType string, buildParams func(string) url.Values) (body []byte, isScalar bool, err error) {
+func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType string, buildParams func(string) url.Values, gridStartRaw, gridStepRaw string) (body []byte, isScalar bool, err error) {
 	if translator.IsScalar(query) {
 		return []byte(`{"status":"success","data":{"resultType":"scalar","result":[0,"` + query + `"]}}`), true, nil
 	}
 	if strings.HasPrefix(query, translator.BinaryMetricPrefix) {
-		body, err = p.evalBinaryMarker(r, query, vlEndpoint, resultType, buildParams)
+		body, err = p.evalBinaryMarker(r, query, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 		return body, false, err
 	}
 	if strings.HasPrefix(query, templateBinOpPrefix) {
@@ -3768,17 +3763,17 @@ func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType 
 }
 
 // evalBinaryMarker recursively evaluates a __binary__: expression marker.
-func (p *Proxy) evalBinaryMarker(r *http.Request, marker, vlEndpoint, resultType string, buildParams func(string) url.Values) ([]byte, error) {
+func (p *Proxy) evalBinaryMarker(r *http.Request, marker, vlEndpoint, resultType string, buildParams func(string) url.Values, gridStartRaw, gridStepRaw string) ([]byte, error) {
 	op, left, right, vm, ok := translator.ParseBinaryMetricExprFull(marker)
 	if !ok {
 		return nil, fmt.Errorf("invalid binary expression marker")
 	}
 
-	leftBody, leftScalar, err := p.resolveBinOpBody(r, left, vlEndpoint, resultType, buildParams)
+	leftBody, leftScalar, err := p.resolveBinOpBody(r, left, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 	if err != nil {
 		return nil, err
 	}
-	rightBody, rightScalar, err := p.resolveBinOpBody(r, right, vlEndpoint, resultType, buildParams)
+	rightBody, rightScalar, err := p.resolveBinOpBody(r, right, vlEndpoint, resultType, buildParams, gridStartRaw, gridStepRaw)
 	if err != nil {
 		return nil, err
 	}
