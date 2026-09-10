@@ -29,7 +29,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - name: Build
@@ -77,7 +77,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - name: Tuple contract gate (default 2-tuple + categorize-labels 3-tuple)
@@ -109,7 +109,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       # --- internal/proxy ---
@@ -210,7 +210,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - name: Race-detector tests on concurrency-critical packages
@@ -243,7 +243,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
@@ -291,7 +291,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - name: Run benchmarks
@@ -619,7 +619,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - name: gofmt -s (Go Report Card parity)
@@ -675,7 +675,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
@@ -752,7 +752,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
@@ -809,7 +809,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
@@ -890,7 +890,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - name: Stress tests (concurrency + race detector)
@@ -914,7 +914,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - name: Memory-leak tests (bounded heap growth + race detector)
@@ -936,7 +936,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
-          go-version: "1.26.8"
+          go-version: "1.27.1"
           cache: true
 
       - name: Install Helm
