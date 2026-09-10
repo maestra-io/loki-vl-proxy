@@ -83,6 +83,24 @@ jobs:
       - name: Tuple contract gate (default 2-tuple + categorize-labels 3-tuple)
         run: go test ./internal/proxy -run '^TestTupleContract_' -count=1
 
+  # Every step budgets fuzzing by EXECUTION COUNT (-fuzztime=<N>x), never by
+  # duration (-fuzztime=<N>s). A duration budget is implemented as a context
+  # deadline, and on Go <= 1.26.x expiring it fails the test outright roughly 1%
+  # of the time with a bare "context deadline exceeded" and no failing input:
+  # internal/fuzz.CoordinateFuzzing suppresses the expiry only when
+  # `err == fuzzCtx.Err()`, but context.cancelCtx.cancel closes the parent's Done
+  # channel BEFORE it walks its children, so the coordinator can wake up seeing
+  # ctx.Err() == DeadlineExceeded while the child fuzzCtx.Err() is still nil.
+  # Fixed upstream in Go 1.27 (adds the missing `err == ctx.Err()` arm) --
+  # go.dev/issue/75804 -- and NOT backported to 1.26.x, which is what we pin.
+  # A count budget leaves opts.Timeout at zero, so no deadline context is created
+  # and the coordinator exits via stop(nil): deterministic. Crash detection is
+  # unaffected -- a crasher still aborts the run and writes
+  # testdata/fuzz/<Target>/<hash>.
+  # Counts are the median execs each target reached in 12s/20s on ubuntu-latest
+  # (4 workers), so the work per step matches what the duration budgets did; wall
+  # time now scales with runner speed instead of the work scaling with it.
+  # Re-derive a count with: -fuzztime=<old duration> and read the last `execs:`.
   fuzz-smoke:
     runs-on: ubuntu-latest
     needs: [test]
@@ -96,88 +114,88 @@ jobs:
 
       # --- internal/proxy ---
       - name: Fuzz smoke (structured metadata normalization)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzNormalizeMetadataPairsFromJSON -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzNormalizeMetadataPairsFromJSON -fuzztime=82000x
 
       - name: Fuzz smoke (merged categorized stream contract)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzMergeLokiQueryResponsesStructuredMetadataContract -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzMergeLokiQueryResponsesStructuredMetadataContract -fuzztime=82000x
 
       - name: Fuzz smoke (parse Loki duration)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseLokiDuration -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseLokiDuration -fuzztime=56000x
 
       - name: Fuzz smoke (parse timestamp)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseTimestamp -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseTimestamp -fuzztime=66000x
 
       - name: Fuzz smoke (subquery aggregate)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzSubqueryAggregate -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzSubqueryAggregate -fuzztime=95000x
 
       - name: Fuzz smoke (series key from metric)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzSeriesKeyFromMetric -fuzztime=20s -timeout=60s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzSeriesKeyFromMetric -fuzztime=160000x -timeout=180s
 
       - name: Fuzz smoke (parse value to float)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseValueToFloat -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseValueToFloat -fuzztime=93000x
 
       - name: Fuzz smoke (Loki error type)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzLokiErrorType -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzLokiErrorType -fuzztime=94000x
 
       - name: Fuzz smoke (format VL step)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzFormatVLStep -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzFormatVLStep -fuzztime=110000x
 
       - name: Fuzz smoke (normalize metadata pairs)
-        run: go test ./internal/proxy -run '^$' -fuzz='^FuzzNormalizeMetadataPairs$' -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz='^FuzzNormalizeMetadataPairs$' -fuzztime=90000x
 
       - name: Fuzz smoke (combine binary metric results scalar path)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzCombineBinaryMetricResultsScalarPath -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzCombineBinaryMetricResultsScalarPath -fuzztime=71000x
 
       - name: Fuzz smoke (parse original range metric spec)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseOriginalRangeMetricSpec -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseOriginalRangeMetricSpec -fuzztime=63000x
 
       - name: Fuzz smoke (parse legacy rules path)
-        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseLegacyRulesPath -fuzztime=20s
+        run: go test ./internal/proxy -run '^$' -fuzz=FuzzParseLegacyRulesPath -fuzztime=210000x
 
       - name: Fuzz smoke (extract log patterns)
         # Anchored regex: FuzzExtractLogPatternsFromWindowEntries shares the
         # FuzzExtractLogPatterns prefix, so an unanchored match selects both
         # and Go's fuzz runner refuses (multi-match error).
-        run: go test ./internal/proxy -run '^$' -fuzz='^FuzzExtractLogPatterns$' -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz='^FuzzExtractLogPatterns$' -fuzztime=99000x
 
       - name: Fuzz smoke (extract log patterns from window entries)
-        run: go test ./internal/proxy -run '^$' -fuzz='^FuzzExtractLogPatternsFromWindowEntries$' -fuzztime=12s
+        run: go test ./internal/proxy -run '^$' -fuzz='^FuzzExtractLogPatternsFromWindowEntries$' -fuzztime=38000x
 
       # --- internal/translator ---
       - name: Fuzz smoke (translate LogQL)
-        run: go test ./internal/translator -run '^$' -fuzz=FuzzTranslateLogQL -fuzztime=12s
+        run: go test ./internal/translator -run '^$' -fuzz=FuzzTranslateLogQL -fuzztime=180000x
 
       - name: Fuzz smoke (translate subquery)
-        run: go test ./internal/translator -run '^$' -fuzz=FuzzTranslateSubquery -fuzztime=12s
+        run: go test ./internal/translator -run '^$' -fuzz=FuzzTranslateSubquery -fuzztime=170000x
 
       - name: Fuzz smoke (parse binary metric expr)
-        run: go test ./internal/translator -run '^$' -fuzz=FuzzParseBinaryMetricExpr -fuzztime=12s
+        run: go test ./internal/translator -run '^$' -fuzz=FuzzParseBinaryMetricExpr -fuzztime=880000x
 
       - name: Fuzz smoke (parse subquery expr)
-        run: go test ./internal/translator -run '^$' -fuzz=FuzzParseSubqueryExpr -fuzztime=12s
+        run: go test ./internal/translator -run '^$' -fuzz=FuzzParseSubqueryExpr -fuzztime=850000x
 
       - name: Fuzz smoke (is scalar)
-        run: go test ./internal/translator -run '^$' -fuzz=FuzzIsScalar -fuzztime=12s
+        run: go test ./internal/translator -run '^$' -fuzz=FuzzIsScalar -fuzztime=790000x
 
       - name: Fuzz smoke (translate with stream fields)
-        run: go test ./internal/translator -run '^$' -fuzz=FuzzTranslateWithStreamFields -fuzztime=20s -timeout=60s
+        run: go test ./internal/translator -run '^$' -fuzz=FuzzTranslateWithStreamFields -fuzztime=130000x -timeout=180s
 
       - name: Fuzz smoke (binary expressions)
-        run: go test ./internal/translator -run '^$' -fuzz=FuzzBinaryExpressions -fuzztime=12s
+        run: go test ./internal/translator -run '^$' -fuzz=FuzzBinaryExpressions -fuzztime=150000x
 
       - name: Fuzz smoke (sanitize label name)
-        run: go test ./internal/translator -run '^$' -fuzz=FuzzSanitizeLabelName -fuzztime=12s
+        run: go test ./internal/translator -run '^$' -fuzz=FuzzSanitizeLabelName -fuzztime=110000x
 
       # --- internal/cache ---
       - name: Fuzz smoke (hash ring get)
-        run: go test ./internal/cache -run '^$' -fuzz=FuzzHashRingGet -fuzztime=12s
+        run: go test ./internal/cache -run '^$' -fuzz=FuzzHashRingGet -fuzztime=100000x
 
       - name: Fuzz smoke (cache get/set)
-        run: go test ./internal/cache -run '^$' -fuzz=FuzzCacheGetSet -fuzztime=12s
+        run: go test ./internal/cache -run '^$' -fuzz=FuzzCacheGetSet -fuzztime=130000x
 
       # --- internal/rulesmigrate ---
       - name: Fuzz smoke (rules migrate convert)
-        run: go test ./internal/rulesmigrate -run '^$' -fuzz=FuzzConvertWithOptions -fuzztime=12s
+        run: go test ./internal/rulesmigrate -run '^$' -fuzz=FuzzConvertWithOptions -fuzztime=210000x
 
   race-stress:
     # Dedicated race-detector gate for concurrency hot paths. Catches issues
