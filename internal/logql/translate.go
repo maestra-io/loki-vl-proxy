@@ -198,10 +198,13 @@ func translateMatcher(m LabelMatcher, opts TranslateOptions) (string, error) {
 		ff := logsql.FieldFilter{Field: quotedLabel, Op: logsql.FieldOpExact, Value: value}
 		return "-" + ff.String(), nil
 	case MatchRe:
-		ff := logsql.FieldFilter{Field: quotedLabel, Op: logsql.FieldOpRegexp, Value: value}
+		// Loki anchors label-matcher regexps to the whole label value; VL's
+		// `field:~"re"` is an unanchored match. Line filters (|~) are NOT
+		// anchored — see translateLineFilter.
+		ff := logsql.FieldFilter{Field: quotedLabel, Op: logsql.FieldOpRegexp, Value: logsql.AnchorLabelMatcherRegex(value)}
 		return ff.String(), nil
 	case MatchNotRe:
-		ff := logsql.FieldFilter{Field: quotedLabel, Op: logsql.FieldOpRegexp, Value: value}
+		ff := logsql.FieldFilter{Field: quotedLabel, Op: logsql.FieldOpRegexp, Value: logsql.AnchorLabelMatcherRegex(value)}
 		return "-" + ff.String(), nil
 	default:
 		return "", errFallthrough

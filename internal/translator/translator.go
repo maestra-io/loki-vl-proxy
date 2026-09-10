@@ -488,9 +488,13 @@ func translateLogQLFull(logql string, labelFn LabelTranslateFunc, streamFields m
 	// returns 1/0 for comparisons, so "bool" is a no-op — just strip it.
 	logql = boolModifierRE.ReplaceAllString(logql, " ")
 
-	// count_values groups by the VALUES of the inner metric — VL cannot compute this.
+	// count_values is PromQL, not LogQL: Loki itself answers `parse error at
+	// line 1, col 1: syntax error: unexpected IDENTIFIER` (verified against
+	// grafana/loki 3.7.1). Accepting it here would make the proxy return data
+	// for a query the reference implementation rejects — a silent divergence,
+	// which the e2e error-parity suite treats as a failure. Keep the 400.
 	if outerAgg, _, _ := extractOuterAggregation(logql); outerAgg == "count_values" {
-		return "", &UnsupportedError{Msg: "count_values is not translatable to LogsQL", Func: "count_values"}
+		return "", &UnsupportedError{Msg: `count_values is not a LogQL aggregation operator; to count entries grouped by a field use sum by (<field>) (count_over_time(...))`, Func: "count_values"}
 	}
 
 	// Check binary metric expressions FIRST — they may contain metric sub-expressions.
@@ -1240,6 +1244,15 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			if label == "" {
 				return "", false
 			}
+
+			// Same anchoring as the stream selector: `| label =~ "re"` is a
+			// label matcher, so Loki requires a full-value match. ip("cidr") is
+			// not a regexp and keeps its own translation below.
+			if entry.entry.isRe {
+				if v := strings.Trim(value, "\"`"); !strings.HasPrefix(v, `ip("`) {
+					value = logsql.AnchorLabelMatcherRegex(v)
+				}
+			}
 			if mapping.isDerivedLevelLabel(label) {
 				if v := strings.Trim(value, "\"`"); v != "" {
 					if ff := mapping.derivedLevelFilter(v, entry.entry.negate, entry.entry.isRe); ff != "" {
@@ -1795,12 +1808,23 @@ func tryTranslateMetricQueryM(logql string, labelFn LabelTranslateFunc, mapping 
 			statsExpr := logsqlFunc + "(" + unwrapField + ")"
 			innerBy := unwrapInnerGrouping(query, byLabels, outerAgg, labelFn, rangeByExplicit, rangeByLabels)
 
+			// An explicit range grouping owns the inner stats stage, so an outer
+			// aggregation needs a stage of its own — otherwise one of the two
+			// groupings is silently dropped. Without a range grouping the outer
+			// labels still collapse into the single inner stage, as before.
+			outerBy := ""
+			twoStage := outerAgg != "" && byLabels == ""
+			if outerAgg != "" && byLabels != "" && rangeByExplicit {
+				twoStage = true
+				outerBy = normalizeByLabels(byLabels, labelFn)
+			}
+
 			// stdvar_over_time uses stddev + square, since VL doesn't have stdvar().
 			if funcName == "stdvar_over_time" {
-				if outerAgg != "" && byLabels == "" {
+				if twoStage {
 					innerAliased := buildStatsQuery(logsqlQuery, statsExpr, innerBy, "__lvp_inner")
 					withVariance := innerAliased + " " + logsql.PipeMath{Alias: "__lvp_inner_var", Expr: "__lvp_inner*__lvp_inner"}.String()
-					if outerResult, ok := applyOuterAggregation(withVariance, outerAgg, "__lvp_inner_var"); ok {
+					if outerResult, ok := applyOuterAggregation(withVariance, outerAgg, "__lvp_inner_var", outerBy); ok {
 						return outerResult, true
 					}
 				}
@@ -1808,10 +1832,13 @@ func tryTranslateMetricQueryM(logql string, labelFn LabelTranslateFunc, mapping 
 				return fmt.Sprintf("%s^:%s|||2", BinaryMetricPrefix, baseStddev), true
 			}
 
-			if outerAgg != "" && byLabels == "" {
+			if twoStage {
 				innerAliased := buildStatsQuery(logsqlQuery, statsExpr, innerBy, "__lvp_inner")
-				if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner"); ok {
+				if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner", outerBy); ok {
 					result = outerResult
+					// The outer grouping is already on its own stage; the trailing
+					// addByClause below would re-insert it into the INNER stage.
+					unwrapByLabelsEmbedded = true
 				} else {
 					result = buildStatsQuery(logsqlQuery, statsExpr, innerBy, "")
 				}
@@ -1845,7 +1872,7 @@ func tryTranslateMetricQueryM(logql string, labelFn LabelTranslateFunc, mapping 
 		if translatedInner, ok := tryTranslateMetricQueryM(innerExpr, labelFn, mapping); ok && translatedInner != "" {
 			// Alias the last stats result so the outer aggregation can reference it.
 			innerAliased := translatedInner + " as __lvp_inner"
-			if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner"); ok {
+			if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner", ""); ok {
 				if isGroup {
 					return outerResult + groupMarker, true
 				}
@@ -1880,7 +1907,7 @@ func buildRateLikeQuery(logsqlQuery, originalQuery, statsExpr, duration, outerAg
 	withRate := innerAliased + " " + logsql.PipeMath{Alias: "__lvp_rate", Expr: "__lvp_inner/" + strconv.FormatFloat(seconds, 'f', -1, 64)}.String()
 
 	if outerAgg != "" && byLabels == "" {
-		if outerResult, ok := applyOuterAggregation(withRate, outerAgg, "__lvp_rate"); ok {
+		if outerResult, ok := applyOuterAggregation(withRate, outerAgg, "__lvp_rate", ""); ok {
 			return outerResult, true
 		}
 	}
@@ -1941,7 +1968,16 @@ func outerAggregationStatsFn(outerAgg string) (statsFn string, pow2 bool) {
 	}
 }
 
-func applyOuterAggregation(baseQuery, outerAgg, field string) (string, bool) {
+// applyOuterAggregation appends the outer aggregation as a SECOND stats stage
+// over an already-aggregated inner result.
+//
+// outerBy carries the outer aggregation's own grouping labels (already
+// translated), and must be passed whenever the inner stage consumed a DIFFERENT
+// grouping — e.g. `sum by (app) (quantile_over_time(...) by (namespace))`. The
+// inner stage groups by namespace, so the outer `by (app)` has nowhere to live
+// except its own stage; folding both into one stats clause silently drops one
+// of them. Empty outerBy emits an ungrouped stage, as `sum(...)` requires.
+func applyOuterAggregation(baseQuery, outerAgg, field, outerBy string) (string, bool) {
 	statsFn, pow2 := outerAggregationStatsFn(outerAgg)
 	if statsFn == "" {
 		return "", false
@@ -1953,6 +1989,11 @@ func applyOuterAggregation(baseQuery, outerAgg, field string) (string, bool) {
 		rawFunc = statsFn + "(" + field + ")"
 	}
 	pipe := logsql.PipeStats{Funcs: []logsql.StatsFuncAlias{{Func: logsql.DeferredExpr{Raw: rawFunc}}}}
+	for _, label := range strings.Split(outerBy, ",") {
+		if label = strings.TrimSpace(label); label != "" {
+			pipe.By = append(pipe.By, logsql.GroupKey{Field: label})
+		}
+	}
 	result := baseQuery + " " + pipe.String()
 	if pow2 {
 		result = fmt.Sprintf("%s^:%s|||2", BinaryMetricPrefix, result)
@@ -2443,6 +2484,15 @@ func tryTranslateQuantileOverTimeM(innerExpr, outerAgg, byLabels string, labelFn
 	}
 	body := rest[:end]
 
+	// Detect a trailing by (...) modifier on the range aggregation, e.g.
+	// quantile_over_time(0.95, {...} | unwrap d [5m]) by (namespace).
+	// The generic metric-function loop below already does this; quantile_over_time
+	// is intercepted here for its two-argument form and must not lose the clause,
+	// otherwise unwrapInnerGrouping falls through to the "_stream, _msg" default
+	// and the result is one series per stream (or per log line) instead of one
+	// series per requested label.
+	rangeByLabels, rangeByExplicit := extractRangeByClause(strings.TrimSpace(rest[end+1:]))
+
 	// Extract phi (first arg before comma): quantile_over_time(0.95, ...)
 	commaIdx := strings.Index(body, ",")
 	if commaIdx < 0 {
@@ -2470,11 +2520,20 @@ func tryTranslateQuantileOverTimeM(innerExpr, outerAgg, byLabels string, labelFn
 	}
 
 	statsExpr := "quantile(" + phi + ", " + unwrapField + ")"
-	innerBy := unwrapInnerGrouping(query, byLabels, outerAgg, labelFn, false, "")
+	innerBy := unwrapInnerGrouping(query, byLabels, outerAgg, labelFn, rangeByExplicit, rangeByLabels)
 
-	if outerAgg != "" && byLabels == "" {
+	// Same two-stage rule as the generic unwrap path above: an explicit range
+	// grouping owns the inner stage, so an outer aggregation gets its own.
+	outerBy := ""
+	twoStage := outerAgg != "" && byLabels == ""
+	if outerAgg != "" && byLabels != "" && rangeByExplicit {
+		twoStage = true
+		outerBy = normalizeByLabels(byLabels, labelFn)
+	}
+
+	if twoStage {
 		innerAliased := buildStatsQuery(logsqlQuery, statsExpr, innerBy, "__lvp_inner")
-		if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner"); ok {
+		if outerResult, ok := applyOuterAggregation(innerAliased, outerAgg, "__lvp_inner", outerBy); ok {
 			return outerResult, true
 		}
 	}
@@ -2775,6 +2834,13 @@ func streamMatcherToFieldFilter(matcher string, labelFn LabelTranslateFunc, mapp
 			value := strings.TrimSpace(matcher[idx+len(op.logql):])
 			if label == "" {
 				return ""
+			}
+
+			// Loki anchors label-matcher regexps to the whole value; VL's
+			// `field:~"re"` does not. Anchor here, once, before the value fans
+			// out to the fallback-chain / service_name / plain branches below.
+			if op.isRe {
+				value = logsql.AnchorLabelMatcherRegex(strings.Trim(value, "\"`"))
 			}
 
 			// Fallback chain: the Loki label is backed by an ordered list of VL

@@ -9,6 +9,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Label-matcher regex flags escaped the anchors.** `AnchorLabelMatcherRegex`
+  hoisted leading inline flags in front of `^…$`, so `(?m)foo` became
+  `(?m)^(?:foo)$` — and under `(?m)` the anchors match at LINE boundaries, which
+  let the value `"foo\nbar"` satisfy a matcher for `foo`. Flags are now scoped
+  to the body (`^(?:(?m:foo))$`), nesting successive groups in order. An empty
+  pattern is anchored too (`=~""` matches only the empty value, where before it
+  returned unanchored and matched anything).
+- **A line filter containing the text `| stats ` looked like a second stats
+  stage.** The multi-stage detector scanned raw text, so `{...} |= "| stats "`
+  routed a one-stage query away from the stats-compat layer. It now scans with
+  quoted spans blanked (`stripQuotedSpans`), so only real pipe stages count.
+- **Two-stage aggregations with `range > step` are rejected instead of answered
+  wrongly.** VictoriaLogs buckets `stats_query_range` by `step` (tumbling) while
+  a LogQL range aggregation is a sliding `range` window; they agree only while
+  `range <= step`. `query_range` outside that now returns 400 naming the
+  mismatch and the two workarounds. Instant queries and single-stage sliding
+  queries are unaffected. See `docs/KNOWN_ISSUES.md`.
+
+- **An outer aggregation over a range grouping dropped one of the two clauses.**
+  `sum by (app) (quantile_over_time(...) by (namespace))` carries an inner range
+  grouping AND an outer grouping; a single LogsQL stats stage holds only one, so
+  the outer `sum by (app)` was discarded and the query returned per-namespace
+  quantiles with no sum applied — a plausible-looking wrong number, not an
+  error. The inner grouping now keeps the first stage and the outer aggregation
+  gets its own (`| stats by (app) sum(__lvp_inner)`). The same defect was in the
+  generic unwrap path (`max_over_time`, `avg_over_time`, `stdvar_over_time`),
+  not only in `quantile_over_time`.
+- **The stats-compat layer served the INNER result for two-stage aggregations.**
+  It models one fold and read its grouping from the FIRST stats stage, so
+  `sum by (container) (max_over_time(...) by (namespace))` came back as
+  `{container="<namespace value>"}` holding the per-namespace max — the outer
+  sum never ran, and the label was the inner one renamed. `sum(... by (ns))` was
+  already wrong this way before the change above. Genuine two-stage
+  aggregations now fall through to VictoriaLogs, which executes both stages
+  correctly; `| math` rate pipelines keep their existing manual handling.
+- **`count_values()` stays rejected with 400 — it is not a LogQL operator.** An
+  earlier revision of this branch implemented it as a post-aggregation; real
+  Loki 3.7.1 answers `parse error at line 1, col 1: syntax error: unexpected
+  IDENTIFIER` for `count_values("app", count_over_time({app="x"}[5m]))`, so
+  serving it made the proxy return data for a query the reference implementation
+  rejects. The e2e error-parity suite classes that as a SILENT FAIL, and it is
+  the worse compatibility bug. The 400 message now names the LogQL spelling that
+  does work: `sum by (<field>) (count_over_time(...))`.
+
+- **`=~` / `!~` label matchers reached VictoriaLogs UNANCHORED.** Loki anchors a
+  label-matcher regexp to the whole label value, so `{namespace=~"nch"}` matches
+  only the exact value `nch`. VL's `field:~"re"` is a substring match, so the
+  pattern was passed through verbatim and every `=~` matcher silently widened:
+  `{namespace=~"nch"}` matched `anch` and `nch-b`, and `{namespace=~"ppx"}`
+  matched `appx`. A widened matcher inflates counts instead of erroring, so
+  nothing surfaced it. Label matchers are now emitted as `^(?:<re>)$` in both
+  stream selectors and `| label =~ …` pipeline filters, including over
+  `-field-mapping` fallback chains and the synthetic `service_name` expansion.
+  The non-capturing group is required: `^a|b$` parses as `(^a)|(b$)` and would
+  match any value containing `a` or ending in `b`. Leading inline flags are
+  hoisted (`(?i)prod` → `(?i)^(?:prod)$`). **Line filters (`|~`, `!~` on the log
+  line) stay unanchored** — those are substring regexps in Loki too. No flag:
+  this is Loki compatibility, not an option.
+- **Instant `rate(...)` emitted an empty `level=""` label.** Grouping by the
+  derived level makes VL return a `level` column for every series, empty where
+  the field is absent. Loki emits no label at all in that case; the empty one
+  reached Grafana as a real series dimension. Empty-valued `level` /
+  `detected_level` are now dropped from metric responses.
+
+- **Instant `quantile_over_time(...) by (labels)` ignored its grouping.**
+  `quantile_over_time` is intercepted by its own two-argument translator before
+  the generic metric-function loop, and that interceptor never parsed the
+  trailing `by (...)` / `by ()` modifier. Grouping then fell through to the
+  parser-pipeline default `by (_stream, _msg)`, so
+  `quantile_over_time(0.95, {ns=~"app.+"} | json | unwrap Duration [10m]) by (namespace)`
+  returned one series per POD on the instant path and one series per LOG LINE on
+  the range path instead of one per namespace. Without a parser pipeline the
+  clause was dropped entirely, collapsing every namespace into one series. The
+  clause is now honoured exactly as it already was for the single-argument
+  siblings (`max_over_time`, `avg_over_time`, …). Verified against VictoriaLogs
+  v1.52.0.
+- **`sum by (detected_level)` returned both `detected_level` and `level`.** On
+  the manual (parser-stage) metric path, by-fields that only exist after a
+  parser stage were injected under their VL name after the VL→Loki rename had
+  already run, re-adding the pre-rename label. The response carried one grouping
+  dimension more than Loki returns, which renames every Grafana series.
+
 - **Derived-level queries returned HTTP 400 from VictoriaLogs.** Two generated
   constructs are not valid LogsQL: there is no `coalesce` PIPE (`unexpected pipe
   "coalesce"`), and `replace`/`replace_regexp` take the field LAST

@@ -199,7 +199,11 @@ func (m *MappingOptions) derivedLevelFilter(value string, negate, isRe bool) str
 		return ""
 	}
 	pattern := value
-	if !isRe {
+	if isRe {
+		// User-supplied label regexp: anchor it like Loki does.
+		pattern = logsql.AnchorLabelMatcherRegex(value)
+	} else {
+		// levelValuePattern is generated already anchored.
 		pattern = levelValuePattern(value)
 	}
 	parts := make([]string, 0, len(m.DerivedLevelFields))
