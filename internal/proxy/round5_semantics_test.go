@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -297,11 +298,16 @@ func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
 	base := time.Unix(1700000700, 0).UTC() // 25 minutes past the hour — NOT step-aligned
 	const step = 3600
 
+	// The binary path fetches both operands CONCURRENTLY, so the capture needs
+	// its own lock.
+	var mu sync.Mutex
 	var gotOffsets, gotStarts []string
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
+		mu.Lock()
 		gotOffsets = append(gotOffsets, r.Form.Get("offset"))
 		gotStarts = append(gotStarts, r.Form.Get("start"))
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w,
 			`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"a"},"values":[[%d,"2"],[%d,"4"]]}]}}`,
@@ -321,6 +327,8 @@ func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
+	mu.Lock()
+	defer mu.Unlock()
 	if len(gotOffsets) < 2 {
 		t.Fatalf("expected both operands to be fetched, got %d upstream calls", len(gotOffsets))
 	}
