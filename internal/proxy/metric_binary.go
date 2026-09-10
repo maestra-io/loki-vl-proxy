@@ -554,8 +554,11 @@ type drilldownFVEntry struct {
 var vlStatsNameKeyRE = regexp.MustCompile(`"__name__":"[^"]*",?`)
 
 // stripVLStatsNameKey removes VL's __name__ column marker from a stats_query_range
-// body. Called in the hybrid path where label translation is skipped — we need to
-// clean __name__ without invoking ensureDetectedLevel which would rename level→detected_level.
+// body. Called wherever a VL stats body reaches the client WITHOUT going through
+// translateStatsResponseLabels (which drops the key itself): the hybrid drilldown
+// path, and every side of a binary expression. Loki never emits __name__, so
+// leaving it in renames the series for Grafana — `sum(...) or vector(0)` came
+// back as {__name__="count(*)"} where Loki returns {}.
 func stripVLStatsNameKey(body []byte) []byte {
 	if !bytes.Contains(body, []byte(`"__name__"`)) {
 		return body
@@ -3403,7 +3406,8 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 				return
 			}
 			defer resp.Body.Close()
-			leftBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			leftBody = stripVLStatsNameKey(raw)
 		}()
 		go func() {
 			defer wg.Done()
@@ -3413,7 +3417,8 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 				return
 			}
 			defer resp.Body.Close()
-			rightBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			rightBody = stripVLStatsNameKey(raw)
 		}()
 		wg.Wait()
 		if leftErr != nil {
@@ -3434,7 +3439,8 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 				return
 			}
 			defer resp.Body.Close()
-			leftBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			leftBody = stripVLStatsNameKey(raw)
 		}
 
 		if rightIsScalar {
@@ -3446,7 +3452,8 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 				return
 			}
 			defer resp.Body.Close()
-			rightBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			rightBody = stripVLStatsNameKey(raw)
 		}
 	}
 
@@ -3544,7 +3551,8 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 				return
 			}
 			defer resp.Body.Close()
-			leftBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			leftBody = stripVLStatsNameKey(raw)
 		}()
 		go func() {
 			defer wg.Done()
@@ -3554,7 +3562,8 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 				return
 			}
 			defer resp.Body.Close()
-			rightBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			rightBody = stripVLStatsNameKey(raw)
 		}()
 		wg.Wait()
 	} else {
@@ -3567,7 +3576,8 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 				return
 			}
 			defer resp.Body.Close()
-			leftBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			leftBody = stripVLStatsNameKey(raw)
 		}
 
 		if rightIsScalar {
@@ -3579,7 +3589,8 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 				return
 			}
 			defer resp.Body.Close()
-			rightBody, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			raw, _ := readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
+			rightBody = stripVLStatsNameKey(raw)
 		}
 	}
 
@@ -3629,7 +3640,7 @@ func (p *Proxy) resolveBinOpBody(r *http.Request, query, vlEndpoint, resultType 
 	}
 	defer resp.Body.Close()
 	body, _ = readBodyLimited(resp.Body, maxBufferedBackendBodyBytes)
-	return body, false, nil
+	return stripVLStatsNameKey(body), false, nil
 }
 
 // evalBinaryMarker recursively evaluates a __binary__: expression marker.

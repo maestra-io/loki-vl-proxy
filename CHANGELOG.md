@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The manual range-metric window counted boundary samples twice.**
+  `aggregateManualWindow` closed its window on both ends where LogQL's range
+  vector at time `t` selects `(t-range, t]`, so an entry landing exactly on a
+  bucket edge was folded into two adjacent windows. On entries 20 s apart in 1 m
+  tumbling buckets the proxy returned 4 per step against Loki's 3 (Σ=40 vs 30,
+  10 of 11 steps wrong); every step now matches Loki exactly. The window is
+  half-open for RAW entries and stays closed on the left for PRE-BUCKETED
+  VictoriaLogs stats samples, whose timestamp is a bucket start standing for
+  `[ts, ts+step)` — the two callers now say which they pass. Affects every query
+  on the manual path (`rate`, `count_over_time`, the unwrap family), not only
+  the template path.
+- **`sum(...) or vector(0)` returned `{__name__="count(*)"}` where Loki returns
+  `{}`.** Every side of a binary metric expression is fetched straight from
+  VictoriaLogs and combined without passing through the label translator, so
+  VL's internal `__name__` column marker survived into the response and renamed
+  the series for Grafana. Each side is now run through `stripVLStatsNameKey`.
 - **A Go template in the pipeline was pushed to VictoriaLogs, which cannot
   evaluate it.** The string translator rewrote only the bare `{{.field}}` shape
   into a LogsQL `| format` placeholder; conditionals, function pipes, `__line__`

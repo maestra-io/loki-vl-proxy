@@ -607,12 +607,12 @@ func tplSet(lines []string) map[string]bool {
 	return out
 }
 
-// tplAssertClose compares two totals within a relative tolerance. Exact
-// equality is not available: the manual range-metric path evaluates its window
-// with both bounds closed while Loki's range vector is left-open, so a sample
-// landing exactly on a bucket edge is counted twice. That is a pre-existing
-// property of the shared aggregation helper, not of the template path — the
-// same skew shows on a plain `sum by (ns) (rate({...}[2m]))`.
+// tplAssertClose compares two totals within a relative tolerance. The window
+// bounds now match Loki exactly (see TestWindowBounds_HalfOpenMatchesLoki), but
+// these fixtures are ingested twice — once per backend — so the first and last
+// evaluation points still depend on each backend's own view of the range edge.
+// The per-step equality assertion lives in the boundary test; here the totals
+// only need to agree.
 func tplAssertClose(t *testing.T, what string, got, want, tolerance float64) {
 	t.Helper()
 	if want == 0 {
@@ -623,5 +623,169 @@ func tplAssertClose(t *testing.T, what string, got, want, tolerance float64) {
 	}
 	if rel := math.Abs(got-want) / want; rel > tolerance {
 		t.Errorf("%s: proxy=%v loki=%v (%.1f%% apart, tolerance %.0f%%)", what, got, want, rel*100, tolerance*100)
+	}
+}
+
+// ─── window bounds and __name__ ─────────────────────────────────────────────
+
+// tplBoundaryNS is a fixture whose entries land EXACTLY on the step boundaries:
+// t0, t0+20s, t0+40s, t0+60s … with step=60s and range=1m every third entry
+// sits on a bucket edge. A closed left bound counted those twice.
+var (
+	tplBoundaryOnce  sync.Once
+	tplBoundaryNS    string
+	tplBoundaryStart time.Time
+	tplBoundaryEnd   time.Time
+)
+
+const tplBoundaryEntries = 30 // 20 s apart → 10 minutes
+
+func ensureBoundaryDataIngested(t *testing.T) {
+	t.Helper()
+	tplBoundaryOnce.Do(func() {
+		waitForReady(t, proxyURL+"/ready", 30*time.Second)
+		waitForReady(t, lokiURL+"/ready", 30*time.Second)
+
+		tplBoundaryNS = "e2e-bound-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		// Anchor on a whole minute so the query's step grid and the entry
+		// timestamps coincide exactly — that alignment IS the test.
+		tplBoundaryEnd = time.Now().Add(-3 * time.Minute).Truncate(time.Minute)
+		tplBoundaryStart = tplBoundaryEnd.Add(-time.Duration(tplBoundaryEntries*20) * time.Second)
+
+		entries := make([]tplEntry, 0, tplBoundaryEntries)
+		for i := 0; i < tplBoundaryEntries; i++ {
+			entries = append(entries, tplEntry{
+				ts:   tplBoundaryStart.Add(time.Duration(i*20) * time.Second),
+				line: fmt.Sprintf(`{"level":"info","seq":%d}`, i),
+			})
+		}
+		tplPush(t, map[string]string{"namespace": tplBoundaryNS, "container": "bound", "app": "bound"}, entries)
+		forceVLFlush(t)
+
+		deadline := time.Now().Add(60 * time.Second)
+		q := fmt.Sprintf(`sum(count_over_time({namespace=%q}[20m]))`, tplBoundaryNS)
+		for time.Now().Before(deadline) {
+			if len(tplResults(t, tplBoundaryQuery(t, lokiURL, "instant", q))) > 0 {
+				return
+			}
+			time.Sleep(time.Second)
+		}
+		t.Logf("warning: Loki has not made the boundary fixture queryable within 60s")
+	})
+}
+
+func tplBoundaryQuery(t *testing.T, baseURL, kind, query string) map[string]interface{} {
+	t.Helper()
+	params := url.Values{}
+	params.Set("query", query)
+	path := "/loki/api/v1/query_range"
+	if kind == "instant" {
+		path = "/loki/api/v1/query"
+		params.Set("time", strconv.FormatInt(tplBoundaryEnd.UnixNano(), 10))
+	} else {
+		params.Set("start", strconv.FormatInt(tplBoundaryStart.UnixNano(), 10))
+		params.Set("end", strconv.FormatInt(tplBoundaryEnd.UnixNano(), 10))
+		params.Set("step", "60")
+	}
+	resp, err := http.Get(baseURL + path + "?" + params.Encode())
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("query %q against %s: status %d body %s", query, baseURL, resp.StatusCode, tplTruncate(string(raw)))
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("bad JSON from %s: %v (%s)", baseURL, err, tplTruncate(string(raw)))
+	}
+	return payload
+}
+
+// tplPerStep flattens a matrix into timestamp → value for the single series.
+func tplPerStep(t *testing.T, payload map[string]interface{}) map[int64]float64 {
+	t.Helper()
+	out := map[int64]float64{}
+	for _, item := range tplResults(t, payload) {
+		s, _ := item.(map[string]interface{})
+		values, _ := s["values"].([]interface{})
+		for _, pair := range values {
+			p, _ := pair.([]interface{})
+			if len(p) != 2 {
+				continue
+			}
+			ts := int64(tplFloat(p[0]))
+			out[ts] += tplFloat(p[1])
+		}
+	}
+	return out
+}
+
+// TestWindowBounds_HalfOpenMatchesLoki is the regression for the manual
+// aggregation window. Entries sit exactly on the 60 s step boundaries, so a
+// closed left bound put every boundary entry into two adjacent buckets and read
+// 4 where Loki reads 3. The query carries a template so it takes the proxy-side
+// pipeline, but the helper under test is shared with every manual-path query.
+func TestWindowBounds_HalfOpenMatchesLoki(t *testing.T) {
+	ensureBoundaryDataIngested(t)
+
+	queries := map[string]string{
+		"count_over_time": fmt.Sprintf(
+			"sum by (level) (count_over_time({namespace=%q} | json | line_format `{{.level}}` [1m]))", tplBoundaryNS),
+		"rate": fmt.Sprintf(
+			"sum by (level) (rate({namespace=%q} | json | line_format `{{.level}}` [1m]))", tplBoundaryNS),
+	}
+
+	for name, q := range queries {
+		t.Run(name, func(t *testing.T) {
+			proxySteps := tplPerStep(t, tplBoundaryQuery(t, proxyURL, "range", q))
+			lokiSteps := tplPerStep(t, tplBoundaryQuery(t, lokiURL, "range", q))
+
+			if len(lokiSteps) == 0 {
+				t.Fatal("Loki returned no data points — fixture not queryable")
+			}
+			for ts, want := range lokiSteps {
+				got, ok := proxySteps[ts]
+				if !ok {
+					t.Errorf("step %d: proxy has no point, Loki=%v", ts, want)
+					continue
+				}
+				if math.Abs(got-want) > 1e-9 {
+					t.Errorf("step %d: proxy=%v loki=%v", ts, got, want)
+				}
+			}
+			for ts, got := range proxySteps {
+				if _, ok := lokiSteps[ts]; !ok {
+					t.Errorf("step %d: proxy has an extra point %v", ts, got)
+				}
+			}
+		})
+	}
+}
+
+// TestBinaryMetric_NoNameLabel pins that no metric result carries VictoriaLogs'
+// internal `__name__` column marker. Loki never emits it, and on the binary path
+// (`… or vector(0)`) it survived because that route skips the label translator —
+// so Grafana saw the series renamed to {__name__="count(*)"}.
+func TestBinaryMetric_NoNameLabel(t *testing.T) {
+	ensureBoundaryDataIngested(t)
+
+	queries := []string{
+		fmt.Sprintf(`sum(count_over_time({namespace=%q}[10m])) or vector(0)`, tplBoundaryNS),
+		fmt.Sprintf(`sum by (container) (count_over_time({namespace=%q}[10m])) or vector(0)`, tplBoundaryNS),
+		fmt.Sprintf(`sum(count_over_time({namespace=%q}[10m])) * 2`, tplBoundaryNS),
+	}
+	for _, q := range queries {
+		t.Run(q, func(t *testing.T) {
+			payload := tplBoundaryQuery(t, proxyURL, "instant", q)
+			for _, item := range tplResults(t, payload) {
+				s, _ := item.(map[string]interface{})
+				metric, _ := s["metric"].(map[string]interface{})
+				if _, bad := metric["__name__"]; bad {
+					t.Errorf("result carries __name__, which Loki never emits: %v", metric)
+				}
+			}
+		})
 	}
 }

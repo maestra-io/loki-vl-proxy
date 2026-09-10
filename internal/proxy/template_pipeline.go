@@ -502,8 +502,9 @@ func (p *Proxy) templateMetricRangeBody(r *http.Request, mp *templateMetricPlan)
 	if err != nil {
 		return nil, err
 	}
+	// The template pipeline yields RAW log entries.
 	return buildManualRangeMetricMatrix(mp.manualFunc, mp.quantile, series,
-		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries()), nil
+		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries(), false), nil
 }
 
 // templateMetricInstantBody evaluates an instant metric query over a template
@@ -519,7 +520,8 @@ func (p *Proxy) templateMetricInstantBody(r *http.Request, mp *templateMetricPla
 	if err != nil {
 		return nil, err
 	}
-	return buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window), nil
+	// The template pipeline yields RAW log entries.
+	return buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window, false), nil
 }
 
 // handleTemplateMetricRange answers a range metric query over a template

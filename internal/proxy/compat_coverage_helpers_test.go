@@ -150,6 +150,13 @@ func TestCompatHelpers_AddParsedEntryLabels(t *testing.T) {
 	}
 }
 
+// TestCompatHelpers_AggregateManualWindow pins the HALF-OPEN window
+// `(windowStart, windowEnd]` that LogQL's range vector selects. The expected
+// values changed on 10.09.2026: this test previously asserted a CLOSED window,
+// which counted a sample sitting exactly on windowStart in two adjacent buckets
+// and put every tumbling-window count above Loki's (20 s-spaced data in 1 m
+// buckets read 20 where Loki read 15). The sample at ts=0 below is exactly on
+// the left bound and is therefore excluded — that exclusion IS the fix.
 func TestCompatHelpers_AggregateManualWindow(t *testing.T) {
 	samples := []rangeMetricSample{
 		{ts: 0, value: 1},
@@ -164,51 +171,62 @@ func TestCompatHelpers_AggregateManualWindow(t *testing.T) {
 		}
 	}
 
-	if got, ok := aggregateManualWindow("count_over_time", 0, samples, 0, 20, 20); !ok || got != 3 {
-		t.Fatalf("count_over_time: expected 3,true got %v,%v", got, ok)
+	// (0, 20] over {0:1, 10:2, 20:3} sees {2, 3} — the ts=0 sample is on the
+	// excluded left bound. Widening the window to (-1, 20] brings it back.
+	if got, ok := aggregateManualWindow("count_over_time", 0, samples, 0, 20, 20, false); !ok || got != 2 {
+		t.Fatalf("count_over_time: expected 2,true got %v,%v", got, ok)
 	}
-	if got, ok := aggregateManualWindow("rate", 0, samples, 0, 20, 20); !ok {
+	if got, ok := aggregateManualWindow("count_over_time", 0, samples, -1, 20, 21, false); !ok || got != 3 {
+		t.Fatalf("count_over_time with the left bound below ts=0: expected 3,true got %v,%v", got, ok)
+	}
+	// Pre-bucketed samples keep the left bound CLOSED: the timestamp is a bucket
+	// START standing for `[ts, ts+step)`, so dropping the bucket on the edge
+	// would drop entries that are inside the window.
+	if got, ok := aggregateManualWindow("count_over_time", 0, samples, 0, 20, 20, true); !ok || got != 3 {
+		t.Fatalf("count_over_time on pre-bucketed samples: expected 3,true got %v,%v", got, ok)
+	}
+	if got, ok := aggregateManualWindow("rate", 0, samples, 0, 20, 20, false); !ok {
 		t.Fatal("rate: expected success")
 	} else {
-		assertClose("rate", got, 0.15)
+		assertClose("rate", got, 0.1)
 	}
-	if got, ok := aggregateManualWindow("bytes_over_time", 0, samples, 0, 20, 20); !ok || got != 6 {
-		t.Fatalf("bytes_over_time: expected 6,true got %v,%v", got, ok)
+	if got, ok := aggregateManualWindow("bytes_over_time", 0, samples, 0, 20, 20, false); !ok || got != 5 {
+		t.Fatalf("bytes_over_time: expected 5,true got %v,%v", got, ok)
 	}
-	if got, ok := aggregateManualWindow("bytes_rate", 0, samples, 0, 20, 20); !ok {
+	if got, ok := aggregateManualWindow("bytes_rate", 0, samples, 0, 20, 20, false); !ok {
 		t.Fatal("bytes_rate: expected success")
 	} else {
-		assertClose("bytes_rate", got, 0.3)
+		assertClose("bytes_rate", got, 0.25)
 	}
-	if got, ok := aggregateManualWindow("sum", 0, samples, 0, 20, 20); !ok || got != 6 {
-		t.Fatalf("sum: expected 6,true got %v,%v", got, ok)
+	if got, ok := aggregateManualWindow("sum", 0, samples, 0, 20, 20, false); !ok || got != 5 {
+		t.Fatalf("sum: expected 5,true got %v,%v", got, ok)
 	}
-	if got, ok := aggregateManualWindow("avg", 0, samples, 0, 20, 20); !ok || got != 2 {
-		t.Fatalf("avg: expected 2,true got %v,%v", got, ok)
+	if got, ok := aggregateManualWindow("avg", 0, samples, 0, 20, 20, false); !ok || got != 2.5 {
+		t.Fatalf("avg: expected 2.5,true got %v,%v", got, ok)
 	}
-	if got, ok := aggregateManualWindow("min", 0, samples, 0, 20, 20); !ok || got != 1 {
-		t.Fatalf("min: expected 1,true got %v,%v", got, ok)
+	if got, ok := aggregateManualWindow("min", 0, samples, 0, 20, 20, false); !ok || got != 2 {
+		t.Fatalf("min: expected 2,true got %v,%v", got, ok)
 	}
-	if got, ok := aggregateManualWindow("max", 0, samples, 0, 20, 20); !ok || got != 3 {
+	if got, ok := aggregateManualWindow("max", 0, samples, 0, 20, 20, false); !ok || got != 3 {
 		t.Fatalf("max: expected 3,true got %v,%v", got, ok)
 	}
-	if got, ok := aggregateManualWindow("stddev", 0, samples, 0, 20, 20); !ok {
+	if got, ok := aggregateManualWindow("stddev", 0, samples, 0, 20, 20, false); !ok {
 		t.Fatal("stddev: expected success")
 	} else {
-		assertClose("stddev", got, math.Sqrt(2.0/3.0))
+		assertClose("stddev", got, 0.5)
 	}
-	if got, ok := aggregateManualWindow("stdvar", 0, samples, 0, 20, 20); !ok {
+	if got, ok := aggregateManualWindow("stdvar", 0, samples, 0, 20, 20, false); !ok {
 		t.Fatal("stdvar: expected success")
 	} else {
-		assertClose("stdvar", got, 2.0/3.0)
+		assertClose("stdvar", got, 0.25)
 	}
-	if got, ok := aggregateManualWindow("quantile", 0.5, samples, 0, 20, 20); !ok || got != 2 {
-		t.Fatalf("quantile: expected 2,true got %v,%v", got, ok)
+	if got, ok := aggregateManualWindow("quantile", 0.5, samples, 0, 20, 20, false); !ok || got != 2.5 {
+		t.Fatalf("quantile: expected 2.5,true got %v,%v", got, ok)
 	}
-	if got, ok := aggregateManualWindow("first", 0, samples, 0, 20, 20); !ok || got != 1 {
-		t.Fatalf("first: expected 1,true got %v,%v", got, ok)
+	if got, ok := aggregateManualWindow("first", 0, samples, 0, 20, 20, false); !ok || got != 2 {
+		t.Fatalf("first: expected 2,true got %v,%v", got, ok)
 	}
-	if got, ok := aggregateManualWindow("last", 0, samples, 0, 20, 20); !ok || got != 3 {
+	if got, ok := aggregateManualWindow("last", 0, samples, 0, 20, 20, false); !ok || got != 3 {
 		t.Fatalf("last: expected 3,true got %v,%v", got, ok)
 	}
 
@@ -218,19 +236,21 @@ func TestCompatHelpers_AggregateManualWindow(t *testing.T) {
 		{ts: 20, value: 10},
 		{ts: 30, value: 30},
 	}
-	if got, ok := aggregateManualWindow("rate_counter", 0, counterSamples, 0, 30, 30); !ok {
+	if got, ok := aggregateManualWindow("rate_counter", 0, counterSamples, 0, 30, 30, false); !ok {
 		t.Fatal("rate_counter: expected success")
 	} else {
-		assertClose("rate_counter", got, 2.0)
+		// (0, 30] drops the ts=0 sample, so the counter series is {130, 10, 30}:
+		// one reset (130→10, +10) plus 10→30 (+20) = 30 over 30 s.
+		assertClose("rate_counter", got, 1.0)
 	}
 
-	if _, ok := aggregateManualWindow("unknown", 0, samples, 0, 20, 20); ok {
+	if _, ok := aggregateManualWindow("unknown", 0, samples, 0, 20, 20, false); ok {
 		t.Fatal("expected unknown aggregate function to fail")
 	}
-	if _, ok := aggregateManualWindow("rate", 0, samples, 0, 20, 0); ok {
+	if _, ok := aggregateManualWindow("rate", 0, samples, 0, 20, 0, false); ok {
 		t.Fatal("expected rate with non-positive windowSeconds to fail")
 	}
-	if _, ok := aggregateManualWindow("sum", 0, samples, 999, 1000, 1); ok {
+	if _, ok := aggregateManualWindow("sum", 0, samples, 999, 1000, 1, false); ok {
 		t.Fatal("expected aggregate on empty sample window to fail")
 	}
 }
@@ -261,7 +281,7 @@ func TestCompatHelpers_BuildManualRangeResponses(t *testing.T) {
 			} `json:"result"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(buildManualRangeMetricMatrix("count_over_time", 0, series, start, end, step, window, 0), &matrixResp); err != nil {
+	if err := json.Unmarshal(buildManualRangeMetricMatrix("count_over_time", 0, series, start, end, step, window, 0, false), &matrixResp); err != nil {
 		t.Fatalf("decode matrix response: %v", err)
 	}
 	if matrixResp.Status != "success" || matrixResp.Data.ResultType != "matrix" {
@@ -281,7 +301,7 @@ func TestCompatHelpers_BuildManualRangeResponses(t *testing.T) {
 			} `json:"result"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(buildManualRangeMetricVector("last", 0, series, end, window), &vectorResp); err != nil {
+	if err := json.Unmarshal(buildManualRangeMetricVector("last", 0, series, end, window, false), &vectorResp); err != nil {
 		t.Fatalf("decode vector response: %v", err)
 	}
 	if vectorResp.Status != "success" || vectorResp.Data.ResultType != "vector" {
@@ -296,7 +316,7 @@ func TestCompatHelpers_BuildManualRangeResponses(t *testing.T) {
 			Result []json.RawMessage `json:"result"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(buildManualRangeMetricMatrix("sum", 0, series, end, start, step, window, 0), &emptyMatrix); err != nil {
+	if err := json.Unmarshal(buildManualRangeMetricMatrix("sum", 0, series, end, start, step, window, 0, false), &emptyMatrix); err != nil {
 		t.Fatalf("decode empty matrix response: %v", err)
 	}
 	if len(emptyMatrix.Data.Result) != 0 {

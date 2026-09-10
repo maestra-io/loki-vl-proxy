@@ -751,7 +751,8 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 
-	result := buildManualRangeMetricMatrix(manualFunc, quantile, series, startTS, endTS, step, origSpec.Window, p.resolvedMaxStatsQuerySeries())
+	// collectRangeMetricSamples returns RAW log entries.
+	result := buildManualRangeMetricMatrix(manualFunc, quantile, series, startTS, endTS, step, origSpec.Window, p.resolvedMaxStatsQuerySeries(), false)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(result) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter -- Content-Type set above; proxy returns pre-built JSON
 	return true
@@ -778,7 +779,8 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 		return true
 	}
 
-	result := buildManualRangeMetricVector(manualFunc, quantile, series, evalTS, origSpec.Window)
+	// collectRangeMetricSamples returns RAW log entries.
+	result := buildManualRangeMetricVector(manualFunc, quantile, series, evalTS, origSpec.Window, false)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(result) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter -- Content-Type set above; proxy returns pre-built JSON
 	return true
@@ -1651,7 +1653,9 @@ func capSeriesByTotalCount(series map[string]manualSeriesSamples, maxSeries int)
 	return capped
 }
 
-func buildManualRangeMetricMatrix(functionName string, quantile float64, series map[string]manualSeriesSamples, start, end time.Time, step, window time.Duration, maxSeries int) []byte {
+// preBucketed says the series carry VictoriaLogs stats buckets (timestamp =
+// bucket start) rather than raw log entries — see aggregateManualWindow.
+func buildManualRangeMetricMatrix(functionName string, quantile float64, series map[string]manualSeriesSamples, start, end time.Time, step, window time.Duration, maxSeries int, preBucketed bool) []byte {
 	series = capSeriesByTotalCount(series, maxSeries)
 	if end.Before(start) {
 		return marshalManualMetricResponse("matrix", []map[string]interface{}{})
@@ -1669,7 +1673,7 @@ func buildManualRangeMetricMatrix(functionName string, quantile float64, series 
 		windowEnd := t.UnixNano()
 		for _, key := range keys {
 			seriesEntry := series[key]
-			value, ok := aggregateManualWindow(functionName, quantile, seriesEntry.Samples, windowStart, windowEnd, window.Seconds())
+			value, ok := aggregateManualWindow(functionName, quantile, seriesEntry.Samples, windowStart, windowEnd, window.Seconds(), preBucketed)
 			if !ok {
 				continue
 			}
@@ -1792,7 +1796,7 @@ func buildHitsRangeMetricMatrix(manualFunc string, series map[string]manualSerie
 	return marshalManualMetricResponse("matrix", results)
 }
 
-func buildManualRangeMetricVector(functionName string, quantile float64, series map[string]manualSeriesSamples, evalTime time.Time, window time.Duration) []byte {
+func buildManualRangeMetricVector(functionName string, quantile float64, series map[string]manualSeriesSamples, evalTime time.Time, window time.Duration, preBucketed bool) []byte {
 	keys := make([]string, 0, len(series))
 	for key := range series {
 		keys = append(keys, key)
@@ -1805,7 +1809,7 @@ func buildManualRangeMetricVector(functionName string, quantile float64, series 
 
 	for _, key := range keys {
 		seriesEntry := series[key]
-		value, ok := aggregateManualWindow(functionName, quantile, seriesEntry.Samples, windowStart, windowEnd, window.Seconds())
+		value, ok := aggregateManualWindow(functionName, quantile, seriesEntry.Samples, windowStart, windowEnd, window.Seconds(), preBucketed)
 		if !ok {
 			continue
 		}
@@ -1832,13 +1836,36 @@ func marshalManualMetricResponse(resultType string, result []map[string]interfac
 	return payload
 }
 
-func aggregateManualWindow(functionName string, quantile float64, samples []rangeMetricSample, windowStart, windowEnd int64, windowSeconds float64) (float64, bool) {
+// aggregateManualWindow folds the samples of ONE evaluation window.
+//
+// The window is HALF-OPEN — `(windowStart, windowEnd]` — because that is what
+// LogQL's range vector selects at time t for `[range]`. A closed left bound puts
+// a sample sitting exactly on a bucket edge into BOTH adjacent windows, and on
+// evenly-spaced data that is not a rounding difference: 20 s-spaced entries in
+// 1 m tumbling buckets came back +33 % against Loki (measured 10.09.2026 —
+// 20 counted where Loki counted 15).
+//
+// That rule is about RAW entry timestamps. Some callers instead pass
+// PRE-BUCKETED VictoriaLogs stats samples, whose timestamp is a bucket START
+// standing for every entry in `[ts, ts+step)`. Excluding such a bucket because
+// its start coincides with the window edge would drop entries that are inside
+// the window, so `preBucketed` keeps the left bound closed for them — the same
+// choice buildHitsRangeMetricMatrix makes with `[T-window, T)`.
+func aggregateManualWindow(functionName string, quantile float64, samples []rangeMetricSample, windowStart, windowEnd int64, windowSeconds float64, preBucketed bool) (float64, bool) {
+	// One exclusive lower bound, computed once: raw entries exclude windowStart
+	// itself, pre-bucketed samples keep it (timestamps are integer nanoseconds,
+	// so "one below" is exact).
+	lowerExclusive := windowStart
+	if preBucketed {
+		lowerExclusive = windowStart - 1
+	}
+	outOfWindow := func(ts int64) bool { return ts <= lowerExclusive || ts > windowEnd }
 	// Slice-dependent functions: build filtered slice, then aggregate.
 	switch functionName {
 	case "quantile", "stddev", "stdvar", "rate_counter":
 		values := make([]float64, 0, len(samples))
 		for _, sample := range samples {
-			if sample.ts < windowStart || sample.ts > windowEnd {
+			if outOfWindow(sample.ts) {
 				continue
 			}
 			values = append(values, sample.value)
@@ -1876,7 +1903,7 @@ func aggregateManualWindow(functionName string, quantile float64, samples []rang
 		hasFirst bool
 	)
 	for _, sample := range samples {
-		if sample.ts < windowStart || sample.ts > windowEnd {
+		if outOfWindow(sample.ts) {
 			continue
 		}
 		v := sample.value
