@@ -37,6 +37,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The grouped/two-phase range path still labelled buckets by their START.**
+  `sum by (<stream label>) (count_over_time({…}[1h]))` goes through the global
+  top-N two-phase path, which builds its own request and response handling, and
+  it kept VictoriaLogs' labels after the direct path was fixed: every point sat
+  one `step` to the left and the last bucket collected data past `end`
+  (reproduced for `by (pod)`, `by (app)`, `by (namespace)`). Both two-phase paths
+  now go through the same `buildLokiGridStatsParams` + `shiftStatsQRToLokiGrid` +
+  `lokiGridWindowKeep` helpers as the direct one.
+- **A quantile is computed here, not in VictoriaLogs.** VL's `quantile()` returns
+  an actual sample (nearest rank); LogQL interpolates between the order
+  statistics around `q*(n-1)`, like Prometheus. Measured against Loki 3.7.1 over
+  ten samples 109…199: q=0.95 → Loki 194.5, VL 199; q=0.5 → Loki 154, VL 149.
+- **A range aggregation is evaluated PER LABEL SET before the outer aggregation
+  runs.** The manual and template paths pooled every row into one series when the
+  outer aggregation carried no `by()`. That is exact for an additive aggregation
+  (`sum(count_over_time(…))`) and wrong for an order statistic:
+  `max(quantile_over_time(0.95, …))` is the max of the per-series p95s, while
+  pooling returns the p95 of everything — the T5 panel came back 13.4% below Loki
+  (1488.7 vs 1720). Such queries now fan out per label set, and the outer
+  aggregation is applied across the results.
+- **An extracted label no longer shadows a stream label.** LogQL gives an
+  existing stream label priority over one a parser extracts and exposes the
+  parsed value as `<name>_extracted`; VictoriaLogs' `unpack_json` simply
+  overwrites the row's field, so `sum by (namespace) (count_over_time(
+  {namespace="flux-system"}[1h]))` returned 39 series — one per namespace named in
+  the log BODIES — instead of one. Both surfaces implement Loki's rule now: the
+  pushed-down query snapshots each grouped label before the parser and restores it
+  after, and the proxy-side pipeline renames a colliding parsed label to
+  `<name>_extracted`.
+
 - **Every range-metric point sat one `step` to the left of where Loki draws it.**
   VictoriaLogs labels a stats bucket by its START; LogQL labels a range point by
   the EVALUATION time, i.e. the bucket's END. The proxy passed VL's label

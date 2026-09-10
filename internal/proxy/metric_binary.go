@@ -149,9 +149,7 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 	// range-metric point with the EVALUATION time, i.e. the bucket's END. The
 	// response is relabelled below, and the request reaches one step FURTHER
 	// BACK so the point at `start` still has a bucket behind it.
-	params := buildStatsQueryRangeParams(logsqlQuery,
-		shiftRangeStartOneStep(r.FormValue("start"), r.FormValue("step")),
-		r.FormValue("end"), r.FormValue("step"))
+	params := p.buildLokiGridStatsParams(logsqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
 
 	// Use vlPost directly (not coalesced) so readBodyLimited can bound the response
 	// before the full body is allocated. The coalescer's 256 MB cap is too generous
@@ -213,19 +211,8 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 	// Single parse pass: filter points to the requested end time AND translate
 	// metric labels. Replaces two sequential fastjson parses (trim then translate).
 	body = shiftStatsQRToLokiGrid(body, r.FormValue("step"))
-	var keepFn func(int64) bool
-	startNs, hasStart := parseLokiTimeToUnixNano(r.FormValue("start"))
-	endNs, hasEnd := parseLokiTimeToUnixNano(r.FormValue("end"))
-	if hasStart || hasEnd {
-		keepFn = func(tsNs int64) bool {
-			if hasEnd && tsNs > endNs {
-				return false
-			}
-			// The extra step requested above can yield a point before `start`.
-			return !hasStart || tsNs >= startNs
-		}
-	}
-	body = p.trimAndTranslateStatsQRFJ(r.Context(), body, keepFn, r.FormValue("query"))
+	body = p.trimAndTranslateStatsQRFJ(r.Context(), body,
+		lokiGridWindowKeep(r.FormValue("start"), r.FormValue("end")), r.FormValue("query"))
 	// Cap to the busiest maxStatsQuerySeries (default 500, top-N by total count).
 	// This is the path taken by `sum by (pod|trace_id|*_id) (count_over_time(
 	// {...} | detected_level="error" [w]))` from the Drilldown labels page —
@@ -2244,7 +2231,7 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	inFilter := buildVLInFilter(field, topValues)
 	p2Query := p1Base + " | filter " + inFilter + " | stats by (" + quoteLogsQLIdent(field) + ") count()"
 	p2Query = p.addUnderscorefallbackByLabels(p2Query, parseOriginalByLabels(r.FormValue("query")))
-	p2Params := buildStatsQueryRangeParams(p2Query, start, end, r.FormValue("step"))
+	p2Params := p.buildLokiGridStatsParams(p2Query, start, end, r.FormValue("step"))
 	resp2, err := p.vlPost(ctx, "/select/logsql/stats_query_range", p2Params)
 	if err != nil {
 		return nil
@@ -2257,8 +2244,8 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	if p2Err != nil {
 		return nil
 	}
-	keepFn := func(tsNs int64) bool { return tsNs <= endNs }
-	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, keepFn, r.FormValue("query"))
+	p2Body = shiftStatsQRToLokiGrid(p2Body, r.FormValue("step"))
+	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, lokiGridWindowKeep(start, end), r.FormValue("query"))
 	p2Body = limitLokiMatrixSeries(p2Body, p.resolvedMaxStatsQuerySeries())
 	return wrapAsLokiResponse(p2Body, "matrix")
 }
@@ -2316,7 +2303,7 @@ func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, fi
 	origGroupBy := parseOriginalByLabels(r.FormValue("query"))
 	p2Query = p.addUnderscorefallbackByLabels(p2Query, origGroupBy)
 
-	p2Params := buildStatsQueryRangeParams(p2Query, start, end, step)
+	p2Params := p.buildLokiGridStatsParams(p2Query, start, end, step)
 	resp2, err := p.vlPost(ctx, "/select/logsql/stats_query_range", p2Params)
 	if err != nil {
 		return nil
@@ -2331,11 +2318,8 @@ func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, fi
 		return nil
 	}
 
-	var keepFn func(int64) bool
-	if ok2 {
-		keepFn = func(tsNs int64) bool { return tsNs <= endNs }
-	}
-	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, keepFn, r.FormValue("query"))
+	p2Body = shiftStatsQRToLokiGrid(p2Body, step)
+	p2Body = p.trimAndTranslateStatsQRFJ(ctx, p2Body, lokiGridWindowKeep(start, end), r.FormValue("query"))
 	p2Body = limitLokiMatrixSeries(p2Body, maxDrilldownSeries)
 	return wrapAsLokiResponse(p2Body, "matrix")
 }
@@ -2640,6 +2624,34 @@ func mapStatsQRPointTimestamps(body []byte, deltaNs int64) []byte {
 	out := make([]byte, buf.Len())
 	copy(out, buf.Bytes())
 	return out
+}
+
+// buildLokiGridStatsParams builds stats_query_range params for a range query
+// whose response will be relabelled onto the Loki grid: the window opens one
+// step BEFORE `start`, so the point at `start` still has a bucket behind it.
+// Every path that returns a Loki matrix built from stats buckets must use this
+// together with shiftStatsQRToLokiGrid + lokiGridWindowKeep, or its points land
+// one step to the left of where Loki draws them.
+func (p *Proxy) buildLokiGridStatsParams(query, startRaw, endRaw, stepRaw string) url.Values {
+	return buildStatsQueryRangeParams(p.guardExtractedLabelShadowing(query),
+		shiftRangeStartOneStep(startRaw, stepRaw), endRaw, stepRaw)
+}
+
+// lokiGridWindowKeep returns the point filter for a relabelled response: the
+// extra step fetched below `start` lands before it, and the bucket at `end`
+// lands past it. nil when the request carries neither bound.
+func lokiGridWindowKeep(startRaw, endRaw string) func(int64) bool {
+	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)
+	endNs, hasEnd := parseLokiTimeToUnixNano(endRaw)
+	if !hasStart && !hasEnd {
+		return nil
+	}
+	return func(tsNs int64) bool {
+		if hasEnd && tsNs > endNs {
+			return false
+		}
+		return !hasStart || tsNs >= startNs
+	}
 }
 
 func buildStatsQueryRangeParams(logsqlQuery, startRaw, endRaw, stepRaw string) url.Values {
@@ -3402,7 +3414,7 @@ func (p *Proxy) proxyStatsQuery(w http.ResponseWriter, r *http.Request, logsqlQu
 	}
 
 	params := url.Values{}
-	params.Set("query", logsqlQuery)
+	params.Set("query", p.guardExtractedLabelShadowing(logsqlQuery))
 	evalTime := r.FormValue("time")
 	if evalTime == "" {
 		evalTime = strconv.FormatInt(time.Now().UnixNano(), 10)
