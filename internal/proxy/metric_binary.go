@@ -145,11 +145,18 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 
 	// Keep metric query_range as a single backend request. Window splitting and
 	// window-level cache reuse are for raw log queries only.
+	// `now`/`now±d` bounds resolve against time.Now() on EVERY parse, so the
+	// request and the response filter would otherwise be built from two
+	// different instants — and the filter, being later, drops the very first
+	// point the request went one step back to fetch. Freeze them once.
+	startRaw := freezeRelativeRangeBound(r.FormValue("start"))
+	endRaw := freezeRelativeRangeBound(r.FormValue("end"))
+
 	// VictoriaLogs labels each stats bucket with its START; LogQL labels every
 	// range-metric point with the EVALUATION time, i.e. the bucket's END. The
 	// response is relabelled below, and the request reaches one step FURTHER
 	// BACK so the point at `start` still has a bucket behind it.
-	params := p.buildLokiGridStatsParams(logsqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
+	params := p.buildLokiGridStatsParams(logsqlQuery, startRaw, endRaw, r.FormValue("step"))
 
 	// Use vlPost directly (not coalesced) so readBodyLimited can bound the response
 	// before the full body is allocated. The coalescer's 256 MB cap is too generous
@@ -210,9 +217,9 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 
 	// Single parse pass: filter points to the requested end time AND translate
 	// metric labels. Replaces two sequential fastjson parses (trim then translate).
-	body = shiftStatsQRToLokiGrid(body, r.FormValue("start"), r.FormValue("step"))
+	body = shiftStatsQRToLokiGrid(body, startRaw, r.FormValue("step"))
 	body = p.trimAndTranslateStatsQRFJ(r.Context(), body,
-		lokiGridWindowKeep(r.FormValue("start"), r.FormValue("end")), r.FormValue("query"))
+		lokiGridWindowKeep(startRaw, endRaw), r.FormValue("query"))
 	// Cap to the busiest maxStatsQuerySeries (default 500, top-N by total count).
 	// This is the path taken by `sum by (pod|trace_id|*_id) (count_over_time(
 	// {...} | detected_level="error" [w]))` from the Drilldown labels page —
@@ -2170,7 +2177,8 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	if !ok || spec.Func != "count" || len(spec.GroupBy) != 1 || isRateMathPipeline(logsqlQuery) {
 		return nil
 	}
-	start, end := r.FormValue("start"), r.FormValue("end")
+	start := freezeRelativeRangeBound(r.FormValue("start"))
+	end := freezeRelativeRangeBound(r.FormValue("end"))
 	startNs, ok1 := parseLokiTimeToUnixNano(start)
 	endNs, ok2 := parseLokiTimeToUnixNano(end)
 	if !ok1 || !ok2 || endNs <= startNs {
@@ -2252,7 +2260,8 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 
 func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, field, effectiveStep string) []byte {
 	ctx := r.Context()
-	start, end := r.FormValue("start"), r.FormValue("end")
+	start := freezeRelativeRangeBound(r.FormValue("start"))
+	end := freezeRelativeRangeBound(r.FormValue("end"))
 	step := effectiveStep
 	if step == "" {
 		step = r.FormValue("step")
@@ -2654,6 +2663,21 @@ func mapStatsQRPointTimestamps(body []byte, deltaNs int64, snap func(int64) int6
 // A microsecond is the finest offset VictoriaLogs accepts (`1ns` is rejected)
 // and is far below any log timestamp's resolution.
 const lokiGridBucketEpsilonNanos = int64(time.Microsecond)
+
+// freezeRelativeRangeBound resolves a `now`/`now±d` bound to an absolute
+// nanosecond timestamp so every later parse of the same request sees ONE
+// instant. Absolute bounds are returned untouched.
+func freezeRelativeRangeBound(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed != "now" && !strings.HasPrefix(trimmed, "now-") && !strings.HasPrefix(trimmed, "now+") {
+		return raw
+	}
+	ns, ok := parseLokiTimeToUnixNano(trimmed)
+	if !ok {
+		return raw
+	}
+	return strconv.FormatInt(ns, 10)
+}
 
 // lokiGridOffsetNanos is how far LEFT VictoriaLogs' bucket grid must move for
 // its buckets to become the LogQL windows of the client's own step grid.

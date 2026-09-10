@@ -650,6 +650,22 @@ func parseTopKWrapper(logql string) (k int, descending bool, ok bool) {
 // step. When true, VL's native rate() — which buckets by the step interval —
 // is semantically identical to LogQL rate()[range]. Pass false to keep the
 // sliding-window manual path for cases where range != step.
+// quantileFallsBackToBackend reports whether a failed raw-row scan for a
+// QUANTILE should hand the query back to the native VictoriaLogs route.
+//
+// A quantile is computed here because VictoriaLogs' `quantile()` is nearest-rank
+// while LogQL interpolates — but that exactness is bought with a raw-row scan,
+// and a busy panel can exceed the scan cap. Failing such a panel with a 400
+// trades a small numeric difference for no chart at all, so a truncated scan
+// falls back to VictoriaLogs' own quantile instead.
+func quantileFallsBackToBackend(manualFunc string, err error) bool {
+	if manualFunc != "quantile" {
+		return false
+	}
+	var truncated *rawRowScanTruncatedError
+	return errors.As(err, &truncated)
+}
+
 // manualQuantileRoutable reports whether a quantile query must be evaluated
 // HERE rather than pushed to VictoriaLogs.
 //
@@ -789,6 +805,9 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 
 	series, err := p.collectRangeMetricSamples(r.Context(), spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, field, origSpec.UnwrapConv, startTS.Add(-origSpec.Window), endTS)
 	if err != nil {
+		if quantileFallsBackToBackend(manualFunc, err) {
+			return false
+		}
 		p.writeError(w, statusForRangeMetricCollectError(err), err.Error())
 		return true
 	}
@@ -820,6 +839,9 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 
 	series, err := p.collectRangeMetricSamples(r.Context(), spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, field, origSpec.UnwrapConv, evalTS.Add(-origSpec.Window), evalTS)
 	if err != nil {
+		if quantileFallsBackToBackend(manualFunc, err) {
+			return false
+		}
 		p.writeError(w, statusForRangeMetricCollectError(err), err.Error())
 		return true
 	}
@@ -2083,11 +2105,19 @@ func outerAggregationOverSeries(originalLogql, manualFunc string) (agg string, b
 		// same number the outer sum would produce, and it is the cheaper path.
 		return "", nil, false
 	}
-	trimmed := strings.TrimSpace(originalLogql)
-	name := strings.TrimSpace(outerAggregationRE.FindString(trimmed))
-	if name == "" {
+	trimmed := stripOuterLabelReplace(strings.TrimSpace(originalLogql))
+	loc := outerAggregationRE.FindStringIndex(trimmed)
+	if loc == nil || loc[0] != 0 || loc[1] >= len(trimmed) {
 		return "", nil, false
 	}
+	// outerAggregationRE matches a bare keyword, and every one of them is also
+	// the prefix of a RANGE aggregation: `min_over_time(...)` starts with `min`,
+	// `count_over_time(...)` with `count`. Only a `(` (after an optional
+	// by/without clause) makes it the outer operator.
+	if !strings.HasPrefix(strings.TrimSpace(trimmed[loc[1]:]), "(") {
+		return "", nil, false
+	}
+	name := strings.TrimSpace(trimmed[loc[0]:loc[1]])
 	if i := strings.IndexAny(name, "( \t"); i > 0 {
 		name = name[:i]
 	}
@@ -2117,7 +2147,11 @@ func applyLokiSeriesDecomposition(spec *statsCompatSpec, originalLogql, manualFu
 		return
 	}
 	spec.OuterAggAcrossSeries, spec.OuterAggBy = agg, by
-	spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit = nil, nil, false
+	// Only the POOLING is switched off. The grouping labels stay: the raw-row
+	// collector needs them to keep parser-derived dimensions in the series key
+	// (it only materialises the fields named in by(...)), and dropping them
+	// would leave the reduction below with labels that no longer exist.
+	spec.ByExplicit = false
 }
 
 // reduceLokiSeriesAcrossSeries applies the outer aggregation LogQL runs over the
@@ -2148,9 +2182,12 @@ func reduceLokiSeriesAcrossSeries(body []byte, agg string, by []string) []byte {
 		return body
 	}
 	result, _ := data["result"].([]interface{})
-	if len(result) <= 1 {
+	if len(result) == 0 {
 		return body
 	}
+	// A single series is NOT a no-op: the decomposition keeps the full label set
+	// on it, and the outer aggregation still has to trim it to its by() labels
+	// (to `{}` when it has none).
 
 	type acc struct {
 		val    float64

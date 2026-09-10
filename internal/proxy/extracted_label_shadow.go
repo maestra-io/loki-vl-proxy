@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"strconv"
 	"strings"
 )
 
@@ -27,10 +28,17 @@ var logsqlParserStages = []string{"| unpack_json", "| unpack_logfmt", "| extract
 // returned unchanged.
 func (p *Proxy) guardExtractedLabelShadowing(logsqlQuery string) string {
 	scanned := stripQuotedSpans(logsqlQuery)
-	parserIdx := -1
+	parserIdx, lastParserIdx := -1, -1
 	for _, stage := range logsqlParserStages {
 		if i := strings.Index(scanned, stage); i >= 0 && (parserIdx < 0 || i < parserIdx) {
 			parserIdx = i
+		}
+		// A pipeline can carry several parsers (`| unpack_json | unpack_logfmt`,
+		// or the derived-level materialisation appending its own). Restoring
+		// after the FIRST one lets a later parser shadow the label again, so the
+		// restore goes after the LAST parser stage.
+		if i := strings.LastIndex(scanned, stage); i > lastParserIdx {
+			lastParserIdx = i
 		}
 	}
 	if parserIdx < 0 {
@@ -46,29 +54,7 @@ func (p *Proxy) guardExtractedLabelShadowing(logsqlQuery string) string {
 		return logsqlQuery
 	}
 
-	// The parser can only shadow a BARE field name. A mapped VictoriaLogs field
-	// (`kubernetes.pod_namespace`) is dotted and quoted in the query, and no JSON
-	// body field is named like that.
-	var protect []string
-	seen := map[string]bool{}
-	for _, label := range spec.GroupBy {
-		label = strings.Trim(strings.TrimSpace(label), `"`)
-		if label == "" || seen[label] || strings.ContainsAny(label, `."'`) ||
-			strings.HasPrefix(label, "__lvp_") || label == "_stream" || label == "_time" {
-			continue
-		}
-		if base, isExtracted := strings.CutSuffix(label, "_extracted"); isExtracted && base != "" {
-			// Grouping by `<label>_extracted` needs the BASE label protected —
-			// that is where the parsed value lands.
-			if !seen[base] {
-				seen[base] = true
-				protect = append(protect, base)
-			}
-			continue
-		}
-		seen[label] = true
-		protect = append(protect, label)
-	}
+	protect := protectedShadowNames(spec)
 	if len(protect) == 0 {
 		return logsqlQuery
 	}
@@ -96,14 +82,69 @@ func (p *Proxy) guardExtractedLabelShadowing(logsqlQuery string) string {
 		restore.WriteString(` | format if (` + tmp + `:*) "<` + tmp + `>" as ` + label)
 	}
 
-	// Find the END of the parser stage — the next pipe, or the stats clause.
-	parserEnd := strings.Index(scanned[parserIdx+1:], "|")
+	// Find the END of the LAST parser stage — the next pipe, or the stats clause.
+	parserEnd := strings.Index(scanned[lastParserIdx+1:], "|")
 	if parserEnd < 0 {
 		return logsqlQuery
 	}
-	parserEnd += parserIdx + 1
+	parserEnd += lastParserIdx + 1
 
 	return logsqlQuery[:parserIdx] + snapshot.String() + " " +
 		strings.TrimSpace(logsqlQuery[parserIdx:parserEnd]) + restore.String() + " " +
 		strings.TrimSpace(logsqlQuery[parserEnd:])
+}
+
+// protectedShadowNames lists the bare field names a parser stage must not
+// shadow: every grouping label and every field the aggregation itself reads.
+// A mapped VictoriaLogs field (`kubernetes.pod_namespace`) is dotted and quoted
+// in the query, and no JSON body field is named like that, so only bare names
+// can collide.
+func protectedShadowNames(spec statsCompatSpec) []string {
+	var protect []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		name = strings.Trim(strings.TrimSpace(name), `"`)
+		if name == "" || seen[name] || strings.ContainsAny(name, `."'`) ||
+			strings.HasPrefix(name, "__lvp_") || name == "_stream" || name == "_time" {
+			return
+		}
+		seen[name] = true
+		protect = append(protect, name)
+	}
+	for _, label := range spec.GroupBy {
+		label = strings.Trim(strings.TrimSpace(label), `"`)
+		// Grouping by `<label>_extracted` needs the BASE label protected — that
+		// is where the parsed value lands.
+		if base, isExtracted := strings.CutSuffix(label, "_extracted"); isExtracted && base != "" {
+			add(base)
+			continue
+		}
+		add(label)
+	}
+	// The aggregation reads a field by name as well — `quantile(0.95, duration_ms)`,
+	// `sum(bytes)`, `| unwrap duration_ms`. LogQL takes the STREAM label when the
+	// parser extracts one of the same name, so it needs the same protection.
+	for _, field := range statsFieldNames(spec.Field) {
+		add(field)
+	}
+	return protect
+}
+
+// statsFieldNames returns the bare field names a stats function reads: the
+// argument of `count(field)` / `sum(field)`, or the second argument of
+// `quantile(0.95, field)`. Numbers and quoted literals are skipped.
+func statsFieldNames(statsArgs string) []string {
+	args := strings.Split(statsArgs, ",")
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg == "" || strings.ContainsAny(arg, `"'()`) {
+			continue
+		}
+		if _, err := strconv.ParseFloat(arg, 64); err == nil {
+			continue // a quantile's phi, not a field
+		}
+		out = append(out, arg)
+	}
+	return out
 }
