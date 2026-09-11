@@ -456,6 +456,79 @@ func TranslateLogQLWithMapping(logql string, labelFn LabelTranslateFunc, streamF
 	return translateLogQLFull(logql, labelFn, streamFields, caps, mapping)
 }
 
+// logqlCallNames are the LogQL functions and aggregations whose `(` may be
+// separated from the name by whitespace. Keywords that legitimately take a
+// SPACED paren — by, without, on, ignoring, group_left, group_right — are
+// deliberately absent: their spacing is already handled and must stay.
+var logqlCallNames = map[string]bool{
+	"sum": true, "avg": true, "min": true, "max": true, "count": true,
+	"stddev": true, "stdvar": true, "topk": true, "bottomk": true,
+	"sort": true, "sort_desc": true, "group": true, "count_values": true,
+	"quantile": true, "approx_topk": true,
+	"rate": true, "rate_counter": true, "count_over_time": true,
+	"bytes_rate": true, "bytes_over_time": true, "sum_over_time": true,
+	"avg_over_time": true, "max_over_time": true, "min_over_time": true,
+	"first_over_time": true, "last_over_time": true, "stdvar_over_time": true,
+	"stddev_over_time": true, "quantile_over_time": true, "absent_over_time": true,
+	"label_replace": true, "vector": true, "absent": true, "abs": true,
+	"ceil": true, "floor": true, "round": true, "exp": true, "ln": true,
+	"log2": true, "log10": true, "sqrt": true,
+}
+
+// NormalizeCallWhitespace removes the whitespace between a LogQL function name
+// and its opening paren. Quoted spans (", `) are left untouched, so a line
+// filter such as `|= "sum (x)"` keeps its text.
+func NormalizeCallWhitespace(logql string) string {
+	if !strings.Contains(logql, " (") && !strings.Contains(logql, "\t(") && !strings.Contains(logql, "\n(") {
+		return logql
+	}
+	var b strings.Builder
+	b.Grow(len(logql))
+	for i := 0; i < len(logql); {
+		c := logql[i]
+		switch c {
+		case '"', '`':
+			j := i + 1
+			for j < len(logql) {
+				if logql[j] == c && (c == '`' || logql[j-1] != '\\') {
+					j++
+					break
+				}
+				j++
+			}
+			b.WriteString(logql[i:j])
+			i = j
+			continue
+		}
+		if !isLogQLIdentByte(c) || (i > 0 && isLogQLIdentByte(logql[i-1])) {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		j := i
+		for j < len(logql) && isLogQLIdentByte(logql[j]) {
+			j++
+		}
+		name := logql[i:j]
+		k := j
+		for k < len(logql) && isLogQLSpace(logql[k]) {
+			k++
+		}
+		if k > j && k < len(logql) && logql[k] == '(' && logqlCallNames[name] {
+			b.WriteString(name)
+			i = k
+			continue
+		}
+		b.WriteString(name)
+		i = j
+	}
+	return b.String()
+}
+
+func isLogQLIdentByte(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
 func translateLogQLFull(logql string, labelFn LabelTranslateFunc, streamFields map[string]bool, caps logsql.Capabilities, mapping *MappingOptions) (string, error) {
 	// A fallback-chain label that this query GROUPS BY is materialised into a
 	// real field of that exact name by chainCoalescePipes. The by-clause must
@@ -468,6 +541,13 @@ func translateLogQLFull(logql string, labelFn LabelTranslateFunc, streamFields m
 	if logql == "" {
 		return "*", nil
 	}
+	// Whitespace between a function name and its `(` is insignificant in LogQL —
+	// `sum (count_over_time (...))` is the same query as `sum(count_over_time(...))`
+	// and Grafana stores it that way in saved panel JSON. This translator matches
+	// on `sum(`-shaped prefixes, so without normalising it stopped recognising the
+	// query as a metric one, fell through to the raw-log branch and emitted a
+	// LogsQL string that the backend then rejected.
+	logql = NormalizeCallWhitespace(logql)
 
 	// Detect subquery syntax: outer_func(inner_query[range:step])
 	// The proxy evaluates these by running the inner query at sub-step intervals.
@@ -717,34 +797,34 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 		}
 
 		if strings.HasPrefix(remaining, "|= ") || strings.HasPrefix(remaining, "|=\"") {
-			// Substring match: |= "text" → ~"text"
+			// Substring match: |= "text" → ~"text"; `|= "a" or "b"` → (~"a" OR ~"b")
 			remaining = strings.TrimSpace(remaining[2:])
-			val, rest := extractQuotedValue(remaining)
-			parts = append(parts, "~"+val)
+			values, rest := extractLineFilterValues(remaining)
+			parts = append(parts, lineFilterAlternation(values, false))
 			remaining = rest
 			continue
 		}
 		if strings.HasPrefix(remaining, "!= ") || strings.HasPrefix(remaining, "!=\"") {
-			// Negative substring: != "text" → NOT ~"text"
+			// Negative substring: != "text" → NOT ~"text"; an OR-list is negated whole
 			remaining = strings.TrimSpace(remaining[2:])
-			val, rest := extractQuotedValue(remaining)
-			parts = append(parts, "NOT ~"+val)
+			values, rest := extractLineFilterValues(remaining)
+			parts = append(parts, lineFilterAlternation(values, true))
 			remaining = rest
 			continue
 		}
 		if strings.HasPrefix(remaining, "|~ ") || strings.HasPrefix(remaining, "|~\"") {
 			// Regexp match: |~ "regexp" → ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
-			val, rest := extractQuotedValue(remaining)
-			parts = append(parts, "~"+val)
+			values, rest := extractLineFilterValues(remaining)
+			parts = append(parts, lineFilterAlternation(values, false))
 			remaining = rest
 			continue
 		}
 		if strings.HasPrefix(remaining, "!~ ") || strings.HasPrefix(remaining, "!~\"") {
 			// Negative regexp: !~ "regexp" → NOT ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
-			val, rest := extractQuotedValue(remaining)
-			parts = append(parts, "NOT ~"+val)
+			values, rest := extractLineFilterValues(remaining)
+			parts = append(parts, lineFilterAlternation(values, true))
 			remaining = rest
 			continue
 		}
@@ -2721,6 +2801,48 @@ func extractPipelineStage(s string) (stage, rest string) {
 }
 
 // extractQuotedValue extracts a quoted string (respecting escaped quotes) and returns (quoted_value, remaining).
+// extractLineFilterValues pulls one line-filter literal plus LogQL's OR-list
+// continuation (`|= "a" or "b" or "c"`) off the front of s. Each returned value
+// is already a quoted VL literal. An `or` NOT followed by a string literal is the
+// binary set operator and is left for the caller.
+func extractLineFilterValues(s string) ([]string, string) {
+	val, rest := extractQuotedValue(s)
+	values := []string{val}
+	for {
+		trimmed := strings.TrimSpace(rest)
+		if !strings.HasPrefix(trimmed, "or") {
+			break
+		}
+		after := strings.TrimSpace(trimmed[2:])
+		if after == "" || (after[0] != '"' && after[0] != '`') {
+			break
+		}
+		var next string
+		next, rest = extractQuotedValue(after)
+		values = append(values, next)
+	}
+	return values, strings.TrimSpace(rest)
+}
+
+// lineFilterAlternation renders the values as one VL filter. A multi-value list
+// is parenthesised so a negative filter's single NOT covers every alternative.
+func lineFilterAlternation(values []string, negated bool) string {
+	joined := ""
+	for i, v := range values {
+		if i > 0 {
+			joined += " OR "
+		}
+		joined += "~" + v
+	}
+	if len(values) > 1 {
+		joined = "(" + joined + ")"
+	}
+	if negated {
+		return "NOT " + joined
+	}
+	return joined
+}
+
 func extractQuotedValue(s string) (string, string) {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "\"") {

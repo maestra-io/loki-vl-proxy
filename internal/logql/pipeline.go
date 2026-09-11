@@ -684,25 +684,42 @@ func sanitizeLabel(s string) string {
 var lineFilterCache compileCache[*regexp.Regexp]
 
 func matchLineFilter(st *LineFilterStage, line string) bool {
-	switch st.Op {
-	case LineFilterContains:
-		return strings.Contains(line, st.Value)
-	case LineFilterExcludes:
-		return !strings.Contains(line, st.Value)
-	case LineFilterMatchRe, LineFilterExcludeRe:
-		re, ok := lineFilterCache.get(st.Value)
-		if !ok {
-			var err error
-			re, err = regexp.Compile(st.Value)
-			if err != nil {
+	// An OR-list shares one operator: a positive filter keeps a line matching ANY
+	// alternative, a negative one drops a line matching any of them.
+	anyContains := func() bool {
+		for _, v := range st.Values() {
+			if strings.Contains(line, v) {
 				return true
 			}
-			lineFilterCache.put(st.Value, re)
 		}
-		if st.Op == LineFilterMatchRe {
-			return re.MatchString(line)
+		return false
+	}
+	anyMatchesRe := func() bool {
+		for _, v := range st.Values() {
+			re, ok := lineFilterCache.get(v)
+			if !ok {
+				var err error
+				re, err = regexp.Compile(v)
+				if err != nil {
+					return true
+				}
+				lineFilterCache.put(v, re)
+			}
+			if re.MatchString(line) {
+				return true
+			}
 		}
-		return !re.MatchString(line)
+		return false
+	}
+	switch st.Op {
+	case LineFilterContains:
+		return anyContains()
+	case LineFilterExcludes:
+		return !anyContains()
+	case LineFilterMatchRe:
+		return anyMatchesRe()
+	case LineFilterExcludeRe:
+		return !anyMatchesRe()
 	default:
 		// |> and !> are pattern line filters — treat as a match so the backend's
 		// own filtering stands rather than dropping everything.

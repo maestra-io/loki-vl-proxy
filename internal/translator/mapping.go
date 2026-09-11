@@ -175,6 +175,18 @@ var levelSynonyms = map[string]string{
 	"unknown":  "unknown",
 }
 
+// anyLevelValuePattern matches every raw value Loki RECOGNISES as a level. A
+// named field holding anything else is, to Loki, no level at all.
+func anyLevelValuePattern() string {
+	alts := make([]string, 0, len(levelSynonyms))
+	for _, canonical := range []string{"error", "warn", "info", "debug", "trace", "critical", "unknown"} {
+		if alt, ok := levelSynonyms[canonical]; ok {
+			alts = append(alts, alt)
+		}
+	}
+	return "(?i)^(" + strings.Join(alts, "|") + ")$"
+}
+
 // levelValuePattern returns the anchored, case-insensitive regexp that matches
 // every raw level value mapping to the canonical value.
 func levelValuePattern(value string) string {
@@ -219,6 +231,25 @@ func (m *MappingOptions) derivedLevelFilter(value string, negate, isRe bool) str
 	}
 	if len(parts) == 0 {
 		return ""
+	}
+	if !negate && !isRe {
+		// Loki falls back to the LINE TEXT when no level field carries a value,
+		// so a panel filtering on detected_level="error" also returns the rows
+		// whose only evidence is the word in the message. Reproduce that here,
+		// guarded by "no named level field is present" so a real level always
+		// wins — which is Loki's precedence too.
+		if textPattern := LokiTextLevelPattern(value); textPattern != "" {
+			// Guard on a RECOGNISED named value, not on any value at all: Loki falls
+			// back to the line text when the level key holds something it does not
+			// know (`"LogLevel":"Information"`), so an unrecognised value must not
+			// suppress the heuristic.
+			present := make([]string, 0, len(m.DerivedLevelFields))
+			for _, f := range m.DerivedLevelFields {
+				present = append(present, buildFieldFilterStr(quoteVLField(f), logsql.FieldOpRegexp, anyLevelValuePattern(), false))
+			}
+			parts = append(parts, "(NOT ("+strings.Join(present, " OR ")+") AND "+
+				buildFieldFilterStr("_msg", logsql.FieldOpRegexp, textPattern, false)+")")
+		}
 	}
 	if len(parts) == 1 {
 		return parts[0]

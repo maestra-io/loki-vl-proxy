@@ -399,6 +399,29 @@ func (p *parser) parseLabelMatcher() (LabelMatcher, error) {
 	return LabelMatcher{Name: name.Val, Op: op, Value: valStr}, nil
 }
 
+// parseLineFilterOrList consumes LogQL's OR-list form of a line filter —
+// `|= "a" or "b" or "c"` — which Grafana's builder emits for a multi-value
+// "contains" filter. The alternatives share the stage's single operator.
+// `or` NOT followed by a string literal belongs to the binary set operator and
+// is left alone.
+func (p *parser) parseLineFilterOrList() ([]string, error) {
+	var out []string
+	for p.cur.Typ == TokOr {
+		switch p.peekTyp() {
+		case TokString, TokRawString:
+		default:
+			return out, nil
+		}
+		p.advance()
+		val, err := p.expectStringOrRaw()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, val)
+	}
+	return out, nil
+}
+
 // parsePipelineStage parses one pipeline stage. Returns nil, nil when no more
 // pipeline stages are found (i.e. EOF or unexpected token).
 func (p *parser) parsePipelineStage() (Stage, error) {
@@ -409,7 +432,11 @@ func (p *parser) parsePipelineStage() (Stage, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &LineFilterStage{Op: LineFilterContains, Value: val}, nil
+		or, err := p.parseLineFilterOrList()
+		if err != nil {
+			return nil, err
+		}
+		return &LineFilterStage{Op: LineFilterContains, Value: val, Or: or}, nil
 
 	case TokBangEq:
 		p.advance()
@@ -417,7 +444,11 @@ func (p *parser) parsePipelineStage() (Stage, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &LineFilterStage{Op: LineFilterExcludes, Value: val}, nil
+		or, err := p.parseLineFilterOrList()
+		if err != nil {
+			return nil, err
+		}
+		return &LineFilterStage{Op: LineFilterExcludes, Value: val, Or: or}, nil
 
 	case TokPipeTilde:
 		p.advance()
@@ -425,7 +456,11 @@ func (p *parser) parsePipelineStage() (Stage, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &LineFilterStage{Op: LineFilterMatchRe, Value: val}, nil
+		or, err := p.parseLineFilterOrList()
+		if err != nil {
+			return nil, err
+		}
+		return &LineFilterStage{Op: LineFilterMatchRe, Value: val, Or: or}, nil
 
 	case TokBangTilde:
 		p.advance()
@@ -433,7 +468,11 @@ func (p *parser) parsePipelineStage() (Stage, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &LineFilterStage{Op: LineFilterExcludeRe, Value: val}, nil
+		or, err := p.parseLineFilterOrList()
+		if err != nil {
+			return nil, err
+		}
+		return &LineFilterStage{Op: LineFilterExcludeRe, Value: val, Or: or}, nil
 
 	case TokPipeGt:
 		p.advance()
@@ -441,7 +480,11 @@ func (p *parser) parsePipelineStage() (Stage, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &LineFilterStage{Op: LineFilterContainsPat, Value: val}, nil
+		or, err := p.parseLineFilterOrList()
+		if err != nil {
+			return nil, err
+		}
+		return &LineFilterStage{Op: LineFilterContainsPat, Value: val, Or: or}, nil
 
 	case TokBangGt:
 		p.advance()
@@ -449,7 +492,11 @@ func (p *parser) parsePipelineStage() (Stage, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &LineFilterStage{Op: LineFilterExcludePat, Value: val}, nil
+		or, err := p.parseLineFilterOrList()
+		if err != nil {
+			return nil, err
+		}
+		return &LineFilterStage{Op: LineFilterExcludePat, Value: val, Or: or}, nil
 
 	case TokPipe:
 		p.advance()

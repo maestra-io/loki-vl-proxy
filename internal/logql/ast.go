@@ -2,6 +2,7 @@ package logql
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -81,6 +82,21 @@ const (
 type LineFilterStage struct {
 	Op    LineFilterOp
 	Value string
+	// Or holds the alternatives of LogQL's OR-list form, `|= "a" or "b" or "c"`.
+	// The whole list shares ONE operator: a positive filter keeps a line matching
+	// ANY of them, a negative one drops a line matching any of them.
+	Or []string
+}
+
+// Values returns the filter's full alternative list, Value first.
+func (s *LineFilterStage) Values() []string {
+	if len(s.Or) == 0 {
+		return []string{s.Value}
+	}
+	out := make([]string, 0, len(s.Or)+1)
+	out = append(out, s.Value)
+	out = append(out, s.Or...)
+	return out
 }
 
 func (s *LineFilterStage) String() string {
@@ -99,7 +115,13 @@ func (s *LineFilterStage) String() string {
 	case LineFilterExcludePat:
 		op = "!>"
 	}
-	return fmt.Sprintf(`%s "%s"`, op, s.Value)
+	// The scanner DECODES the literal, so a value carrying a quote or a backslash
+	// must be re-quoted on the way out or the emitted query stops parsing.
+	out := op + " " + strconv.Quote(s.Value)
+	for _, alt := range s.Or {
+		out += " or " + strconv.Quote(alt)
+	}
+	return out
 }
 
 func (s *LineFilterStage) stage() {}
