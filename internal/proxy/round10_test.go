@@ -147,6 +147,34 @@ func TestLabelAliasResolvedOnTheQueryPath(t *testing.T) {
 	}
 }
 
+// The RESPONSE direction has to answer under the name Loki uses. Sanitizing the
+// whole VL path gives `kubernetes_pod_labels_strimzi_io_cluster`, which no
+// dashboard selects on — a grouping would carry real values under a label name
+// nobody asked for, which is only half a fix for the empty-value symptom.
+func TestLearnedAliasRoundTripsBothWays(t *testing.T) {
+	const vlField = "kubernetes.pod_labels.strimzi.io/cluster"
+	lt := NewLabelTranslator(LabelStyleUnderscores, nil)
+	lt.LearnFieldAliases([]string{vlField, "app"})
+
+	if got := lt.ToVL("strimzi_io_cluster"); got != vlField {
+		t.Errorf("ToVL(strimzi_io_cluster) = %q, want %q", got, vlField)
+	}
+	if got := lt.ToLoki(vlField); got != "strimzi_io_cluster" {
+		t.Errorf("ToLoki(%s) = %q, want %q", vlField, got, "strimzi_io_cluster")
+	}
+	// A field that is not in a Kubernetes label map keeps plain sanitization.
+	if got := lt.ToLoki("k8s.namespace.name"); got != "k8s_namespace_name" {
+		t.Errorf("ToLoki(k8s.namespace.name) = %q", got)
+	}
+	// A collision on the leaf must drop BOTH directions, not leave the response
+	// side answering for a mapping the query side has disowned.
+	lt2 := NewLabelTranslator(LabelStyleUnderscores, nil)
+	lt2.LearnFieldAliases([]string{vlField, "kubernetes.namespace_labels.strimzi.io/cluster"})
+	if got := lt2.ToLoki(vlField); got != "kubernetes_pod_labels_strimzi_io_cluster" {
+		t.Errorf("ambiguous leaf must not keep a reverse alias, got %q", got)
+	}
+}
+
 // NeedsAliasDiscovery must not send the proxy to the backend for a label it can
 // already answer — that is what keeps the cost at one cached call per replica.
 func TestNeedsAliasDiscoveryScope(t *testing.T) {

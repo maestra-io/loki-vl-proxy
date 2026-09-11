@@ -66,7 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   learning now also happens on cache HITS, and the translation path resolves the
   labels it is about to translate before translating them (`-0.25s` cold, 30s
   TTL, coalesced). A lookup the backend could not answer forfeits the cache
-  write rather than pinning a wrong query for the life of the process.
+  write rather than pinning a wrong query for the life of the process. The
+  RESPONSE direction learns the alias too: sanitizing the whole VL path answers
+  `kubernetes_pod_labels_strimzi_io_cluster`, a label name no dashboard selects
+  on, so a grouping would otherwise have carried real values under the wrong
+  name. A leaf that two containers claim drops both directions.
 - **The logs path never bounded its sort, so VictoriaLogs buffered the whole
   match to answer a 1000-line panel.** `sort` is a blocking pipe: without a
   `limit` VictoriaLogs holds every matching row before it emits the first, so
