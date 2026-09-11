@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	logqlpkg "github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
@@ -122,8 +124,13 @@ func planRangeWindowRollupDetailed(logqlQuery, startRaw, endRaw, stepRaw string)
 		return plan, nil, false
 	}
 	if buckets := (endNs - startNs + rangeNs) / fineNs; buckets > maxRangeWindowFineBuckets {
-		// Refuse rather than fall back: the fallback is the step-wide window, which
-		// is exactly the wrong answer this file exists to stop returning.
+		// A near-coprime range/step pair drives the common grid down to a second or
+		// less, and the grid explodes while the number of OUTPUT points stays small
+		// — 21809 buckets for 36 points, in the case that reported this. The plan
+		// comes back populated so the caller can evaluate those points one window
+		// at a time instead, which is exact and bounded by the points, not by their
+		// common divisor.
+		plan = rangeWindowPlan{startNs: startNs, endNs: endNs, stepNs: stepNs, rangeNs: rangeNs}
 		return plan, &errRangeWindowTooFine{rangeDur: rangeDur, stepDur: stepDur, buckets: buckets}, false
 	}
 	return rangeWindowPlan{
@@ -332,6 +339,21 @@ func statsQRRawPointFloat(raw json.RawMessage) (float64, bool) {
 // sliding-window rollup, so the wrapper does not recurse into itself.
 type rangeWindowRollupKey struct{}
 
+// exactBoundsKey marks a request whose start/end were chosen deliberately and
+// must NOT be snapped to the step grid — a per-point window is `(t-range, t]`,
+// which sits on no k·step grid. The fine-grid inner is aligned by construction
+// and keeps the normal alignment, which also keeps it away from the pathological
+// bounds an unaligned tiny-step request can produce.
+type exactBoundsKey struct{}
+
+func exactBoundsRequested(ctx context.Context) bool {
+	return ctx != nil && ctx.Value(exactBoundsKey{}) != nil
+}
+
+func withExactBounds(ctx context.Context) context.Context {
+	return context.WithValue(ctx, exactBoundsKey{}, struct{}{})
+}
+
 // rangeWindowRollupActive reports whether r is the inner evaluation.
 func rangeWindowRollupActive(ctx context.Context) bool {
 	return ctx != nil && ctx.Value(rangeWindowRollupKey{}) != nil
@@ -349,13 +371,212 @@ func requestWithFineStep(r *http.Request, plan rangeWindowPlan) *http.Request {
 	fine := formatLogQLDuration(time.Duration(plan.fineNs))
 	q := inner.URL.Query()
 	q.Set("step", fine)
+	// Ask for ONE point past the last one the fold needs. The pushdown computes a
+	// point that sits exactly on the window's right edge from a short set of
+	// buckets — measured directly, without any rollup in play:
+	// `count_over_time([1h30m])` at step=1800 returns 84 for its LAST point and 85
+	// for the same point when the window extends further. Keeping the needed
+	// points off that edge sidesteps it; the extra point is discarded by the fold.
+	// RFC3339, not a bare nanosecond integer: Loki's parser reads a 10-digit
+	// number as SECONDS, so `3000000000` ns came back as the year 2065 and the
+	// inner evaluation walked a 95-year window one step at a time.
+	q.Set("end", formatRangeBound(plan.endNs+plan.fineNs))
 	inner.URL.RawQuery = q.Encode()
 	// r.Form is already parsed at this point and FormValue reads it first.
 	if inner.Form != nil {
 		inner.Form.Set("step", fine)
+		inner.Form.Set("end", q.Get("end"))
 	}
 	if inner.PostForm != nil && inner.PostForm.Get("step") != "" {
 		inner.PostForm.Set("step", fine)
+	}
+	return inner
+}
+
+// maxPerPointWindows caps the per-point fallback. A Grafana panel asks for a few
+// hundred points; far beyond that the fan-out is no longer the cheap option.
+const maxPerPointWindows = 1000
+
+// perPointWindowParallel bounds the fan-out, like every other multi-window path.
+const perPointWindowParallel = 8
+
+// evaluatePerPointWindows answers a request whose range and step share no useful
+// common divisor by evaluating each Loki point in its OWN window: the inner
+// request runs over `(t-range, t]` with step = range, which is the range==step
+// case the pushdown already computes exactly, and its single point is relabelled
+// to t. Exact, and bounded by the number of points rather than by gcd(range, step).
+func (p *Proxy) evaluatePerPointWindows(w http.ResponseWriter, r *http.Request, plan rangeWindowPlan) bool {
+	if plan.stepNs <= 0 || plan.rangeNs <= 0 || plan.endNs < plan.startNs {
+		return false
+	}
+	points := (plan.endNs-plan.startNs)/plan.stepNs + 1
+	if points <= 0 || points > maxPerPointWindows {
+		return false
+	}
+
+	results := make([]perPointBody, points)
+	sem := make(chan struct{}, perPointWindowParallel)
+	var wg sync.WaitGroup
+	for i := int64(0); i < points; i++ {
+		t := plan.startNs + i*plan.stepNs
+		wg.Add(1)
+		go func(idx int64, at int64) {
+			defer wg.Done()
+			select {
+			case <-r.Context().Done():
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+
+			// Same right-edge compensation as the fine-grid path: ask one window
+			// past the point, then take the point itself.
+			inner := requestWithWindow(r, at-plan.rangeNs, at+plan.rangeNs, plan.rangeNs)
+			buf := &bufferedResponseWriter{}
+			p.handleQueryRange(buf, inner)
+			if buf.code != 0 && buf.code != http.StatusOK {
+				return
+			}
+			results[idx] = perPointBody{ts: at, body: buf.body}
+		}(i, t)
+	}
+	wg.Wait()
+
+	kept := make([]perPointBody, 0, len(results))
+	for _, res := range results {
+		if len(res.body) > 0 {
+			kept = append(kept, res)
+		}
+	}
+	merged, ok := mergePerPointMatrices(kept)
+	if !ok {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(merged)
+	return true
+}
+
+type perPointBody struct {
+	ts   int64
+	body []byte
+}
+
+// mergePerPointMatrices stitches one-point matrices into a single matrix, keyed
+// by label set, with every point relabelled to its own evaluation time.
+func mergePerPointMatrices(bodies []perPointBody) ([]byte, bool) {
+	type series struct {
+		metric json.RawMessage
+		values [][]json.RawMessage
+	}
+	order := make([]string, 0, 8)
+	byKey := make(map[string]*series, 8)
+
+	for _, b := range bodies {
+		var payload map[string]json.RawMessage
+		if err := json.Unmarshal(b.body, &payload); err != nil {
+			continue
+		}
+		_, _, raw := statsQRSeriesArray(payload)
+		if raw == nil {
+			continue
+		}
+		var items []map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &items); err != nil {
+			continue
+		}
+		for _, item := range items {
+			metric, hasMetric := item["metric"]
+			if !hasMetric {
+				metric = json.RawMessage("{}")
+			}
+			var points [][]json.RawMessage
+			if err := json.Unmarshal(item["values"], &points); err != nil || len(points) == 0 {
+				continue
+			}
+			// Take the point at the evaluation time itself — the inner window reaches
+			// one step PAST it, so the last point is not the one we asked for. When
+			// no point lands exactly on it (a relabelling that rounds, a backend on
+			// a coarser grid), take the newest one that does not overshoot: its
+			// window still ends at or before the evaluation time, which is the
+			// contract. Never the last, which would be the extra point.
+			want := b.ts / int64(time.Second)
+			var last []json.RawMessage
+			var bestTS int64
+			for _, pt := range points {
+				if len(pt) < 2 {
+					continue
+				}
+				ts, err := strconv.ParseFloat(strings.Trim(string(pt[0]), `"`), 64)
+				if err != nil {
+					continue
+				}
+				at := int64(ts)
+				if at > want {
+					continue
+				}
+				if last == nil || at > bestTS {
+					last, bestTS = pt, at
+				}
+			}
+			if last == nil {
+				continue
+			}
+			key := string(metric)
+			s, seen := byKey[key]
+			if !seen {
+				s = &series{metric: metric}
+				byKey[key] = s
+				order = append(order, key)
+			}
+			ts, err := json.Marshal(b.ts / int64(time.Second))
+			if err != nil {
+				continue
+			}
+			s.values = append(s.values, []json.RawMessage{ts, last[1]})
+		}
+	}
+	if len(order) == 0 {
+		return emptyLokiMatrix, true
+	}
+
+	out := make([]map[string]interface{}, 0, len(order))
+	for _, key := range order {
+		s := byKey[key]
+		sort.Slice(s.values, func(i, j int) bool {
+			return string(s.values[i][0]) < string(s.values[j][0])
+		})
+		out = append(out, map[string]interface{}{"metric": s.metric, "values": s.values})
+	}
+	encoded, err := json.Marshal(map[string]interface{}{
+		"status": "success",
+		"data":   map[string]interface{}{"resultType": "matrix", "result": out},
+	})
+	if err != nil {
+		return nil, false
+	}
+	return encoded, true
+}
+
+// formatRangeBound renders a nanosecond instant in a form Loki's parser cannot
+// mistake for another unit.
+func formatRangeBound(ns int64) string {
+	return time.Unix(0, ns).UTC().Format(time.RFC3339Nano)
+}
+
+// requestWithWindow clones r for ONE evaluation window: start/end bracket the
+// window and the step equals it, so the inner evaluation is the range==step case.
+func requestWithWindow(r *http.Request, startNs, endNs, stepNs int64) *http.Request {
+	inner := r.Clone(withExactBounds(withRangeWindowRollup(r.Context())))
+	q := inner.URL.Query()
+	q.Set("start", formatRangeBound(startNs))
+	q.Set("end", formatRangeBound(endNs))
+	q.Set("step", formatLogQLDuration(time.Duration(stepNs)))
+	inner.URL.RawQuery = q.Encode()
+	if inner.Form != nil {
+		inner.Form.Set("start", q.Get("start"))
+		inner.Form.Set("end", q.Get("end"))
+		inner.Form.Set("step", q.Get("step"))
 	}
 	return inner
 }

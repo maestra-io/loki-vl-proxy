@@ -484,7 +484,7 @@ func run(
 
 	// Grafana datasource compatibility
 	maxLines := fs.Int("max-lines", 1000, "Default max lines per query")
-	rangeMetricRowLimit := fs.Int("manual-range-metric-row-limit", 10_000, "Safety cap on RAW LOG ROWS fetched per manual range-metric compatibility call (rate, count_over_time, ...). VictoriaLogs executes the limit as `| sort by (_time) desc limit N`, so a large value makes the backend sort that many rows in memory. Exceeding the cap returns 400 rather than a silently truncated number.")
+	rangeMetricRowLimit := fs.Int("manual-range-metric-row-limit", 0, "Safety cap on RAW LOG ROWS scanned per manual range-metric compatibility call (rate, count_over_time, ...). 0 uses the built-in default. The cap is enforced PROXY-SIDE while the rows stream — no `limit` is sent to VictoriaLogs, which would execute it as a sort over the whole match — and the memory the scan may hold is bounded separately by a shared retained-sample budget. Exceeding the cap returns 400 rather than a silently truncated number.")
 	backendTimeout := fs.Duration("backend-timeout", 120*time.Second, "Timeout for non-streaming requests to the VictoriaLogs backend")
 	cbFailThreshold := fs.Int("cb-fail-threshold", 5, "Circuit breaker: failures within -cb-window-duration before opening")
 	cbOpenDuration := fs.Duration("cb-open-duration", 10*time.Second, "Circuit breaker: how long to stay open before allowing probe requests")

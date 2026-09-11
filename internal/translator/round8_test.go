@@ -70,7 +70,13 @@ func TestTranslate_NeverShipsAMetricExpressionAsAPhrase(t *testing.T) {
 // `sum by (detected_level) (...)` lost every entry whose only evidence was the
 // word in the message.
 func TestLevelNormalizePipes_CarryTheLineTextRule(t *testing.T) {
-	m := &MappingOptions{DerivedLevelFields: []string{"level", "LogLevel"}, MaterializeLevel: true}
+	// Only `detected_level` licenses the inference — see
+	// TestLevelNormalizePipes_StoredLevelIsNotInferred.
+	m := &MappingOptions{
+		DerivedLevelFields: []string{"level", "LogLevel"},
+		MaterializeLevel:   true,
+		InferLevelFromText: true,
+	}
 	pipes := strings.Join(m.levelNormalizePipes(), " ")
 	// The guard is the absence of a RECOGNISED value, not of any value: a field
 	// holding `custom` is no level at all to Loki, and `level:*` would let it

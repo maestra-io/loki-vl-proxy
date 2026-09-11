@@ -37,6 +37,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`sum by (level)` answered with a level read out of the MESSAGE.** `level` is a
+  stored stream label; `detected_level` is the one Loki infers. Filling the stored
+  one in from the line text invented a series the store does not have — 192 rows
+  under `{level="info"}` where Loki and `stats by (level)` both report an empty
+  level. The inference is now licensed only by a `detected_level` grouping.
+- **The level-discovery query degenerated into a word filter.** Stripping the
+  parser stages removed only the VERB, so the explicit `| unpack_json from _msg`
+  form left ` from _msg  from _msg` behind — two WORD filters to VictoriaLogs,
+  matching only the proxy's own logs. The whitelist built from that discovery
+  (`filter level:in("info","warn")`) then threw away 99.6 % of the data: 45 rows
+  of 11 826. The whole stage is removed now, arguments included.
+- **`detected_level` folded `trace` into `debug` and left the fallback empty.**
+  Loki keeps `trace`, `critical` and `fatal` distinct and labels what it cannot
+  place `unknown`. The derived label now uses Loki's own canonical set rather than
+  the repo's synonym table, which stays as it is for a STORED level. Measured over
+  a 391-line corpus against Loki 3.7.1: all eight buckets match exactly.
+- **A coprime range/step pair was refused with a 400.** The common grid collapses
+  to a second while the number of OUTPUT points stays small — 21 809 buckets for
+  36 points. Those points are now evaluated one window at a time, which is exact
+  and bounded by the points rather than by `gcd(range, step)`, with the fan-out
+  capped and parallelism bounded. Refusing is the last resort.
+- **The 10 000-row cap was still in force.** Round 8 raised the built-in default,
+  but the `-manual-range-metric-row-limit` FLAG still defaulted to 10 000, so no
+  deployment ever saw the new value. The flag now reads the built-in, and the
+  template-pipeline path (`label_format` grouping) sends no `limit` either and
+  draws on the same shared memory budget.
+- **A doubled space before `(` was a parse error.** Whitespace hugging a bracket
+  carries no meaning in LogQL; `sum  (  rate  ( … )  )` is the same query.
+- **A `label_format`-derived grouping lost the name of an empty label** — `{}`
+  where Loki answers `{lf=""}`, the same numbers under a different series.
+
 - **A plain line filter was translated as a REGEXP, unescaped.** `|=` and `!=`
   are SUBSTRING matches in LogQL, but their value went to LogsQL's `~` verbatim,
   so every metacharacter was live: `|= "manifests."` matched `manifestsX`, `|=

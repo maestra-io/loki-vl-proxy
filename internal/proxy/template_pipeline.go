@@ -184,15 +184,18 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 	params.Set("query", logsql)
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
-	// Same raw-row contract as collectRangeMetricSamples: the cap is a safety
-	// limit VictoriaLogs executes as a sort, and hitting it is reported rather
-	// than folded into a smaller-but-plausible number. One extra row is the
-	// overflow probe — a response of exactly rowLimit rows is ambiguous.
+	// Same raw-row contract as collectRangeMetricSamples, and the same reason for
+	// sending NO `limit`: VictoriaLogs executes one as a sort over the whole
+	// match. The cap is counted here as the rows stream, and the memory this scan
+	// may hold is drawn from the shared retained-entry budget. This is the path a
+	// `label_format`-derived grouping takes — the one a 10,000-row ceiling turned
+	// into a 400 on panels Loki draws.
 	rowLimit := p.rangeMetricRowLimit
 	if rowLimit <= 0 {
 		rowLimit = defaultManualRangeMetricRowLimit
 	}
-	params.Set("limit", strconv.Itoa(rowLimit+1))
+	reservation := p.newManualScanReservation()
+	defer reservation.release()
 
 	resp, err := p.vlPost(ctx, "/select/logsql/query", params)
 	if err != nil {
@@ -224,7 +227,19 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 		rowsScanned++
 		if rowsScanned > rowLimit {
 			if truncationFatal {
+				p.log.Warn("template pipeline scan refused", "reason", "row cap", "limit", rowLimit)
 				return nil, &rawRowScanTruncatedError{limit: rowLimit}
+			}
+			break
+		}
+		// Every retained entry costs memory until the whole scan is folded, so it
+		// draws on the same budget every other in-flight scan draws from.
+		if !reservation.account() {
+			if truncationFatal {
+				p.log.Warn("template pipeline scan refused",
+					"reason", "shared retained-sample budget exhausted",
+					"budget_samples", defaultManualScanSampleBudget, "rows_scanned", rowsScanned)
+				return nil, &manualScanBudgetError{budget: defaultManualScanSampleBudget}
 			}
 			break
 		}
@@ -437,6 +452,12 @@ func templateFetchErrorStatus(err error) int {
 	if errors.As(err, &truncated) {
 		return http.StatusBadRequest
 	}
+	// The memory guard is the same kind of answer — the client's query is too
+	// broad for this path, not a backend fault.
+	var overBudget *manualScanBudgetError
+	if errors.As(err, &overBudget) {
+		return http.StatusBadRequest
+	}
 	var rejected *templatePushdownRejectedError
 	if errors.As(err, &rejected) && rejected.status > 0 {
 		return rejected.status
@@ -531,9 +552,10 @@ func templateMetricLabels(labels map[string]string, spec statsCompatSpec) map[st
 	}
 	out := make(map[string]string, len(names))
 	for _, n := range names {
-		if v, ok := labels[n]; ok && v != "" {
-			out[n] = v
-		}
+		// A label the user NAMED in by() identifies the series even when its value
+		// is empty: Loki answers `{lf=""}`, and dropping the name made it `{}` —
+		// the same numbers under a different series in Grafana.
+		out[n] = labels[n]
 	}
 	return out
 }

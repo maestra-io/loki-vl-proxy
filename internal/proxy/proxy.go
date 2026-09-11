@@ -2083,7 +2083,13 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// is not a multiple of 137, every returned timestamp satisfies `ts % 137 == 0`
 	// and the first point sits 17s BEFORE `start`. Align here, at the entry, so
 	// every downstream path builds its request and its grid from Loki's bounds.
-	alignRangeRequestToStepGrid(r, logqlQuery)
+	// The INNER evaluation of a window rollup already carries bounds chosen by the
+	// caller — a per-point window is `(t-range, t]`, which is not on any k·step
+	// grid — so re-aligning would move the very window it was built to measure.
+	// The fine-grid inner is aligned by construction, so skipping costs it nothing.
+	if !exactBoundsRequested(r.Context()) {
+		alignRangeRequestToStepGrid(r, logqlQuery)
+	}
 
 	// A LogQL range vector carries its OWN window, independent of the step. Every
 	// pushdown here asks VictoriaLogs for buckets whose width IS the step, so
@@ -2096,9 +2102,15 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// drilldown fast paths alike.
 	plan, planErr, planOK := planRangeWindowRollupDetailed(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
 	if planErr != nil && !rangeWindowRollupActive(r.Context()) {
-		// The correct grid is finer than this instance will scan. The only other
-		// option is the step-wide window — the very defect this path removes — so
-		// say so instead of returning a plausible wrong number.
+		// The common grid is finer than this instance will scan — a near-coprime
+		// range/step pair, where the grid explodes while the number of OUTPUT
+		// points stays small. Evaluate those points one window at a time: exact,
+		// and bounded by the points rather than by gcd(range, step). Loki answers
+		// these, so refusing is the last resort, not the first.
+		if p.evaluatePerPointWindows(w, r, plan) {
+			p.metrics.RecordRequest("query_range", http.StatusOK, time.Since(start))
+			return
+		}
 		p.writeError(w, http.StatusBadRequest, planErr.Error())
 		p.metrics.RecordRequest("query_range", http.StatusBadRequest, time.Since(start))
 		return

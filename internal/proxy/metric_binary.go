@@ -2089,10 +2089,18 @@ func (p *Proxy) proxyStatsQueryRangeDrilldownHybrid(
 // (json/logfmt body field), the stripped query yields no rows and the caller
 // falls through to the slower exact path. Whitespace left by the removed pipe is
 // harmless to VL.
+//
+// The whole STAGE has to go, arguments included. The translator emits the
+// explicit `| unpack_json from _msg` form for derived levels, and removing just
+// the verb left ` from _msg  from _msg` behind — which VictoriaLogs reads as two
+// WORD filters ("the line contains `from`" AND "contains `_msg`"). The
+// level-discovery query then matched only the proxy's own logs, and the
+// whitelist built from it (`filter level:in("info","warn")`) threw away 99.6 %
+// of the data: 45 rows returned of 11 826.
+var unpackStageRE = regexp.MustCompile(`\|\s*unpack_(?:json|logfmt)\b(?:\s+from\s+[^\s|]+)?`)
+
 func stripUnpackStagesForTopN(base string) string {
-	b := strings.ReplaceAll(base, "| unpack_logfmt", "")
-	b = strings.ReplaceAll(b, "| unpack_json", "")
-	return strings.TrimSpace(b)
+	return strings.TrimSpace(unpackStageRE.ReplaceAllString(base, ""))
 }
 
 // tryHighCardCountByTwoPhase handles single-field `count() by (field)` query_range
