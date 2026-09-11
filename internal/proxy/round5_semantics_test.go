@@ -295,7 +295,11 @@ func TestGuardExtractedLabelShadowing_RestoresAfterTheLastParser(t *testing.T) {
 // relabelling those buckets onto a `:05` grid only renames them — the operands
 // then carry `:00–:60` contents under `:05` labels.
 func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
-	base := time.Unix(1700000700, 0).UTC() // 25 minutes past the hour — NOT step-aligned
+	// The client asks from 25 minutes past the hour; Loki truncates that to the
+	// step grid, so both operands must be built from the SAME aligned start —
+	// which is what makes the offset identical on both of them.
+	base := time.Unix(1700000700, 0).UTC()
+	alignedBase := time.Unix(1700000700-1500, 0).UTC()
 	const step = 3600
 
 	// The binary path fetches both operands CONCURRENTLY, so the capture needs
@@ -311,7 +315,7 @@ func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w,
 			`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"a"},"values":[[%d,"2"],[%d,"4"]]}]}}`,
-			base.Unix()-step, base.Unix())
+			alignedBase.Unix()-step, alignedBase.Unix())
 	}))
 	defer vlBackend.Close()
 
@@ -332,16 +336,17 @@ func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
 	if len(gotOffsets) < 2 {
 		t.Fatalf("expected both operands to be fetched, got %d upstream calls", len(gotOffsets))
 	}
-	// (start mod step) = 1500s, plus the microsecond that makes the bucket
-	// right-closed: every operand must carry it.
+	// The aligned start IS a multiple of the step, so the only offset left is the
+	// microsecond that makes the bucket right-closed — and every operand must
+	// carry it.
 	for i, off := range gotOffsets {
-		if off != "-1500.000001s" {
+		if off != "-0.000001s" {
 			t.Fatalf("operand %d fetched without the client-grid offset: offset=%q start=%q", i, off, gotStarts[i])
 		}
 	}
-	// And both operands must open one step before the client's start.
+	// And both operands must open one step before the ALIGNED start.
 	for i, start := range gotStarts {
-		if want := strconv.FormatInt(base.Unix()-step, 10); start != want {
+		if want := strconv.FormatInt(alignedBase.Unix()-step, 10); start != want {
 			t.Fatalf("operand %d start = %q, want %q", i, start, want)
 		}
 	}
@@ -359,11 +364,11 @@ func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
 	if len(resp.Data.Result) != 1 {
 		t.Fatalf("expected one combined series, got %s", rec.Body.String())
 	}
-	// The bucket labelled `base-step` is the point at `base`; the one at `base`
-	// is the point at `base+step`. Both land on the client's :25 grid.
+	// The bucket labelled `alignedBase-step` is the point at `alignedBase`; the
+	// one at `alignedBase` is the point at `alignedBase+step`.
 	for i, pt := range resp.Data.Result[0].Values {
 		ts := int64(pt[0].(float64))
-		if want := base.Unix() + int64(i)*step; ts != want {
+		if want := alignedBase.Unix() + int64(i)*step; ts != want {
 			t.Fatalf("point %d at %d, want %d (operands off the client grid?)", i, ts, want)
 		}
 	}

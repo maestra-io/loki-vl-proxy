@@ -439,13 +439,20 @@ func (vm *VectorMatching) String() string {
 
 // BinOpExpr is a binary operation between two metric expressions.
 type BinOpExpr struct {
-	Left, Right    Expr
-	Op             string
+	Left, Right Expr
+	Op          string
+	// ReturnBool is LogQL's `bool` modifier on a comparison: `> bool 5` scores
+	// every sample 1/0, while a bare `> 5` FILTERS — it keeps the sample's own
+	// value and drops the ones that do not match.
+	ReturnBool     bool
 	VectorMatching *VectorMatching
 }
 
 func (b *BinOpExpr) String() string {
 	s := b.Left.String() + " " + b.Op
+	if b.ReturnBool {
+		s += " bool"
+	}
 	if vm := b.VectorMatching.String(); vm != "" {
 		s += " " + vm
 	}

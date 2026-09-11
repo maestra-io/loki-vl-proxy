@@ -268,6 +268,15 @@ func seedPatternMessagesToLokiAndVL(t *testing.T, serviceName string, start, end
 		}
 	}
 	flush()
+	// Loki serves a push from its ingester immediately; VictoriaLogs keeps the
+	// rows in an in-memory buffer until the next periodic flush, so an A/B
+	// comparison started right after the push reads a COMPLETE Loki answer
+	// against a partial VL one — and the pattern poll below cannot see that,
+	// since its predicate is "N distinct patterns", which a fraction of the
+	// buckets already satisfies. Observed on GHA as a pattern covering part of
+	// the seeded range while direct Loki covered all of it.
+	// https://docs.victoriametrics.com/victorialogs/#forced-flush
+	forceVLFlush(t)
 }
 
 func waitForPatternsViaGrafanaDatasource(t *testing.T, dsUID, query string, start, end time.Time, step time.Duration, minPatterns int) []densePatternEntry {

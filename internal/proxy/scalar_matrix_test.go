@@ -8,11 +8,14 @@ import (
 	"testing"
 )
 
+// A BARE comparison filters (LogQL/PromQL): the sample keeps its own value when
+// it matches and disappears when it does not — only `bool` scores 1/0.
 func TestScalarMatrix_ApplyScalarOp_AllOperators(t *testing.T) {
 	body := scalarMatrixBody(4)
 	cases := []struct {
-		op   string
-		want float64
+		op      string
+		want    float64
+		dropped bool
 	}{
 		{op: "+", want: 6},
 		{op: "-", want: 2},
@@ -20,28 +23,41 @@ func TestScalarMatrix_ApplyScalarOp_AllOperators(t *testing.T) {
 		{op: "/", want: 2},
 		{op: "%", want: 0},
 		{op: "^", want: 16},
-		{op: "==", want: 0},
-		{op: "!=", want: 1},
-		{op: ">", want: 1},
-		{op: "<", want: 0},
-		{op: ">=", want: 1},
-		{op: "<=", want: 0},
+		{op: "==", dropped: true},
+		{op: "!=", want: 4},
+		{op: ">", want: 4},
+		{op: "<", dropped: true},
+		{op: ">=", want: 4},
+		{op: "<=", dropped: true},
+		{op: "== bool", want: 0},
+		{op: "!= bool", want: 1},
+		{op: "> bool", want: 1},
+		{op: "< bool", want: 0},
+		{op: ">= bool", want: 1},
+		{op: "<= bool", want: 0},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.op, func(t *testing.T) {
 			out := applyScalarOp(body, tc.op, 2, "matrix")
+			if tc.dropped {
+				assertNoMatrixSeries(t, out)
+				return
+			}
 			got := firstMatrixValue(t, out)
 			assertApproxEqual(t, got, tc.want)
 		})
 	}
 }
 
+// With the scalar on the LEFT the comparison still filters the vector, and the
+// value that survives is the VECTOR's own.
 func TestScalarMatrix_ApplyScalarOpReverse_AllOperators(t *testing.T) {
 	body := scalarMatrixBody(4)
 	cases := []struct {
-		op   string
-		want float64
+		op      string
+		want    float64
+		dropped bool
 	}{
 		{op: "+", want: 6},
 		{op: "-", want: -2},
@@ -49,17 +65,24 @@ func TestScalarMatrix_ApplyScalarOpReverse_AllOperators(t *testing.T) {
 		{op: "/", want: 0.5},
 		{op: "%", want: 2},
 		{op: "^", want: 16},
-		{op: "==", want: 0},
-		{op: "!=", want: 1},
-		{op: ">", want: 0},
-		{op: "<", want: 1},
-		{op: ">=", want: 0},
-		{op: "<=", want: 1},
+		{op: "==", dropped: true},
+		{op: "!=", want: 4},
+		{op: ">", dropped: true},
+		{op: "<", want: 4},
+		{op: ">=", dropped: true},
+		{op: "<=", want: 4},
+		{op: "== bool", want: 0},
+		{op: "> bool", want: 0},
+		{op: "< bool", want: 1},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.op, func(t *testing.T) {
 			out := applyScalarOpReverse(body, tc.op, 2, "matrix")
+			if tc.dropped {
+				assertNoMatrixSeries(t, out)
+				return
+			}
 			got := firstMatrixValue(t, out)
 			assertApproxEqual(t, got, tc.want)
 		})
@@ -225,5 +248,22 @@ func assertApproxEqual(t *testing.T, got, want float64) {
 	t.Helper()
 	if math.Abs(got-want) > 1e-9 {
 		t.Fatalf("unexpected value: got=%v want=%v", got, want)
+	}
+}
+
+// assertNoMatrixSeries asserts a comparison filtered every series away, the way
+// LogQL drops a series with no remaining samples.
+func assertNoMatrixSeries(t *testing.T, body []byte) {
+	t.Helper()
+	var resp struct {
+		Data struct {
+			Result []json.RawMessage `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data.Result) != 0 {
+		t.Fatalf("expected no series, got %s", body)
 	}
 }

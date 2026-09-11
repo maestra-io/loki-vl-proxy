@@ -257,9 +257,11 @@ func (p *parser) maybeInfix(lhs Expr) (Expr, error) {
 		op = "!="
 	}
 
-	// Optional bool modifier (e.g. `> bool 0`): consume and ignore for routing purposes.
+	// Optional bool modifier (e.g. `> bool 0`).
+	returnBool := false
 	if p.cur.Typ == TokIdent && p.cur.Val == "bool" {
 		p.advance()
+		returnBool = true
 	}
 
 	// Optional vector matching: on(labels) / ignoring(labels)
@@ -287,7 +289,7 @@ func (p *parser) maybeInfix(lhs Expr) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	lhs = &BinOpExpr{Left: lhs, Right: rhs, Op: op, VectorMatching: vm}
+	lhs = &BinOpExpr{Left: lhs, Right: rhs, Op: op, ReturnBool: returnBool, VectorMatching: vm}
 	return p.maybeInfix(lhs)
 }
 

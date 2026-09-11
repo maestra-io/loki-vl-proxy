@@ -37,6 +37,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Grafana template duration was rejected with 400.** `$__interval`,
+  `$__range` and `${__interval}` were resolved AFTER LogQL validation, and the
+  parser answers `[$__interval]` with `expected DURATION, got ERROR ("$")` — so
+  a perfectly good dashboard panel never reached translation. The tokens are
+  now resolved first, on both `query_range` and `query`, which also puts them
+  ahead of the step-grid alignment and the cache key.
+- **Patterns served PARTIAL range coverage as a complete answer.** The
+  `/loki/api/v1/patterns` miner splits the requested range into windows and
+  queries VictoriaLogs per window; a window whose fetch errored was dropped
+  silently, and `shouldAcceptWindowedPatternResults` then returned the
+  surviving windows as the whole answer — a Drilldown panel covering a third
+  of the range it asked for, indistinguishable from "that is all the data
+  there is". A failed window is now retried once, serially, and if it still
+  errors the windowed result is refused so the request falls back to the
+  full-range fetch. A window that is legitimately EMPTY is unchanged. A
+  known-partial answer is also no longer written to the patterns cache, so an
+  incomplete mining pass cannot freeze itself into every later request.
+- **`or` / `unless` returned nothing.** The set operations went through the
+  arithmetic combiner, which — once a bare comparison started dropping the
+  samples it filters out — also dropped every left series with no right-hand
+  match. That is exactly what `or` and `unless` are for, so
+  `sum(count_over_time(…)) or vector(0)` and `… unless …` came back with zero
+  series. They are now evaluated as set operations: `and`/`unless` keep the left
+  samples whose timestamp the right does (or does not) carry, `or` keeps every
+  left sample and fills in the right's where the left has none.
+- **A mapped grouping label was ALSO grouped by its raw name.** The underscore
+  fallback adds the Loki label name as a second `stats by (…)` key so data that
+  spells the same label with underscores still groups (`service_name` for OTel's
+  `service.name`). It did that for a label an explicit `-field-mapping` points at
+  an unrelated field too, so `sum by (namespace) (count_over_time(
+  {namespace="flux-system"}[1h]))` also grouped by whatever the log BODIES call
+  `namespace` — 38 series where Loki returns 1. The extra key is now added only
+  when it is the underscore spelling of the mapped field.
+- **The evaluation grid did not snap to `k·step`.** Loki truncates BOTH bounds of
+  a metric range query down to a multiple of the step (measured on 3.7.1: with
+  `step=137` every returned timestamp satisfies `ts % 137 == 0` and the first
+  point sits before the requested start). The proxy started at `start`, so a step
+  that did not divide it shifted the whole series — +27 s at `step=137`, +39 s at
+  `step=97`, while `step=120` over a start it divides looked perfectly fine. Log
+  queries keep their bounds: they have no evaluation grid.
+- **A bare comparison scored 1/0 instead of filtering.** `bool` was stripped in
+  the translator and every comparison returned 1 or 0, so `sum(…) > 1000` drew a
+  flat line of ones and `… > 100000` drew zeros where Loki drops the series
+  entirely. LogQL semantics restored: a bare comparison keeps the sample's OWN
+  value, drops the samples that do not match and the series left empty, while
+  `> bool 1000` scores 1/0. A left sample with no matching right sample is
+  dropped as well, the way a binary operation between two vectors behaves.
+
 - **The grouped/two-phase range path still labelled buckets by their START.**
   `sum by (<stream label>) (count_over_time({…}[1h]))` goes through the global
   top-N two-phase path, which builds its own request and response handling, and

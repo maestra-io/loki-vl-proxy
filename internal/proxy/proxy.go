@@ -2032,6 +2032,12 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// emits while the unwrap field picker is open. These are syntactically invalid
 	// and would return 400, leaving the field picker empty.
 	logqlQuery = stripIncompleteUnwrapStubs(logqlQuery)
+	// Grafana's template tokens must be resolved BEFORE validation: the LogQL
+	// parser expects a DURATION inside `[...]` and answers `$__interval` with
+	// `expected DURATION, got ERROR ("$")`, so a perfectly good dashboard panel
+	// would be rejected with 400 before it ever reached translation. Resolving
+	// here also puts it ahead of the step-grid alignment and the cache key.
+	logqlQuery = resolveGrafanaRangeTemplateTokens(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
 	logqlQuery, ok := p.validateQuery(w, logqlQuery, "query_range")
 	if !ok {
 		return
@@ -2059,6 +2065,14 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// Loki evaluates a metric range query on the grid of `k * step`, not on the
+	// client's `start`: its step-align middleware truncates BOTH bounds down to a
+	// multiple of the step. Measured on 3.7.1 — with step=137s over a start that
+	// is not a multiple of 137, every returned timestamp satisfies `ts % 137 == 0`
+	// and the first point sits 17s BEFORE `start`. Align here, at the entry, so
+	// every downstream path builds its request and its grid from Loki's bounds.
+	alignRangeRequestToStepGrid(r, logqlQuery)
 
 	categorizedLabels := requestWantsCategorizedLabels(r)
 	emitStructuredMetadata := p.shouldEmitStructuredMetadata(r)
@@ -2239,7 +2253,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		} else if rightErr != nil {
 			p.writeError(sc, http.StatusBadRequest, rightErr.Error())
 		} else {
-			p.proxyBinaryMetricQueryRangeVM(sc, r, binOp.Op, leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
+			p.proxyBinaryMetricQueryRangeVM(sc, r, withBoolModifier(binOp.Op, binOp.ReturnBool), leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
 		}
 	} else if isStatsQuery(logsqlQuery) {
 		p.proxyStatsQueryRange(sc, r, logsqlQuery)
@@ -2370,6 +2384,9 @@ func (p *Proxy) queryRangeCacheKey(r *http.Request, logqlQuery string) string {
 func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	logqlQuery := r.FormValue("query")
+	// See handleQueryRange: the parser rejects `$__interval` as a duration, so
+	// the tokens must be resolved before validation.
+	logqlQuery = resolveGrafanaRangeTemplateTokens(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
 	logqlQuery, ok := p.validateQuery(w, logqlQuery, "query")
 	if !ok {
 		return
@@ -2517,7 +2534,7 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 		} else if rightErr != nil {
 			p.writeError(sc, http.StatusBadRequest, rightErr.Error())
 		} else {
-			p.proxyBinaryMetricQueryVM(sc, r, binOp.Op, leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
+			p.proxyBinaryMetricQueryVM(sc, r, withBoolModifier(binOp.Op, binOp.ReturnBool), leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
 		}
 	} else if isStatsQuery(logsqlQuery) {
 		p.proxyStatsQuery(sc, r, logsqlQuery)

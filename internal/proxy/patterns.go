@@ -22,10 +22,20 @@ type patternFetchDiagnostics struct {
 	windowAttempts       int
 	windowAccepted       int
 	windowCapped         int
-	secondPassWindows    int
-	minedPreMerge        int
-	minedPostMerge       int
-	lowCoverage          bool
+	// windowFailed counts windows whose backend fetch ERRORED (transport error
+	// or a non-2xx status) — as opposed to a window that simply has no rows.
+	// A single unrecovered error means the mined set covers less than the
+	// requested range, which must never be served as a complete answer.
+	windowFailed int
+	// windowCompleted counts windows whose fetch actually RAN (with any outcome).
+	// A worker that returns while waiting on the semaphore — the request context
+	// was cancelled — never reaches fetchWindow, so without this the remaining
+	// windows look like the whole range.
+	windowCompleted   int
+	secondPassWindows int
+	minedPreMerge     int
+	minedPostMerge    int
+	lowCoverage       bool
 }
 
 func (d *patternFetchDiagnostics) recordExtraction(limit int, stats patternExtractionStats, windowed bool) {
@@ -313,7 +323,11 @@ func (p *Proxy) handlePatterns(w http.ResponseWriter, r *http.Request) {
 	}
 	recordPatternResponseMetrics(p.metrics, resultBody)
 	// Avoid sticky empty results: first-call empty probes should not poison long-lived pattern cache entries.
-	if len(entries) > 0 {
+	// Same for a KNOWN-PARTIAL answer — a mining pass that reached only part of
+	// the requested range (windows refused, capped, or still invisible in the
+	// backend right after ingestion) must not be frozen into the cache, or every
+	// later request is answered from the incomplete snapshot.
+	if len(entries) > 0 && !diag.likelyLowCoverage() {
 		now := time.Now().UTC()
 		snapshotPayload := snapshotBody
 		if len(snapshotPayload) == 0 {
@@ -329,6 +343,15 @@ func (p *Proxy) handlePatterns(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(resultBody)
 	p.metrics.RecordRequest("patterns", http.StatusOK, time.Since(start))
+}
+
+// patternWindowSetIncomplete reports whether the mined windows cover less than
+// the requested range. A window that ERRORED is an obvious hole; so is one that
+// never RAN — a worker returns while waiting on the semaphore when the request
+// context is cancelled, and then appears neither as accepted nor as failed, so
+// the surviving windows would otherwise look like the whole range.
+func patternWindowSetIncomplete(diag patternFetchDiagnostics, total int) bool {
+	return diag.windowFailed > 0 || diag.windowCompleted != total
 }
 
 //nolint:gocyclo // iterates windows with first/second-pass logic, per-window limits, error fan-in and diagnostic accumulation; branching is inherent to windowed mining.
@@ -376,9 +399,12 @@ func (p *Proxy) fetchPatternsFromWindows(
 		stats   patternExtractionStats
 	}
 	results := make([]windowResult, 0, len(windows))
+	failedWindows := make([]queryRangeWindow, 0)
 	var mu sync.Mutex
 
-	fetchWindow := func(window queryRangeWindow, limit int) ([]patternResultEntry, patternExtractionStats, bool) {
+	// fetchWindow returns (entries, stats, ok, failed). `failed` is true ONLY for a
+	// backend error — an empty window is ok=false, failed=false.
+	fetchWindow := func(window queryRangeWindow, limit int) ([]patternResultEntry, patternExtractionStats, bool, bool) {
 		params := cloneURLValues(baseParams)
 		params.Set("start", strconv.FormatInt(window.startNs, 10))
 		endNs := window.endNs
@@ -403,7 +429,7 @@ func (p *Proxy) fetchPatternsFromWindows(
 				"end_ns", window.endNs,
 				"error", err,
 			)
-			return nil, patternExtractionStats{}, false
+			return nil, patternExtractionStats{}, false, true
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= http.StatusBadRequest {
@@ -413,17 +439,17 @@ func (p *Proxy) fetchPatternsFromWindows(
 				"end_ns", window.endNs,
 				"status_code", resp.StatusCode,
 			)
-			return nil, patternExtractionStats{}, false
+			return nil, patternExtractionStats{}, false, true
 		}
 		extracted, stats := extractLogPatternsStreamWithStats(resp.Body, stepParam, patternLimit)
 		if len(extracted) == 0 {
-			return nil, stats, false
+			return nil, stats, false, false
 		}
 		entries := patternResultEntriesFromMaps(extracted)
 		if len(entries) == 0 {
-			return nil, stats, false
+			return nil, stats, false, false
 		}
-		return entries, stats, true
+		return entries, stats, true, false
 	}
 
 	for _, window := range windows {
@@ -437,10 +463,14 @@ func (p *Proxy) fetchPatternsFromWindows(
 			case sem <- struct{}{}:
 			}
 			defer func() { <-sem }()
-			entries, stats, ok := fetchWindow(window, effectiveLimit)
+			entries, stats, ok, failed := fetchWindow(window, effectiveLimit)
 
 			mu.Lock()
+			diag.windowCompleted++
 			diag.recordExtraction(effectiveLimit, stats, true)
+			if failed {
+				failedWindows = append(failedWindows, window)
+			}
 			if ok {
 				diag.windowAccepted++
 				results = append(results, windowResult{
@@ -453,6 +483,23 @@ func (p *Proxy) fetchPatternsFromWindows(
 		}()
 	}
 	wg.Wait()
+
+	// A window whose fetch ERRORED leaves a hole in the mined range. Retry it once,
+	// serially (the parallel fan-out is the usual reason the backend refused), and
+	// if it still errors report zero successes so the caller falls back to the
+	// full-range fetch instead of serving a partial set as a complete answer.
+	for _, window := range failedWindows {
+		entries, stats, ok, failed := fetchWindow(window, effectiveLimit)
+		diag.recordExtraction(effectiveLimit, stats, true)
+		if failed {
+			diag.windowFailed++
+			continue
+		}
+		if ok {
+			diag.windowAccepted++
+			results = append(results, windowResult{window: window, entries: entries, stats: stats})
+		}
+	}
 
 	collected := make([]patternResultEntry, 0, len(results))
 	cappedResults := make([]windowResult, 0, len(results))
@@ -467,7 +514,7 @@ func (p *Proxy) fetchPatternsFromWindows(
 		diag.secondPassWindows += rerunCount
 		for i := 0; i < rerunCount; i++ {
 			result := cappedResults[i]
-			entries, stats, ok := fetchWindow(result.window, boostedLimit)
+			entries, stats, ok, _ := fetchWindow(result.window, boostedLimit)
 			diag.recordExtraction(boostedLimit, stats, true)
 			if !ok || len(entries) == 0 {
 				continue
@@ -476,11 +523,12 @@ func (p *Proxy) fetchPatternsFromWindows(
 		}
 	}
 	diag.minedPostMerge = len(collected)
-	if len(collected) == 0 || diag.windowAccepted == 0 || (diag.windowCapped > 0 && len(collected) <= max(1, diag.windowAccepted/2)) {
+	incomplete := patternWindowSetIncomplete(diag, len(windows))
+	if len(collected) == 0 || diag.windowAccepted == 0 || incomplete || (diag.windowCapped > 0 && len(collected) <= max(1, diag.windowAccepted/2)) {
 		diag.markLowCoverage()
 	}
-	if len(collected) == 0 {
-		return nil, diag.windowAccepted, diag
+	if len(collected) == 0 || incomplete {
+		return nil, 0, diag
 	}
 	return collected, diag.windowAccepted, diag
 }
