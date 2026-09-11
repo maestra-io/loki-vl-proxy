@@ -2442,7 +2442,15 @@ func (p *Proxy) addUnderscorefallbackByLabels(logsqlQuery string, origGroupBy []
 	var extras []string
 	for _, orig := range origGroupBy {
 		vlLabel := p.labelTranslator.ToVL(orig)
-		if vlLabel != orig && strings.Contains(vlLabel, ".") {
+		// The extra key exists for data that carries the SAME label under the
+		// underscore spelling — OTel writes `service.name`, a Loki push writes
+		// `service_name`. It must not be added for a label an explicit
+		// -field-mapping points at an unrelated field: `namespace` mapped to
+		// `kubernetes.pod_namespace` would then also group by whatever a log body
+		// happens to call `namespace`, and a `sum by (namespace)` over
+		// flux-system came back as 38 series where Loki returns 1.
+		if vlLabel != orig && strings.Contains(vlLabel, ".") &&
+			strings.ReplaceAll(vlLabel, ".", "_") == orig {
 			extras = append(extras, orig)
 		}
 	}
@@ -3811,22 +3819,17 @@ func parseScalar(s string) float64 {
 }
 
 func applyScalarOp(body []byte, op string, scalar float64, resultType string) []byte {
-	var vlResp map[string]interface{}
-	if err := json.Unmarshal(body, &vlResp); err != nil {
-		return wrapAsLokiResponse(body, resultType)
-	}
-
-	results, _ := extractMetricResults(vlResp)
-	for _, r := range results {
-		rm, _ := r.(map[string]interface{})
-		applyScalarToSample(rm, scalar, op, false)
-	}
-
-	result, _ := json.Marshal(vlResp)
-	return wrapAsLokiResponse(result, resultType)
+	return applyScalarOpDirected(body, op, scalar, resultType, false)
 }
 
 func applyScalarOpReverse(body []byte, op string, scalar float64, resultType string) []byte {
+	return applyScalarOpDirected(body, op, scalar, resultType, true)
+}
+
+// applyScalarOpDirected applies a scalar operand to every sample. A bare
+// comparison FILTERS: non-matching samples go, and a series left with none goes
+// with them (LogQL semantics — only `bool` scores 1/0).
+func applyScalarOpDirected(body []byte, op string, scalar float64, resultType string, reverse bool) []byte {
 	var vlResp map[string]interface{}
 	if err := json.Unmarshal(body, &vlResp); err != nil {
 		return wrapAsLokiResponse(body, resultType)
@@ -3835,8 +3838,9 @@ func applyScalarOpReverse(body []byte, op string, scalar float64, resultType str
 	results, _ := extractMetricResults(vlResp)
 	for _, r := range results {
 		rm, _ := r.(map[string]interface{})
-		applyScalarToSample(rm, scalar, op, true)
+		applyScalarToSample(rm, scalar, op, reverse)
 	}
+	setMetricResults(vlResp, dropEmptySeries(results))
 
 	result, _ := json.Marshal(vlResp)
 	return wrapAsLokiResponse(result, resultType)
@@ -3873,18 +3877,41 @@ func combineMetricResults(leftBody, rightBody []byte, op, resultType string) []b
 	}
 
 	// Combine: for each left result, find matching right result and apply op
+	kept := make([]interface{}, 0, len(leftResults))
 	for _, r := range leftResults {
 		rm, _ := r.(map[string]interface{})
 		metric, _ := rm["metric"].(map[string]interface{})
 		key := metricKey(metric)
 		rightIdx := rightMap[key]
-		if len(rightIdx) > 0 {
-			applyBinaryToSample(rm, rightIdx, op)
+		if len(rightIdx) == 0 {
+			// No right-hand series to match: LogQL emits nothing for this one.
+			continue
 		}
+		applyBinaryToSample(rm, rightIdx, op)
+		kept = append(kept, r)
 	}
+	setMetricResults(leftResp, dropEmptySeries(kept))
 
 	result, _ := json.Marshal(leftResp)
 	return wrapAsLokiResponse(result, resultType)
+}
+
+// setMetricResults writes a filtered result set back where extractMetricResults
+// found it.
+func setMetricResults(payload map[string]interface{}, results []interface{}) {
+	if _, ok := payload["results"].([]interface{}); ok {
+		payload["results"] = results
+		return
+	}
+	if data, ok := payload["data"].(map[string]interface{}); ok {
+		if _, ok := data["result"].([]interface{}); ok {
+			data["result"] = results
+			return
+		}
+	}
+	if _, ok := payload["result"].([]interface{}); ok {
+		payload["result"] = results
+	}
 }
 
 func extractMetricResults(payload map[string]interface{}) ([]interface{}, bool) {
@@ -3903,32 +3930,55 @@ func extractMetricResults(payload map[string]interface{}) ([]interface{}, bool) 
 }
 
 func applyScalarToSample(sample map[string]interface{}, scalar float64, op string, reverse bool) {
-	values, _ := sample["values"].([]interface{})
-	for i, raw := range values {
-		point, _ := raw.([]interface{})
-		if len(point) < 2 {
-			continue
+	bare, returnBool := splitBoolModifier(op)
+	eval := func(val float64) (float64, bool) {
+		if isComparisonOp(bare) {
+			a, b := val, scalar
+			if reverse {
+				a, b = scalar, val
+			}
+			match := compareValues(a, b, bare)
+			if returnBool {
+				if match {
+					return 1, true
+				}
+				return 0, true
+			}
+			// PromQL/LogQL keep the VECTOR's own value on a match, whichever
+			// side the scalar is on.
+			return val, match
 		}
-		val := parsePointValue(point[1])
-		newVal := applyOp(val, scalar, op)
 		if reverse {
-			newVal = applyOp(scalar, val, op)
+			return applyOp(scalar, val, bare), true
 		}
-		point[1] = strconv.FormatFloat(newVal, 'f', -1, 64)
-		values[i] = point
+		return applyOp(val, scalar, bare), true
 	}
-	if len(values) > 0 {
-		sample["values"] = values
+
+	if values, hasValues := sample["values"].([]interface{}); hasValues {
+		kept := make([]interface{}, 0, len(values))
+		for _, raw := range values {
+			point, _ := raw.([]interface{})
+			if len(point) < 2 {
+				continue
+			}
+			newVal, keep := eval(parsePointValue(point[1]))
+			if !keep {
+				continue
+			}
+			point[1] = strconv.FormatFloat(newVal, 'f', -1, 64)
+			kept = append(kept, point)
+		}
+		sample["values"] = kept
 	}
 
 	if value, ok := sample["value"].([]interface{}); ok && len(value) >= 2 {
-		val := parsePointValue(value[1])
-		newVal := applyOp(val, scalar, op)
-		if reverse {
-			newVal = applyOp(scalar, val, op)
+		newVal, keep := eval(parsePointValue(value[1]))
+		if keep {
+			value[1] = strconv.FormatFloat(newVal, 'f', -1, 64)
+			sample["value"] = value
+		} else {
+			delete(sample, "value")
 		}
-		value[1] = strconv.FormatFloat(newVal, 'f', -1, 64)
-		sample["value"] = value
 	}
 }
 
@@ -3952,8 +4002,9 @@ func samplePointIndex(sample map[string]interface{}) map[string]float64 {
 }
 
 func applyBinaryToSample(sample map[string]interface{}, rightIndex map[string]float64, op string) {
-	values, _ := sample["values"].([]interface{})
-	for i, raw := range values {
+	values, hasValues := sample["values"].([]interface{})
+	kept := make([]interface{}, 0, len(values))
+	for _, raw := range values {
 		point, _ := raw.([]interface{})
 		if len(point) < 2 {
 			continue
@@ -3961,22 +4012,32 @@ func applyBinaryToSample(sample map[string]interface{}, rightIndex map[string]fl
 		ts := fmt.Sprintf("%v", point[0])
 		rightVal, ok := rightIndex[ts]
 		if !ok {
+			// LogQL drops a left sample with no matching right sample.
 			continue
 		}
 		leftVal := parsePointValue(point[1])
-		point[1] = strconv.FormatFloat(applyOp(leftVal, rightVal, op), 'f', -1, 64)
-		values[i] = point
+		newVal, keep := evalBinarySample(leftVal, rightVal, op)
+		if !keep {
+			continue
+		}
+		point[1] = strconv.FormatFloat(newVal, 'f', -1, 64)
+		kept = append(kept, point)
 	}
-	if len(values) > 0 {
-		sample["values"] = values
+	if hasValues {
+		sample["values"] = kept
 	}
 
 	if value, ok := sample["value"].([]interface{}); ok && len(value) >= 2 {
 		ts := fmt.Sprintf("%v", value[0])
 		if rightVal, ok := rightIndex[ts]; ok {
 			leftVal := parsePointValue(value[1])
-			value[1] = strconv.FormatFloat(applyOp(leftVal, rightVal, op), 'f', -1, 64)
-			sample["value"] = value
+			newVal, keep := evalBinarySample(leftVal, rightVal, op)
+			if keep {
+				value[1] = strconv.FormatFloat(newVal, 'f', -1, 64)
+				sample["value"] = value
+			} else {
+				delete(sample, "value")
+			}
 		}
 	}
 }

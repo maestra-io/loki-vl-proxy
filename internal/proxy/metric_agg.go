@@ -262,7 +262,7 @@ func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *htt
 			p.metrics.RecordRequest("query", http.StatusBadRequest, time.Since(start))
 			return
 		}
-		p.proxyBinaryMetricQueryVM(sc, r, binOp.Op, leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
+		p.proxyBinaryMetricQueryVM(sc, r, withBoolModifier(binOp.Op, binOp.ReturnBool), leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
 		dispatched = true
 	}
 

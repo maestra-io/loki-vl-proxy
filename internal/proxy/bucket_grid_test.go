@@ -424,7 +424,10 @@ func TestTemplatePipeline_PushesFiltersDownWithTheSelector(t *testing.T) {
 // was fixed: every point of `sum by (app) (count_over_time({...}[1h]))` sat one
 // step to the left and the last bucket collected data past `end`.
 func TestQueryRange_TwoPhaseGroupedCountIsOnTheLokiGrid(t *testing.T) {
-	base := time.Unix(1700000400, 0).UTC() // hour-aligned
+	// 3600s-aligned: Loki truncates a metric range query's bounds to multiples of
+	// the step, and this fixture asserts the two-phase grid relabel, not that
+	// alignment (1700000400 is NOT a multiple of 3600).
+	base := time.Unix(1700002800, 0).UTC()
 	const step = 3600
 
 	var phase2Start string

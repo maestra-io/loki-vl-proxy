@@ -490,10 +490,10 @@ func translateLogQLFull(logql string, labelFn LabelTranslateFunc, streamFields m
 	var withoutLabels []string
 	logql, withoutLabels = extractWithoutLabels(logql)
 
-	// Strip "bool" modifier from comparison operators before translation.
-	// Loki: "A > bool B" returns 1/0 instead of filtering. Our applyOp always
-	// returns 1/0 for comparisons, so "bool" is a no-op — just strip it.
-	logql = boolModifierRE.ReplaceAllString(logql, " ")
+	// `bool` is NOT a no-op: a BARE comparison filters (the sample keeps its own
+	// value, non-matching samples and empty series are dropped) while `bool`
+	// scores 1/0. The modifier is carried on the operator into the binary
+	// expression marker, so it survives translation.
 
 	// count_values is PromQL, not LogQL: Loki itself answers `parse error at
 	// line 1, col 1: syntax error: unexpected IDENTIFIER` (verified against
@@ -2142,6 +2142,16 @@ const BinaryMetricPrefix = "__binary__:"
 //
 // Returns a special string "__binary__:op:leftQuery|||rightQuery" that the proxy
 // parses and evaluates by running both queries independently.
+// stripBoolModifier removes LogQL's `bool` from a comparison and reports that it
+// was there. A BARE comparison filters (the sample keeps its own value,
+// non-matching samples go, an emptied series goes with them); `bool` scores 1/0.
+func stripBoolModifier(logql string) (string, bool) {
+	if !boolModifierRE.MatchString(logql) {
+		return logql, false
+	}
+	return boolModifierRE.ReplaceAllString(logql, " "), true
+}
+
 func tryTranslateBinaryMetricExpr(logql string, labelFn LabelTranslateFunc) (string, bool) {
 	return tryTranslateBinaryMetricExprM(logql, labelFn, nil)
 }
@@ -2149,10 +2159,15 @@ func tryTranslateBinaryMetricExpr(logql string, labelFn LabelTranslateFunc) (str
 func tryTranslateBinaryMetricExprM(logql string, labelFn LabelTranslateFunc, mapping *MappingOptions) (string, bool) {
 	logql = strings.TrimSpace(logql)
 
-	// Strip the "bool" modifier from comparison operators.
-	// Loki: "A > bool B" means return 1/0 instead of filtering.
-	// We strip "bool" and let applyOp return 1/0 for all comparisons (matching Loki behavior).
-	logql = boolModifierRE.ReplaceAllString(logql, " ")
+	// `bool` rides ALONG WITH the operator (see boolModifierRE below): the
+	// proxy needs it to tell a filtering comparison from a scoring one.
+	logql, hasBoolModifier := stripBoolModifier(logql)
+	tagOperator := func(op string) string {
+		if hasBoolModifier {
+			return op + " bool"
+		}
+		return op
+	}
 
 	// Extract vector matching modifiers before stripping them.
 	// on(labels), ignoring(labels) control join behavior.
@@ -2185,7 +2200,7 @@ func tryTranslateBinaryMetricExprM(logql string, labelFn LabelTranslateFunc, map
 				if i+len(op) <= len(logql) && logql[i:i+len(op)] == op {
 					left := strings.TrimSpace(logql[:i])
 					right := strings.TrimSpace(logql[i+len(op):])
-					operator := strings.TrimSpace(op)
+					operator := tagOperator(strings.TrimSpace(op))
 
 					// Both sides must be valid metric queries
 					leftQL, leftOK := tryTranslateMetricQueryM(left, labelFn, mapping)

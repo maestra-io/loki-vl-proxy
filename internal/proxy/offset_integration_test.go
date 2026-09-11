@@ -14,7 +14,10 @@ func TestQueryRange_OffsetShiftsTimeWindow(t *testing.T) {
 	// rate({app="nginx"}[60s] offset 1h) with start=T end=T+30m step=60
 	// range==step (tumbling window) → routes to stats_query_range.
 	// The proxy must query VL with start=T-1h end=T+30m-1h (both shifted back 1h).
-	base := time.Unix(1700000000, 0).UTC()
+	// 60s-aligned: Loki truncates a metric range query's bounds to multiples of
+	// the step (alignRangeRequestToStepGrid), and this fixture asserts the
+	// UPSTREAM window, not that alignment.
+	base := time.Unix(1700000040, 0).UTC()
 	offset := time.Hour
 
 	var gotStart, gotEnd string
@@ -74,7 +77,10 @@ func TestQueryRange_OffsetShiftsTimeWindow(t *testing.T) {
 func TestQueryRange_NoOffsetUnchanged(t *testing.T) {
 	// Verify that queries without offset leave start/end untouched.
 	// Use [60s] with step=60 so range==step (tumbling) → stats_query_range path.
-	base := time.Unix(1700000000, 0).UTC()
+	// 60s-aligned: Loki truncates a metric range query's bounds to multiples of
+	// the step (alignRangeRequestToStepGrid), and this fixture asserts the
+	// UPSTREAM window, not that alignment.
+	base := time.Unix(1700000040, 0).UTC()
 
 	var gotStart string
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -133,7 +139,10 @@ func TestQueryRange_MultipleOffsetReturns400(t *testing.T) {
 func TestQuery_OffsetShiftsTime(t *testing.T) {
 	// Instant query: sum(count_over_time({app="nginx"}[5m] offset 1h))
 	// eval time T → VL must receive time=T-1h.
-	base := time.Unix(1700000000, 0).UTC()
+	// 60s-aligned: Loki truncates a metric range query's bounds to multiples of
+	// the step (alignRangeRequestToStepGrid), and this fixture asserts the
+	// UPSTREAM window, not that alignment.
+	base := time.Unix(1700000040, 0).UTC()
 	offset := time.Hour
 
 	var gotTime string
@@ -184,7 +193,10 @@ func TestQuery_OffsetShiftsTime(t *testing.T) {
 
 func TestQuery_NoOffsetUnchanged(t *testing.T) {
 	// Verify that instant queries without offset leave the time param unmodified.
-	base := time.Unix(1700000000, 0).UTC()
+	// 60s-aligned: Loki truncates a metric range query's bounds to multiples of
+	// the step (alignRangeRequestToStepGrid), and this fixture asserts the
+	// UPSTREAM window, not that alignment.
+	base := time.Unix(1700000040, 0).UTC()
 
 	var gotTime string
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -2060,6 +2060,14 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Loki evaluates a metric range query on the grid of `k * step`, not on the
+	// client's `start`: its step-align middleware truncates BOTH bounds down to a
+	// multiple of the step. Measured on 3.7.1 — with step=137s over a start that
+	// is not a multiple of 137, every returned timestamp satisfies `ts % 137 == 0`
+	// and the first point sits 17s BEFORE `start`. Align here, at the entry, so
+	// every downstream path builds its request and its grid from Loki's bounds.
+	alignRangeRequestToStepGrid(r, logqlQuery)
+
 	categorizedLabels := requestWantsCategorizedLabels(r)
 	emitStructuredMetadata := p.shouldEmitStructuredMetadata(r)
 	tupleMode := tupleModeForRequest(categorizedLabels, emitStructuredMetadata)
@@ -2239,7 +2247,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		} else if rightErr != nil {
 			p.writeError(sc, http.StatusBadRequest, rightErr.Error())
 		} else {
-			p.proxyBinaryMetricQueryRangeVM(sc, r, binOp.Op, leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
+			p.proxyBinaryMetricQueryRangeVM(sc, r, withBoolModifier(binOp.Op, binOp.ReturnBool), leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
 		}
 	} else if isStatsQuery(logsqlQuery) {
 		p.proxyStatsQueryRange(sc, r, logsqlQuery)
@@ -2517,7 +2525,7 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 		} else if rightErr != nil {
 			p.writeError(sc, http.StatusBadRequest, rightErr.Error())
 		} else {
-			p.proxyBinaryMetricQueryVM(sc, r, binOp.Op, leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
+			p.proxyBinaryMetricQueryVM(sc, r, withBoolModifier(binOp.Op, binOp.ReturnBool), leftLogsql, rightLogsql, binOpExprToVMInfo(binOp))
 		}
 	} else if isStatsQuery(logsqlQuery) {
 		p.proxyStatsQuery(sc, r, logsqlQuery)

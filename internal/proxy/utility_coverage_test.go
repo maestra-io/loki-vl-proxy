@@ -136,8 +136,11 @@ func TestCombineMetricResults(t *testing.T) {
 	if got := resp.Data.Results[0].Values[0][1]; got != "2" {
 		t.Fatalf("expected matched point to be divided, got %#v", got)
 	}
-	if got := resp.Data.Results[0].Values[1][1]; got != "8" {
-		t.Fatalf("expected unmatched point to stay unchanged, got %#v", got)
+	// LogQL evaluates a binary operation per step over BOTH sides: a left sample
+	// with no right-hand sample at that step produces no output point (it used to
+	// be passed through undivided, which is a value no operand ever had).
+	if got := len(resp.Data.Results[0].Values); got != 1 {
+		t.Fatalf("expected the unmatched point to be dropped, got %d points", got)
 	}
 }
 
