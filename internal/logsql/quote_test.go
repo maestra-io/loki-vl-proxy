@@ -36,13 +36,17 @@ func TestQuotePattern(t *testing.T) {
 	}{
 		{"empty", "", `""`},
 		{"simple", "simple", `"simple"`},
-		// Backslash preserved (regex escape semantics), only " is escaped.
-		{"regex_backslash", `\d+`, `"\d+"`},
-		{"regex_word", `\w+\s*`, `"\w+\s*"`},
+		// A regexp escape is DOUBLED on the way into the literal: VictoriaLogs
+		// unquotes before compiling, so `\\d` is what reaches RE2 as `\d`. A
+		// single backslash is a LogsQL parse error, not an escape — the old
+		// expectations here were a query VictoriaLogs answers with HTTP 400.
+		{"regex_backslash", `\d+`, `"\\d+"`},
+		{"regex_word", `\w+\s*`, `"\\w+\\s*"`},
 		// Quotes are still escaped.
 		{"has_quote", `say "hi"`, `"say \"hi\""`},
-		// Backslash NOT doubled — pattern semantics.
-		{"backslash_not_doubled", `a\b`, `"a\b"`},
+		{"backslash_doubled", `a\b`, `"a\\b"`},
+		// The character class that broke `detected_level="error"` on omega.
+		{"bracket_class", `[ \t]`, `"[ \\t]"`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

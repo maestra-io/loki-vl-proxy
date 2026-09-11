@@ -116,6 +116,13 @@ type LabelTranslator struct {
 	learnedMu        sync.RWMutex
 	learnedLokiToVL  map[string]string
 	learnedAmbiguous map[string]struct{}
+	// learnedVLToLoki is the RESPONSE direction of a learned Kubernetes
+	// label/annotation alias. Sanitizing the whole VL path is not what Loki
+	// calls the label — Loki names `kubernetes.pod_labels.strimzi.io/cluster`
+	// `strimzi_io_cluster`, not `kubernetes_pod_labels_strimzi_io_cluster` — so
+	// without this a grouping by it answers with real values under a label name
+	// no dashboard selects on.
+	learnedVLToLoki map[string]string
 
 	translateOTel bool
 }
@@ -129,6 +136,7 @@ func NewLabelTranslator(style LabelStyle, mappings []FieldMapping) *LabelTransla
 		lokiToVL:         make(map[string]string),
 		learnedLokiToVL:  make(map[string]string),
 		learnedAmbiguous: make(map[string]struct{}),
+		learnedVLToLoki:  make(map[string]string),
 		translateOTel:    true,
 	}
 
@@ -194,6 +202,14 @@ func (lt *LabelTranslator) ToLoki(vlField string) string {
 
 	switch lt.style {
 	case LabelStyleUnderscores:
+		if lt != nil {
+			lt.learnedMu.RLock()
+			alias, ok := lt.learnedVLToLoki[vlField]
+			lt.learnedMu.RUnlock()
+			if ok {
+				return alias
+			}
+		}
 		return SanitizeLabelName(vlField)
 	default:
 		return vlField
@@ -300,6 +316,9 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 	// This runs before the empty-bucket return, which an inventory of nothing but
 	// exact names produces.
 	for name := range known {
+		if mapped, ok := lt.learnedLokiToVL[name]; ok {
+			delete(lt.learnedVLToLoki, mapped)
+		}
 		delete(lt.learnedLokiToVL, name)
 		delete(lt.learnedAmbiguous, name)
 	}
@@ -318,7 +337,7 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 		}
 		if len(bucket) != 1 {
 			lt.learnedAmbiguous[alias] = struct{}{}
-			delete(lt.learnedLokiToVL, alias)
+			lt.forgetLearnedAlias(alias)
 			continue
 		}
 		if _, ambiguous := lt.learnedAmbiguous[alias]; ambiguous {
@@ -330,11 +349,26 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 		}
 		if existing, ok := lt.learnedLokiToVL[alias]; ok && existing != candidate {
 			lt.learnedAmbiguous[alias] = struct{}{}
-			delete(lt.learnedLokiToVL, alias)
+			lt.forgetLearnedAlias(alias)
 			continue
 		}
 		lt.learnedLokiToVL[alias] = candidate
+		// Only the LEAF alias earns the response direction: it is the name Loki
+		// gives this label, so a grouping by it has to answer under that name.
+		if alias == leafAlias(candidate) {
+			lt.learnedVLToLoki[candidate] = alias
+		}
 	}
+}
+
+// forgetLearnedAlias drops both directions of an alias. Caller holds learnedMu.
+func (lt *LabelTranslator) forgetLearnedAlias(alias string) {
+	if mapped, ok := lt.learnedLokiToVL[alias]; ok {
+		if lt.learnedVLToLoki[mapped] == alias {
+			delete(lt.learnedVLToLoki, mapped)
+		}
+	}
+	delete(lt.learnedLokiToVL, alias)
 }
 
 // k8sLabelContainers are the VL field prefixes that hold a Kubernetes label or
@@ -348,6 +382,18 @@ var k8sLabelContainers = []string{
 	"kubernetes.pod_annotations.",
 	"kubernetes.namespace_annotations.",
 	"kubernetes.labels.",
+}
+
+// leafAlias returns the Loki label name a Kubernetes label/annotation field is
+// known by — the sanitized LEAF key, which is what Loki's own discovery names it
+// — or "" for a field that is not in one of those maps.
+func leafAlias(field string) string {
+	for _, prefix := range k8sLabelContainers {
+		if leaf, ok := strings.CutPrefix(field, prefix); ok && leaf != "" {
+			return SanitizeLabelName(leaf)
+		}
+	}
+	return ""
 }
 
 // aliasCandidates lists the Loki label names a VL field may legitimately answer
@@ -821,4 +867,43 @@ func canonicalLabelsKey(labels map[string]string) string {
 	}
 	b.WriteByte('}')
 	return b.String()
+}
+
+// NeedsAliasDiscovery reports whether a Loki label can only be resolved to its VL
+// field by looking at the backend's field inventory.
+//
+// True means: the underscore style is in force, nothing static maps this label
+// (no configured mapping, no fallback chain, no built-in OTel name), and no
+// alias has been learned for it yet. `strimzi_io_cluster` is the shape — Loki
+// names a Kubernetes pod label by its sanitized KEY, VictoriaLogs keeps the whole
+// path `kubernetes.pod_labels.strimzi.io/cluster`, and sanitizing is not
+// invertible, so only the inventory can pair them.
+//
+// A label already marked ambiguous returns false: the inventory has been read and
+// gave a collision, and reading it again will not change that.
+func (lt *LabelTranslator) NeedsAliasDiscovery(lokiLabel string) bool {
+	if lt == nil || lt.style != LabelStyleUnderscores {
+		return false
+	}
+	label := strings.TrimSpace(lokiLabel)
+	// Only a sanitized name can hide a dotted/slashed original.
+	if label == "" || !strings.Contains(label, "_") {
+		return false
+	}
+	if _, ok := lt.lokiToVL[label]; ok {
+		return false
+	}
+	if _, ok := lt.fallbacks[label]; ok {
+		return false
+	}
+	if _, ok := knownUnderscoreToDot[label]; ok {
+		return false
+	}
+	lt.learnedMu.RLock()
+	defer lt.learnedMu.RUnlock()
+	if _, ambiguous := lt.learnedAmbiguous[label]; ambiguous {
+		return false
+	}
+	_, learned := lt.learnedLokiToVL[label]
+	return !learned
 }

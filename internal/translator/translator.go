@@ -812,7 +812,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			if ok {
 				// Loki accepts any string in ip() at parse time; ipLineFilterToRegex
 				// falls back to regexp.QuoteMeta for unrecognised patterns.
-				parts = append(parts, "~"+strconv.Quote(ipLineFilterToRegex(arg)))
+				parts = append(parts, "~"+logsql.QuotePattern(ipLineFilterToRegex(arg)))
 			}
 			continue
 		}
@@ -821,7 +821,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			arg, rest, ok := extractIPFilterArg(remaining)
 			remaining = rest
 			if ok {
-				parts = append(parts, "NOT ~"+strconv.Quote(ipLineFilterToRegex(arg)))
+				parts = append(parts, "NOT ~"+logsql.QuotePattern(ipLineFilterToRegex(arg)))
 			}
 			continue
 		}
@@ -1615,7 +1615,7 @@ func translateMalformedDottedStage(stage string, labelFn LabelTranslateFunc) (st
 		//   k8s . `cluster.`
 		// Treat them as prefix regex filters to avoid generating an
 		// impossible field matcher such as "k8s.cluster":!"".
-		return fmt.Sprintf(`~"%s"`, regexp.QuoteMeta(candidate+".")), true
+		return "~" + logsql.QuotePattern(regexp.QuoteMeta(candidate+".")), true
 	}
 	// Dotted field names must be quoted in VL; the :!"" form (non-empty check)
 	// is not representable via FieldFilter, so we keep the literal format here.
@@ -2901,7 +2901,7 @@ func quoteLineFilterLiteral(quoted string) string {
 		// escape what is between the quotes.
 		decoded = strings.Trim(quoted, `"`)
 	}
-	return strconv.Quote(regexp.QuoteMeta(decoded))
+	return logsql.QuotePattern(regexp.QuoteMeta(decoded))
 }
 
 func extractQuotedValue(s string) (string, string) {
@@ -2960,9 +2960,9 @@ func translatePatternLineFilter(expr string, negative bool) string {
 	}
 
 	if negative {
-		return "NOT ~" + strconv.Quote(combined)
+		return "NOT ~" + logsql.QuotePattern(combined)
 	}
-	return "~" + strconv.Quote(combined)
+	return "~" + logsql.QuotePattern(combined)
 }
 
 func extractPatternFilterValues(expr string) ([]string, bool) {

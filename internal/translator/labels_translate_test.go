@@ -137,12 +137,12 @@ func TestTranslateLogQLWithLabels(t *testing.T) {
 		{
 			name:  "malformed dotted stage from drilldown degrades to dotted-prefix regex filter",
 			logql: `{deployment_environment="dev",k8s_namespace_name="sample_ns"} | k8s . ` + "`cluster.`",
-			want:  `"deployment.environment":="dev" "k8s.namespace.name":="sample_ns" ~"k8s\.cluster\."`,
+			want:  `"deployment.environment":="dev" "k8s.namespace.name":="sample_ns" ~"k8s\\.cluster\\."`,
 		},
 		{
 			name:  "malformed nested dotted stage keeps full prefix for regex fallback",
 			logql: `{app="api"} | custom . ` + "`pipeline.`",
-			want:  `app:="api" ~"custom\.pipeline\."`,
+			want:  `app:="api" ~"custom\\.pipeline\\."`,
 		},
 		{
 			name:  "repeated include filter clicks are deduplicated after parser",

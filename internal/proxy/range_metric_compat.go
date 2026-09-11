@@ -1045,7 +1045,7 @@ func (p *Proxy) collectRangeMetricHits(
 	// [[drilldown-high-card-fields-known-limit]] for the deep investigation.
 	// Keep the busiest maxSeries by total count (not the alphabetically-first
 	// maxSeries VL returns) so the chart shows signal, not the noise floor.
-	results = capStatsResultsByTotalCount(results, p.resolvedMaxStatsQuerySeries())
+	results = p.capStatsSeriesReported(results, "range_metric_hits")
 	seriesMap := make(map[string]manualSeriesSamples, len(results))
 	for _, res := range results {
 		metricObj := res.GetObject("metric")
@@ -1697,6 +1697,27 @@ func (p *Proxy) resolvedMaxStatsQuerySeries() int {
 		return p.maxStatsQuerySeries
 	}
 	return 500
+}
+
+// capStatsSeriesReported applies the series cap and SAYS SO. The cap itself is
+// deliberate — an unbounded by() over a churning field returns tens of thousands
+// of single-point series Drilldown cannot render — but until now it was applied
+// silently, so a whole-cluster query answering 500 of its 5091 series was
+// indistinguishable from a cluster that has 500. The count and the cap are
+// logged at WARN with the surface that hit it, and `-max-stats-query-series`
+// raises it per deployment.
+func (p *Proxy) capStatsSeriesReported(results []*fj.Value, surface string) []*fj.Value {
+	maxSeries := p.resolvedMaxStatsQuerySeries()
+	capped := capStatsResultsByTotalCount(results, maxSeries)
+	if len(capped) < len(results) && p != nil && p.log != nil {
+		p.log.Warn("stats series truncated",
+			"surface", surface,
+			"returned", len(capped),
+			"matched", len(results),
+			"limit", maxSeries,
+			"flag", "-max-stats-query-series")
+	}
+	return capped
 }
 
 // capStatsResultsByTotalCount keeps only the maxSeries VL stats results with the
