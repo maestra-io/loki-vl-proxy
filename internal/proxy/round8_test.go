@@ -215,3 +215,105 @@ func TestCollectRangeMetricHits_RequestsTheLokiGrid(t *testing.T) {
 		}
 	}
 }
+
+// The pushdown evaluated a window of `floor(range/step)·step`, so `[15m]` at
+// step=600 came back point-for-point identical to `[10m]` and `[1h30m]` at
+// step=3600 identical to `[1h]`. It looked correct only while the ratio was a
+// whole number — and Grafana's own step choices are what make it fractional.
+func TestPlanRangeWindowRollup_FractionalRatios(t *testing.T) {
+	const start, end = "1700000000", "1700086400"
+	for _, tc := range []struct {
+		name   string
+		query  string
+		step   string
+		want   bool
+		fineNs int64
+	}{
+		{"15m at step 600", `count_over_time({a="b"}[15m])`, "600", true, int64(5 * time.Minute)},
+		{"90m at step 3600", `count_over_time({a="b"}[1h30m])`, "3600", true, int64(30 * time.Minute)},
+		{"7m at step 120", `count_over_time({a="b"}[7m])`, "120", true, int64(time.Minute)},
+		// Equal range and step is the one case the pushdown gets right on its own.
+		{"1h at step 3600", `count_over_time({a="b"}[1h])`, "3600", false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan, ok := planRangeWindowRollup(tc.query, start, end, tc.step)
+			if ok != tc.want {
+				t.Fatalf("engaged=%v, want %v", ok, tc.want)
+			}
+			if ok && plan.fineNs != tc.fineNs {
+				t.Fatalf("fine grid = %v, want %v", time.Duration(plan.fineNs), time.Duration(tc.fineNs))
+			}
+			if ok && plan.rangeNs%plan.fineNs != 0 {
+				t.Fatalf("the fine grid must divide the range, or the inner evaluation is not exact")
+			}
+		})
+	}
+}
+
+// Grafana's `${__auto_interval_<name>}` carries the dashboard's interval-variable
+// name; every spelling resolves to the request's own step.
+func TestQueryRange_GrafanaAutoIntervalStepToken(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer backend.Close()
+
+	p, err := New(Config{BackendURL: backend.URL, LogLevel: "error"})
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	for _, token := range []string{"$__auto_interval_step", "${__auto_interval_step}"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet,
+			"/loki/api/v1/query_range?query="+url.QueryEscape(`sum(count_over_time({app="a"}[`+token+`]))`)+
+				"&start=1700000000&end=1700003600&step=60", nil)
+		p.handleQueryRange(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s -> HTTP %d: %s", token, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// `topk (5, …)` with a space used to fall through to the bare-text branch and
+// reach VictoriaLogs as a search PHRASE, which answers with a parse error naming
+// the proxy's own output.
+func TestQueryRange_WhitespaceVariantsDoNotReachTheBackendAsText(t *testing.T) {
+	var mu sync.Mutex
+	var sawPhrase bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if q := r.FormValue("query"); strings.HasPrefix(strings.TrimSpace(q), `"`) {
+			mu.Lock()
+			sawPhrase = true
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+	}))
+	defer backend.Close()
+
+	p, err := New(Config{BackendURL: backend.URL, LogLevel: "error"})
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	for _, q := range []string{
+		`topk (5, sum by (ns) (count_over_time({app="a"}[5m])))`,
+		`topk(5,  sum by (ns) (count_over_time({app="a"}[5m])))`,
+		`sum  by  (ns)  (count_over_time({app="a"}[5m]))`,
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet,
+			"/loki/api/v1/query_range?query="+url.QueryEscape(q)+
+				"&start=1700000000&end=1700003600&step=300", nil)
+		p.handleQueryRange(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s -> HTTP %d: %s", q, rec.Code, rec.Body.String())
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if sawPhrase {
+		t.Fatal("the query text reached VictoriaLogs as a search phrase")
+	}
+}

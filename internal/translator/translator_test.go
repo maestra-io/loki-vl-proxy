@@ -45,7 +45,9 @@ func TestTranslateLogQL(t *testing.T) {
 		{
 			name:  "line contains backtick raw string containing pipe char",
 			logql: "{app=\"nginx\"} |= `api|v1` | logfmt",
-			want:  `app:="nginx" ~"api|v1" | unpack_logfmt`,
+			// `|=` is a substring filter: the pipe is escaped so it cannot act as
+			// regexp alternation.
+			want: `app:="nginx" ~"api\\|v1" | unpack_logfmt`,
 		},
 		{
 			name:  "line not contains filter — substring semantics",

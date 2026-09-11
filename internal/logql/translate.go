@@ -2,6 +2,7 @@ package logql
 
 import (
 	"errors"
+	"regexp"
 	"strings"
 
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/logsql"
@@ -218,11 +219,20 @@ func translateMatcher(m LabelMatcher, opts TranslateOptions) (string, error) {
 func translateLineFilter(s *LineFilterStage) (string, error) {
 	// An OR-list (`|= "a" or "b"`) becomes one parenthesised alternation so the
 	// single NOT of a negative filter covers every alternative.
+	//
+	// `|=` and `!=` are SUBSTRING matches in LogQL, not regexps. Handing their
+	// value to LogsQL's `~` unescaped made every metacharacter live: `|=
+	// "manifests."` matched `manifestsX`, `|= "a+b"` matched nothing at all, and
+	// `|= "\x1b"` matched every line. Only `|~`/`!~` carry a real pattern.
+	literal := s.Op == LineFilterContains || s.Op == LineFilterExcludes
 	values := s.Values()
 	alternation := ""
 	for i, v := range values {
 		if i > 0 {
 			alternation += " OR "
+		}
+		if literal {
+			v = regexp.QuoteMeta(v)
 		}
 		alternation += "~" + logsql.QuotePattern(v)
 	}

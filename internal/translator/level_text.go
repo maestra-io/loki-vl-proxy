@@ -59,3 +59,8 @@ func LokiTextLevelPattern(level string) string {
 	}
 	return `(?i)(?:^|[ \t\n="\[{(])(?:` + strings.Join(keywords, "|") + `)(?:$|[ \t\n="\[\]{}(),:!])`
 }
+
+// lokiTextLevelCapturePattern is lokiTextLevelRE with the keyword captured into a
+// field named `level`, for the backend-side extraction that gives the stats path
+// the same line-text rule the logs path has.
+const lokiTextLevelCapturePattern = `(?i)(?:^|[ \t\n="\[{(])(?P<level>trace|debug|info|warning|warn|error|err|critical|fatal)(?:$|[ \t\n="\[\]{}(),:!])`

@@ -2,6 +2,7 @@ package translator
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/logsql"
@@ -290,6 +291,14 @@ func (m *MappingOptions) levelNormalizePipes() []string {
 		// lower-priority field overwrite a level that was already present.
 		pipes = append(pipes, "| format if ("+quoted+":*) \"<"+field+">\" as level")
 	}
+	// Loki derives the level from the LINE TEXT when no named field carries a
+	// recognised value, and the logs path already does — the stats path did not,
+	// so `sum by (detected_level) (...)` lost every entry whose only evidence was
+	// the word in the message. One conditional extraction, guarded on `level`
+	// still being empty, puts both paths on the same rule; the capture takes the
+	// FIRST keyword in the line, which is Loki's tie-break too.
+	pipes = append(pipes, "| extract_regexp if (NOT (level:*)) "+
+		strconv.Quote(lokiTextLevelCapturePattern)+" from _msg")
 	for _, canonical := range []string{"error", "warn", "info", "debug"} {
 		pipes = append(pipes, logsql.PipeReplaceRegexp{
 			Field:       "level",

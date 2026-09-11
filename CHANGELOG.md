@@ -37,6 +37,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A plain line filter was translated as a REGEXP, unescaped.** `|=` and `!=`
+  are SUBSTRING matches in LogQL, but their value went to LogsQL's `~` verbatim,
+  so every metacharacter was live: `|= "manifests."` matched `manifestsX`, `|=
+  "a+b"` matched nothing at all, and `|= "\x1b"` matched every line. Panel
+  numbers were silently inflated. The value is now escaped; `|~`/`!~` keep the
+  pattern the user wrote. Measured against Loki 3.7.1 over ten filters: every
+  count matches.
+- **The range window was still wrong for a non-integer range/step ratio.** The
+  pushdown evaluated `floor(range/step)·step`, so `[15m]` at `step=600` was
+  point-for-point `[10m]` and `[1h30m]` at `step=3600` was `[1h]` — and those
+  ratios are exactly what Grafana's own step choices produce. The gcd grid now
+  engages for every range except one equal to the step, which makes the ratio
+  integral by construction. Measured over 39 query/range/step combinations
+  (489 points): 78 mismatching points before, 0 after.
+- **An unparsed LogQL query was shipped to the backend as a search phrase.**
+  `topk (5, …)` with a space fell through to the bare-text branch, and
+  VictoriaLogs answered with a parse error naming the proxy's own output — an
+  error about a query nobody wrote. Whitespace LogQL does not care about is now
+  canonicalised once at the entry (runs collapsed outside quoted spans, not just
+  the single gap before a paren), and a metric expression that still fails to
+  translate is refused here instead of being handed over as text.
+- **`detected_level` was inferred from the line text on the logs path only**, so
+  `sum by (detected_level) (…)` lost every entry whose only evidence was the word
+  in the message. The stats chain now carries the same measured rule as a guarded
+  backend-side extraction. Over the 391-line corpus the two agree exactly, modulo
+  the synonym folding this repo already applied to named-field levels
+  (critical/fatal → error, trace → debug).
+- **`${__auto_interval_step}` was a parse error** — Grafana's
+  `${__auto_interval_<name>}` spelling was missing from the token table.
+
 - **A `label_format`-derived grouping was refused above 10 000 rows.** A grouping
   label the backend cannot see — built by `| regexp` + `| label_format` — forces
   the raw-row path, and its cap turned Trow Registry panels Loki draws (3 series

@@ -2038,6 +2038,11 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// would be rejected with 400 before it ever reached translation. Resolving
 	// here also puts it ahead of the step-grid alignment and the cache key.
 	logqlQuery = resolveGrafanaRangeTemplateTokens(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
+	// Whitespace LogQL does not care about is canonicalised here, once, so every
+	// consumer below — the topk-wrapper parser, the metric-shape checks and the
+	// translator alike — sees the same string. `topk (5, …)` used to fall through
+	// to the bare-text branch and reach VictoriaLogs as a search PHRASE.
+	logqlQuery = translator.NormalizeCallWhitespace(logqlQuery)
 	logqlQuery, ok := p.validateQuery(w, logqlQuery, "query_range")
 	if !ok {
 		return
@@ -2422,6 +2427,7 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// See handleQueryRange: the parser rejects `$__interval` as a duration, so
 	// the tokens must be resolved before validation.
 	logqlQuery = resolveGrafanaRangeTemplateTokens(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
+	logqlQuery = translator.NormalizeCallWhitespace(logqlQuery)
 	logqlQuery, ok := p.validateQuery(w, logqlQuery, "query")
 	if !ok {
 		return

@@ -475,13 +475,17 @@ var logqlCallNames = map[string]bool{
 	"log2": true, "log10": true, "sqrt": true,
 }
 
-// NormalizeCallWhitespace removes the whitespace between a LogQL function name
-// and its opening paren. Quoted spans (", `) are left untouched, so a line
-// filter such as `|= "sum (x)"` keeps its text.
+// NormalizeCallWhitespace canonicalises the whitespace LogQL does not care about:
+// it removes the gap between a function name and its opening paren, and collapses
+// every run of whitespace OUTSIDE a quoted span to one space. Quoted spans
+// (", `) are left untouched, so a line filter such as `|= "sum  (x)"` keeps its
+// text verbatim.
+//
+// Both are needed because this translator matches on shapes, not tokens:
+// `topk (5, …)` and `topk(5,  …)` are the same query to Loki, and without
+// normalising they fell through to the bare-text branch and were shipped to
+// VictoriaLogs as a search PHRASE — which it answers with a parse error.
 func NormalizeCallWhitespace(logql string) string {
-	if !strings.Contains(logql, " (") && !strings.Contains(logql, "\t(") && !strings.Contains(logql, "\n(") {
-		return logql
-	}
 	var b strings.Builder
 	b.Grow(len(logql))
 	for i := 0; i < len(logql); {
@@ -497,6 +501,15 @@ func NormalizeCallWhitespace(logql string) string {
 				j++
 			}
 			b.WriteString(logql[i:j])
+			i = j
+			continue
+		}
+		if isLogQLSpace(c) {
+			j := i
+			for j < len(logql) && isLogQLSpace(logql[j]) {
+				j++
+			}
+			b.WriteByte(' ')
 			i = j
 			continue
 		}
@@ -800,7 +813,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Substring match: |= "text" → ~"text"; `|= "a" or "b"` → (~"a" OR ~"b")
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, false))
+			parts = append(parts, lineFilterAlternation(values, false, true))
 			remaining = rest
 			continue
 		}
@@ -808,7 +821,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Negative substring: != "text" → NOT ~"text"; an OR-list is negated whole
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, true))
+			parts = append(parts, lineFilterAlternation(values, true, true))
 			remaining = rest
 			continue
 		}
@@ -816,7 +829,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Regexp match: |~ "regexp" → ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, false))
+			parts = append(parts, lineFilterAlternation(values, false, false))
 			remaining = rest
 			continue
 		}
@@ -824,7 +837,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Negative regexp: !~ "regexp" → NOT ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, true))
+			parts = append(parts, lineFilterAlternation(values, true, false))
 			remaining = rest
 			continue
 		}
@@ -861,6 +874,16 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// 400, matching Loki's behavior.
 			if looksLikeBareLabelMatcher(remaining) {
 				return "", &ParseError{Msg: fmt.Sprintf("parse error : syntax error: stream selector must be wrapped in braces, got %q", remaining), Pos: -1}
+			}
+			// A metric expression that reached here did not translate. Shipping its
+			// TEXT to VictoriaLogs as a search phrase produced a backend parse error
+			// naming the proxy's own output — an error about a query nobody wrote.
+			// Fail here instead, where the message can name the real problem.
+			// A SUBQUERY (`[1h:5m]`) is deliberately left to the proxy, which
+			// evaluates it itself — that one keeps the passthrough.
+			if name, isCall := leadingLogQLCall(remaining); isCall && !subqueryRangeRE.MatchString(remaining) {
+				return "", &ParseError{Msg: fmt.Sprintf(
+					"parse error : %s(...) is not supported in this position and cannot be evaluated against the backend", name), Pos: -1}
 			}
 			parts = append(parts, translateBareFilter(remaining))
 			break
@@ -2826,11 +2849,20 @@ func extractLineFilterValues(s string) ([]string, string) {
 
 // lineFilterAlternation renders the values as one VL filter. A multi-value list
 // is parenthesised so a negative filter's single NOT covers every alternative.
-func lineFilterAlternation(values []string, negated bool) string {
+//
+// `literal` marks a SUBSTRING filter (`|=`, `!=`). LogsQL's `~` is a regexp, so
+// an unescaped substring made every metacharacter live: `|= "manifests."`
+// matched `manifestsX` (34 rows where Loki returned 0), `|= "a+b"` matched
+// nothing, and `|= "\x1b"` matched every line. Only `|~`/`!~` carry a pattern
+// the user wrote as one.
+func lineFilterAlternation(values []string, negated, literal bool) string {
 	joined := ""
 	for i, v := range values {
 		if i > 0 {
 			joined += " OR "
+		}
+		if literal {
+			v = quoteLineFilterLiteral(v)
 		}
 		joined += "~" + v
 	}
@@ -2841,6 +2873,18 @@ func lineFilterAlternation(values []string, negated bool) string {
 		return "NOT " + joined
 	}
 	return joined
+}
+
+// quoteLineFilterLiteral turns an already-quoted LogQL literal into a quoted
+// regexp that matches it verbatim.
+func quoteLineFilterLiteral(quoted string) string {
+	decoded, err := strconv.Unquote(quoted)
+	if err != nil {
+		// Not a Go-quoted literal (extractQuotedValue's bare-word fallback):
+		// escape what is between the quotes.
+		decoded = strings.Trim(quoted, `"`)
+	}
+	return strconv.Quote(regexp.QuoteMeta(decoded))
 }
 
 func extractQuotedValue(s string) (string, string) {
@@ -3170,6 +3214,24 @@ func isFieldFilter(s string) bool {
 	// Field filters contain :=, :!, :~, :>, :<, :>=, :<=
 	return strings.Contains(s, ":=") || strings.Contains(s, ":~") ||
 		strings.Contains(s, ":!") || strings.Contains(s, ":>") || strings.Contains(s, ":<")
+}
+
+// subqueryRangeRE matches a LogQL subquery range such as `[1h:5m]` or `[1h:]`.
+var subqueryRangeRE = regexp.MustCompile(`\[[^\]]*:[^\]]*\]`)
+
+// leadingLogQLCall reports whether s begins with a LogQL function or aggregation
+// call, which makes it a metric expression rather than free text.
+func leadingLogQLCall(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	i := 0
+	for i < len(s) && isLogQLIdentByte(s[i]) {
+		i++
+	}
+	if i == 0 || i >= len(s) || s[i] != '(' {
+		return "", false
+	}
+	name := s[:i]
+	return name, logqlCallNames[name]
 }
 
 func translateBareFilter(s string) string {
