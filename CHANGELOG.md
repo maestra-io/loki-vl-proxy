@@ -45,7 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the range it asked for, indistinguishable from "that is all the data
   there is". A failed window is now retried once, serially, and if it still
   errors the windowed result is refused so the request falls back to the
-  full-range fetch. A window that is legitimately EMPTY is unchanged.
+  full-range fetch. A window that is legitimately EMPTY is unchanged. A
+  known-partial answer is also no longer written to the patterns cache, so an
+  incomplete mining pass cannot freeze itself into every later request.
 - **`or` / `unless` returned nothing.** The set operations went through the
   arithmetic combiner, which — once a bare comparison started dropping the
   samples it filters out — also dropped every left series with no right-hand

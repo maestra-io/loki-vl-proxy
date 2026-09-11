@@ -318,7 +318,11 @@ func (p *Proxy) handlePatterns(w http.ResponseWriter, r *http.Request) {
 	}
 	recordPatternResponseMetrics(p.metrics, resultBody)
 	// Avoid sticky empty results: first-call empty probes should not poison long-lived pattern cache entries.
-	if len(entries) > 0 {
+	// Same for a KNOWN-PARTIAL answer — a mining pass that reached only part of
+	// the requested range (windows refused, capped, or still invisible in the
+	// backend right after ingestion) must not be frozen into the cache, or every
+	// later request is answered from the incomplete snapshot.
+	if len(entries) > 0 && !diag.likelyLowCoverage() {
 		now := time.Now().UTC()
 		snapshotPayload := snapshotBody
 		if len(snapshotPayload) == 0 {
