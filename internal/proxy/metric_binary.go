@@ -2097,10 +2097,38 @@ func (p *Proxy) proxyStatsQueryRangeDrilldownHybrid(
 // level-discovery query then matched only the proxy's own logs, and the
 // whitelist built from it (`filter level:in("info","warn")`) threw away 99.6 %
 // of the data: 45 rows returned of 11 826.
-var unpackStageRE = regexp.MustCompile(`\|\s*unpack_(?:json|logfmt)\b(?:\s+from\s+[^\s|]+)?`)
+// The scan is QUOTE-AWARE: a filter value may legitimately contain the text
+// `| unpack_json from _msg` (a line filter over the proxy's own logs does), and
+// rewriting it would change what the user asked for.
+var unpackStageRE = regexp.MustCompile(`^\|\s*unpack_(?:json|logfmt)\b(?:\s+from\s+[^\s|]+)?`)
 
 func stripUnpackStagesForTopN(base string) string {
-	return strings.TrimSpace(unpackStageRE.ReplaceAllString(base, ""))
+	var b strings.Builder
+	b.Grow(len(base))
+	for i := 0; i < len(base); {
+		switch c := base[i]; c {
+		case '"', '`':
+			j := i + 1
+			for j < len(base) {
+				if base[j] == c && (c == '`' || base[j-1] != '\\') {
+					j++
+					break
+				}
+				j++
+			}
+			b.WriteString(base[i:j])
+			i = j
+			continue
+		case '|':
+			if m := unpackStageRE.FindString(base[i:]); m != "" {
+				i += len(m)
+				continue
+			}
+		}
+		b.WriteByte(base[i])
+		i++
+	}
+	return strings.TrimSpace(b.String())
 }
 
 // tryHighCardCountByTwoPhase handles single-field `count() by (field)` query_range

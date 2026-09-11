@@ -36,6 +36,27 @@ func TestStripUnpackStagesForTopN_RemovesTheWholeStage(t *testing.T) {
 			t.Errorf("a bare `from _msg` argument survived and becomes a word filter: %s", got)
 		}
 	}
+
+	// CodeRabbit 3988862272: a filter VALUE may legitimately contain the text of a
+	// pipeline stage — a line filter over the proxy's own logs does — and
+	// rewriting it changes what the user asked for.
+	for _, q := range []string{
+		"ns:=\"a\" ~\"| unpack_json from _msg\" | unpack_logfmt from _msg | stats count()",
+		"ns:=\"a\" ~`| unpack_logfmt from _msg` | stats count()",
+	} {
+		got := stripUnpackStagesForTopN(q)
+		if !strings.Contains(got, "| unpack_json from _msg") && !strings.Contains(got, "| unpack_logfmt from _msg") {
+			t.Errorf("the quoted literal was rewritten: %s -> %s", q, got)
+		}
+	}
+	// The real stage next to a quoted one is still removed.
+	got := stripUnpackStagesForTopN("ns:=\"a\" ~\"| unpack_json from _msg\" | unpack_logfmt from _msg | stats count()")
+	if strings.Count(got, "unpack_json") != 1 {
+		t.Errorf("the quoted literal must survive verbatim: %s", got)
+	}
+	if strings.Contains(got, "unpack_logfmt") {
+		t.Errorf("the real stage next to it must still go: %s", got)
+	}
 }
 
 // `level` is a STORED stream label; `detected_level` is the one Loki INFERS.
