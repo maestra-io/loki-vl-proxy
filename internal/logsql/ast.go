@@ -4,6 +4,7 @@ package logsql
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -15,21 +16,26 @@ func quoteLogsQL(s string) string {
 	return `"` + s + `"`
 }
 
-// quoteLogsQLPattern is like quoteLogsQL but for regexp/pattern strings that
-// carry their own backslash escape semantics. Only double-quotes are escaped;
-// backslashes pass through verbatim so regex escapes (\d, \w, etc.) are preserved.
-func quoteLogsQLPattern(s string) string {
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return `"` + s + `"`
-}
+// quoteLogsQLPattern quotes a regexp for embedding in LogsQL. VictoriaLogs
+// UNQUOTES the literal before handing it to RE2, so a regexp escape has to
+// survive that pass: `\\d` in the literal is what reaches RE2 as `\d`. A single
+// backslash is not an escape LogsQL knows and it rejects the whole query
+// (`compound token cannot start with ...`, HTTP 400) — measured against
+// VictoriaLogs v1.50.0, see TestQuotePatternEscapesBackslashes.
+//
+// strconv.Quote is the scheme: VictoriaLogs unquotes with Go semantics, and the
+// one regexp path that was already correct (the detected_level line-text capture)
+// has been using it against production since round 9.
+func quoteLogsQLPattern(s string) string { return strconv.Quote(s) }
 
 // QuoteValue wraps s in double-quotes and escapes embedded backslashes and
 // double-quote characters so the result is always a valid LogsQL quoted string.
 func QuoteValue(s string) string { return quoteLogsQL(s) }
 
-// QuotePattern is like QuoteValue but for regexp/pattern strings that carry
-// their own backslash escape semantics. Only double-quotes are escaped;
-// backslashes pass through verbatim so regex escapes (\d, \w, etc.) are preserved.
+// QuotePattern quotes a REGEXP for embedding in a LogsQL query. Every regexp
+// that reaches a LogsQL string literal must go through here — VictoriaLogs
+// unquotes the literal before compiling it, so a single backslash is a parse
+// error, not an escape.
 func QuotePattern(s string) string { return quoteLogsQLPattern(s) }
 
 // Expr is the top-level LogsQL expression interface.

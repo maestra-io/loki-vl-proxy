@@ -17,6 +17,7 @@ import (
 
 	fj "github.com/valyala/fastjson"
 
+	"github.com/ReliablyObserve/Loki-VL-proxy/internal/logsql"
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/translator"
 )
 
@@ -2253,14 +2254,11 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	if p1Err != nil {
 		return nil
 	}
-	topValues := drilldownTopValuesFromMatrix(p1Body, field)
+	topValues := drilldownTopValuesFromMatrix(p1Body, field, maxDrilldownPhase2Values)
 	if len(topValues) == 0 {
 		// Field is parser-derived (json/logfmt body field) or genuinely empty:
 		// fall through to the exact direct path.
 		return nil
-	}
-	if len(topValues) > maxDrilldownPhase2Values {
-		topValues = topValues[:maxDrilldownPhase2Values]
 	}
 
 	// Phase 2: per-step counts for the selected values, bounded by field:in(...).
@@ -2334,12 +2332,9 @@ func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, fi
 		return nil
 	}
 
-	topValues := drilldownTopValuesFromMatrix(p1Body, field)
+	topValues := drilldownTopValuesFromMatrix(p1Body, field, maxDrilldownPhase2Values)
 	if len(topValues) == 0 {
 		return emptyLokiMatrix
-	}
-	if len(topValues) > maxDrilldownPhase2Values {
-		topValues = topValues[:maxDrilldownPhase2Values]
 	}
 
 	// Phase 2: range query restricted to the global top-N values.
@@ -2372,7 +2367,9 @@ func (p *Proxy) drilldownTwoPhase(r *http.Request, effectiveQuery, cleanBase, fi
 // drilldownTopValuesFromMatrix extracts the label values for field from a Loki
 // matrix JSON response. Used by drilldownTwoPhase to parse the Phase 1 result
 // (one bucket → global top-N values from a single-bucket stats_query_range call).
-func drilldownTopValuesFromMatrix(body []byte, field string) []string {
+// max caps the returned list; the EMPTY value, when Phase 1 found one, is always
+// kept and never counts against that cap.
+func drilldownTopValuesFromMatrix(body []byte, field string, max int) []string {
 	v, err := fj.ParseBytes(body)
 	if err != nil {
 		return nil
@@ -2382,11 +2379,31 @@ func drilldownTopValuesFromMatrix(body []byte, field string) []string {
 		return nil
 	}
 	out := make([]string, 0, len(result))
+	hasEmpty := false
 	for _, entry := range result {
 		val := string(entry.GetStringBytes("metric", field))
-		if val != "" {
-			out = append(out, val)
+		if val == "" {
+			hasEmpty = true
+			continue
 		}
+		out = append(out, val)
+	}
+	if max > 0 && len(out) > max {
+		out = out[:max]
+	}
+	// The empty-valued group is a REAL series both Loki and VictoriaLogs report
+	// — a row whose level key is absent groups under no value at all. Dropping it
+	// here is what made Phase 2's `filter level:in("info","warn")` throw those
+	// rows away: flux-system answered 8834 of its own 8867, mta-renderer lost
+	// 1721. VictoriaLogs matches an ABSENT field with `in("")` (measured on
+	// v1.50.0, TestBuildVLInFilterKeepsEmptyValue), so re-admitting it is enough.
+	//
+	// Only ever alongside a named value: a Phase-1 result that is NOTHING BUT the
+	// empty group means the field is parser-derived and the unpack-stripped
+	// selection query found no column — the callers' "fall through to the exact
+	// path" contract, which an empty-only list must keep triggering.
+	if hasEmpty && len(out) > 0 {
+		out = append(out, "")
 	}
 	return out
 }
@@ -2403,9 +2420,9 @@ func buildVLInFilter(field string, values []string) string {
 		if i > 0 {
 			sb.WriteByte(',')
 		}
-		sb.WriteByte('"')
-		sb.WriteString(strings.ReplaceAll(v, `"`, `\"`))
-		sb.WriteByte('"')
+		// logsql.QuoteValue, not a hand-rolled quote escape: a value carrying a
+		// BACKSLASH has to be doubled or VictoriaLogs rejects the whole query.
+		sb.WriteString(logsql.QuoteValue(v))
 	}
 	sb.WriteByte(')')
 	return sb.String()

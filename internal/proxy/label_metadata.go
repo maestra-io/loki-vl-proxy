@@ -324,6 +324,7 @@ func (p *Proxy) fetchStreamFieldNamesCached(ctx context.Context, params url.Valu
 		if cached, ok := p.streamFieldNamesCache.Get(cacheKey); ok {
 			var fields []string
 			if err := json.Unmarshal(cached, &fields); err == nil {
+				p.labelTranslator.LearnFieldAliases(fields)
 				return fields, nil
 			}
 		}
@@ -350,6 +351,7 @@ func (p *Proxy) fetchStreamFieldNamesCached(ctx context.Context, params url.Valu
 			var fields []string
 			if err := json.Unmarshal(cached, &fields); err == nil {
 				p.streamFieldNamesCache.Set(cacheKey, cached) // populate per-window key
+				p.labelTranslator.LearnFieldAliases(fields)
 				return fields, nil
 			}
 		}
@@ -484,6 +486,7 @@ func (p *Proxy) fetchAllFieldNamesCached(ctx context.Context, params url.Values)
 		if cached, ok := p.streamFieldNamesCache.Get(cacheKey); ok {
 			var fields []string
 			if err := json.Unmarshal(cached, &fields); err == nil {
+				p.labelTranslator.LearnFieldAliases(fields)
 				return fields, nil
 			}
 		}
@@ -501,6 +504,7 @@ func (p *Proxy) fetchAllFieldNamesCached(ctx context.Context, params url.Values)
 			var fields []string
 			if err := json.Unmarshal(cached, &fields); err == nil {
 				p.streamFieldNamesCache.Set(cacheKey, cached)
+				p.labelTranslator.LearnFieldAliases(fields)
 				return fields, nil
 			}
 		}

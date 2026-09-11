@@ -176,24 +176,20 @@ func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *template
 
 func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *templatePlan, logsql string, start, end time.Time, truncationFatal, forward bool) ([]templateEntry, error) {
 	params := url.Values{}
-	if forward {
-		logsql += " | sort by (_time)"
-	} else {
-		logsql += " | sort by (_time desc)"
-	}
-	params.Set("query", logsql)
-	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
-	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
-	// Same raw-row contract as collectRangeMetricSamples, and the same reason for
-	// sending NO `limit`: VictoriaLogs executes one as a sort over the whole
-	// match. The cap is counted here as the rows stream, and the memory this scan
-	// may hold is drawn from the shared retained-entry budget. This is the path a
-	// `label_format`-derived grouping takes — the one a 10,000-row ceiling turned
-	// into a 400 on panels Loki draws.
 	rowLimit := p.rangeMetricRowLimit
 	if rowLimit <= 0 {
 		rowLimit = defaultManualRangeMetricRowLimit
 	}
+	// Bounded sort: the proxy-side row cap below stops READING at rowLimit, but
+	// an unbounded `| sort` has already made VictoriaLogs materialise the whole
+	// match before it emits the first row. Same ceiling, declared to the backend.
+	logsql += sortByTimePipe(forward, rowLimit)
+	params.Set("query", logsql)
+	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
+	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
+	// No HTTP `limit` argument: the cap is counted here as the rows stream, and
+	// the memory this scan may hold is drawn from the shared retained-entry
+	// budget. The backend-side bound is the `limit` on the sort pipe above.
 	reservation := p.newManualScanReservation()
 	defer reservation.release()
 

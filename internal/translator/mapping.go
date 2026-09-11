@@ -2,7 +2,6 @@ package translator
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/logsql"
@@ -310,7 +309,7 @@ func (m *MappingOptions) levelNormalizePipes() []string {
 	if m.InferLevelFromText {
 		pipes = append(pipes, "| extract_regexp if ("+
 			buildFieldFilterStr("level", logsql.FieldOpRegexp, anyLevelValuePattern(), true)+") "+
-			strconv.Quote(lokiTextLevelCapturePattern)+" from _msg")
+			logsql.QuotePattern(lokiTextLevelCapturePattern)+" from _msg")
 	}
 	if m.InferLevelFromText {
 		// Loki's OWN canonical set for `detected_level`, measured on 3.7.1: it keeps

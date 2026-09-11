@@ -508,26 +508,54 @@ func TestDrilldownShouldEagerTwoPhase(t *testing.T) {
 }
 
 // TestDrilldownTopValuesFromMatrix verifies that drilldownTopValuesFromMatrix
-// extracts label values for the requested field from a Loki matrix JSON response,
-// skipping entries where the field is absent.
+// extracts label values for the requested field from a Loki matrix JSON response
+// and KEEPS the empty-valued group, which Phase 2 needs in its in() whitelist.
 func TestDrilldownTopValuesFromMatrix(t *testing.T) {
 	body := []byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
 		`{"metric":{"trace_id":"abc","_c":"5"},"values":[[1700000000,"5"]]},` +
 		`{"metric":{"trace_id":"def","_c":"3"},"values":[[1700000000,"3"]]},` +
-		`{"metric":{"_c":"1"},"values":[[1700000000,"1"]]}` + // no trace_id — must be skipped
+		`{"metric":{"_c":"1"},"values":[[1700000000,"1"]]}` + // no trace_id — the EMPTY group
 		`]}}`)
 
-	got := drilldownTopValuesFromMatrix(body, "trace_id")
-	if len(got) != 2 {
-		t.Fatalf("expected 2 values (entry without trace_id skipped), got %d: %v", len(got), got)
+	got := drilldownTopValuesFromMatrix(body, "trace_id", maxDrilldownPhase2Values)
+	// Round 10: the entry with no trace_id is a real series both Loki and VL
+	// report. Dropping it made Phase 2 emit `filter trace_id:in("abc","def")`,
+	// which deletes those rows — flux-system answered 8834 of its own 8867.
+	if len(got) != 3 {
+		t.Fatalf("expected 3 values (named + the empty group), got %d: %v", len(got), got)
 	}
-	if got[0] != "abc" || got[1] != "def" {
+	if got[0] != "abc" || got[1] != "def" || got[2] != "" {
 		t.Errorf("unexpected values: %v", got)
 	}
 }
 
+// A result that is NOTHING BUT the empty group means the field is parser-derived
+// and the unpack-stripped selection query found no column. The callers read an
+// empty list as "fall through to the exact path", so it must stay empty.
+func TestDrilldownTopValuesFromMatrix_OnlyEmptyGroup(t *testing.T) {
+	body := []byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
+		`{"metric":{"_c":"1"},"values":[[1700000000,"1"]]}` +
+		`]}}`)
+	if got := drilldownTopValuesFromMatrix(body, "trace_id", maxDrilldownPhase2Values); len(got) != 0 {
+		t.Errorf("empty-only result must stay empty, got %v", got)
+	}
+}
+
+// The cap applies to the NAMED values; the empty group is never what gets cut.
+func TestDrilldownTopValuesFromMatrix_CapKeepsEmptyGroup(t *testing.T) {
+	body := []byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
+		`{"metric":{"trace_id":"abc"},"values":[[1700000000,"5"]]},` +
+		`{"metric":{"trace_id":"def"},"values":[[1700000000,"3"]]},` +
+		`{"metric":{"_c":"1"},"values":[[1700000000,"1"]]}` +
+		`]}}`)
+	got := drilldownTopValuesFromMatrix(body, "trace_id", 1)
+	if len(got) != 2 || got[0] != "abc" || got[1] != "" {
+		t.Errorf("cap must trim named values only, got %v", got)
+	}
+}
+
 func TestDrilldownTopValuesFromMatrix_InvalidJSON(t *testing.T) {
-	got := drilldownTopValuesFromMatrix([]byte(`not json`), "trace_id")
+	got := drilldownTopValuesFromMatrix([]byte(`not json`), "trace_id", maxDrilldownPhase2Values)
 	if got != nil {
 		t.Errorf("invalid JSON should return nil, got %v", got)
 	}
@@ -535,7 +563,7 @@ func TestDrilldownTopValuesFromMatrix_InvalidJSON(t *testing.T) {
 
 func TestDrilldownTopValuesFromMatrix_EmptyResult(t *testing.T) {
 	body := []byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`)
-	got := drilldownTopValuesFromMatrix(body, "trace_id")
+	got := drilldownTopValuesFromMatrix(body, "trace_id", maxDrilldownPhase2Values)
 	if len(got) != 0 {
 		t.Errorf("expected nil/empty for empty result, got %v", got)
 	}

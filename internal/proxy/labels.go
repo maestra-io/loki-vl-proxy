@@ -822,3 +822,42 @@ func canonicalLabelsKey(labels map[string]string) string {
 	b.WriteByte('}')
 	return b.String()
 }
+
+// NeedsAliasDiscovery reports whether a Loki label can only be resolved to its VL
+// field by looking at the backend's field inventory.
+//
+// True means: the underscore style is in force, nothing static maps this label
+// (no configured mapping, no fallback chain, no built-in OTel name), and no
+// alias has been learned for it yet. `strimzi_io_cluster` is the shape — Loki
+// names a Kubernetes pod label by its sanitized KEY, VictoriaLogs keeps the whole
+// path `kubernetes.pod_labels.strimzi.io/cluster`, and sanitizing is not
+// invertible, so only the inventory can pair them.
+//
+// A label already marked ambiguous returns false: the inventory has been read and
+// gave a collision, and reading it again will not change that.
+func (lt *LabelTranslator) NeedsAliasDiscovery(lokiLabel string) bool {
+	if lt == nil || lt.style != LabelStyleUnderscores {
+		return false
+	}
+	label := strings.TrimSpace(lokiLabel)
+	// Only a sanitized name can hide a dotted/slashed original.
+	if label == "" || !strings.Contains(label, "_") {
+		return false
+	}
+	if _, ok := lt.lokiToVL[label]; ok {
+		return false
+	}
+	if _, ok := lt.fallbacks[label]; ok {
+		return false
+	}
+	if _, ok := knownUnderscoreToDot[label]; ok {
+		return false
+	}
+	lt.learnedMu.RLock()
+	defer lt.learnedMu.RUnlock()
+	if _, ambiguous := lt.learnedAmbiguous[label]; ambiguous {
+		return false
+	}
+	_, learned := lt.learnedLokiToVL[label]
+	return !learned
+}

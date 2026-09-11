@@ -37,6 +37,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A regexp embedded in LogsQL was quoted one backslash too shallow, and
+  VictoriaLogs rejected the whole query.** `quoteLogsQLPattern` passed
+  backslashes through verbatim on the theory that a regexp carries its own
+  escape semantics. VictoriaLogs UNQUOTES a string literal before handing it to
+  RE2, so `\d` in the literal is not an escape it knows — it answers
+  `compound token cannot start with …`, HTTP 400, for the entire query. Every
+  regexp now goes through `logsql.QuotePattern`, which is `strconv.Quote`: the
+  scheme the one already-correct path (the `detected_level` line-text capture)
+  has been using against production since round 9. Reproduced against the
+  SHIPPED `1.63.1-maestra.13` image and a live VictoriaLogs v1.50.0:
+  `{namespace="status-router"} | json | detected_level = "error"` answered 400
+  there and 200 here, because the line-text heuristic embeds `\[`. The
+  hand-rolled quoting at the four remaining call sites was routed through the
+  same helper, and `buildVLInFilter` stopped escaping only the double quote.
+- **A Kubernetes pod-label selector resolved differently on each replica, and
+  differently over time.** Loki names a pod label by its sanitized KEY
+  (`strimzi_io_cluster`), VictoriaLogs keeps the whole path
+  (`kubernetes.pod_labels.strimzi.io/cluster`), and sanitizing is not
+  invertible — only the backend's field inventory can pair them. That inventory
+  was read ONLY as a side effect of a metadata request that missed its cache, so
+  whether a replica could translate the selector depended on what it had served
+  earlier; the translation cache then froze the answer it reached first. On
+  11.09.2026 one us-omega replica returned 0 rows with HTTP 200 at 13:19 and
+  14:19 while its sibling returned 5000 for the same query at 14:10, and
+  `by (strimzi_io_cluster)` grouped everything under an EMPTY value — which is
+  how VictoriaLogs reports a grouping on a field it does not have. Alias
+  learning now also happens on cache HITS, and the translation path resolves the
+  labels it is about to translate before translating them (`-0.25s` cold, 30s
+  TTL, coalesced). A lookup the backend could not answer forfeits the cache
+  write rather than pinning a wrong query for the life of the process.
+- **The logs path never bounded its sort, so VictoriaLogs buffered the whole
+  match to answer a 1000-line panel.** `sort` is a blocking pipe: without a
+  `limit` VictoriaLogs holds every matching row before it emits the first, so
+  the HTTP `limit` argument — which trims the RESULT — cannot cap the scan.
+  Every raw-row read path now emits `| sort by (_time …) limit N` through one
+  helper (`sortByTimePipe`), which makes VictoriaLogs keep a top-N heap instead.
+  Both us-omega replicas sat at 255.5 MiB of a 256 MiB limit before crashing on
+  11.09.2026. A caller that genuinely folds the whole match client-side
+  (`collectRangeMetricSamples`) passes `n <= 0` and keeps the unbounded form.
+- **`sum by (level)` dropped the group with no value.** The two-phase Drilldown
+  path discovers the top field values, then restricts phase 2 with
+  `filter level:in(…)`. The empty-valued group was filtered out of that
+  whitelist, so the rows it covers were deleted from the answer: flux-system
+  reported 8834 of its own 8867, mta-renderer lost 1721. VictoriaLogs matches a
+  row whose field is ABSENT with `in("")` (measured on v1.50.0), so the empty
+  value is now carried through — never counted against the value cap, and never
+  on its own, since a phase-1 result that is nothing but the empty group is how
+  the callers detect a parser-derived field.
+- **The stats series cap is no longer silent.** A `by()` clause matching more
+  series than `-max-stats-query-series` (default 500) was trimmed to the busiest
+  500 with nothing said, so a query answering 500 of its 5091 series looked
+  exactly like a cluster that has 500. The cap stays — an unbounded high-card
+  `by()` returns tens of thousands of single-point series Drilldown cannot
+  render — but it now logs the returned count, the matched count, the limit and
+  the flag that raises it.
 - **`sum by (level)` answered with a level read out of the MESSAGE.** `level` is a
   stored stream label; `detected_level` is the one Loki infers. Filling the stored
   one in from the line text invented a series the store does not have — 192 rows

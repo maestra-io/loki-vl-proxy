@@ -506,6 +506,41 @@ services:
       start_period: 5s
 
   # Loki-VL-proxy with label-style=underscores (for OTel dot→underscore tests)
+  # Round 10: the only variant with the derived-level flags OUR clusters run
+  # (base/pod-logs/loki-api.yaml). CM16 — a regexp quoted one backslash too
+  # shallow, HTTP 400 for the whole query — is only reachable with them on, so
+  # the main proxy cannot cover it without changing the config every other
+  # e2e expectation was written against.
+  loki-vl-proxy-derived-level:
+    image: ${PROXY_IMAGE:-loki-vl-proxy:e2e-local}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: e2e-proxy-derived-level
+    ports:
+      - "13111:3100"
+    environment:
+      - GOMEMLIMIT=2GiB
+    command:
+      - "-listen=:3100"
+      - "-backend=http://victorialogs:9428"
+      - "-log-level=info"
+      - "-cache-ttl=5s"
+      - "-derived-level-fields=loglevel,LogLevel,level,Level,severity,severity_text,lvl"
+      - "-derived-level-group-by=true"
+      - "-rate-limit-per-second=0"
+      - "-rate-limit-burst=0"
+      - "-max-concurrent=0"
+    depends_on:
+      victorialogs:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s
+
   loki-vl-proxy-underscore:
     image: ${PROXY_IMAGE:-loki-vl-proxy:e2e-local}
     build:

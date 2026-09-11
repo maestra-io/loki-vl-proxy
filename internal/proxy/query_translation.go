@@ -428,6 +428,11 @@ func (p *Proxy) translateQueryWithContext(ctx context.Context, logql string) (st
 			}
 		}
 
+		// Resolve any label only the backend's field inventory can map BEFORE
+		// translating, so the result does not depend on what this replica
+		// happened to serve earlier. A failed lookup forfeits the cache write.
+		aliasesResolved := p.ensureQueryLabelAliases(ctx, normalized)
+
 		p.configMu.RLock()
 		labelFn := p.labelTranslator.ToVL
 		streamFieldsMap := p.streamFieldsMap
@@ -447,7 +452,7 @@ func (p *Proxy) translateQueryWithContext(ctx context.Context, logql string) (st
 		if strings.HasPrefix(trimmed, "|") {
 			translated = "* " + trimmed
 		}
-		if p.translationCache != nil {
+		if p.translationCache != nil && aliasesResolved {
 			p.translationCache.SetWithTTL(normalized, []byte(translated), 5*time.Minute)
 		}
 		return translationResult{query: translated}, nil
@@ -1336,7 +1341,7 @@ func (p *Proxy) fetchBareParserCountBytesViaStats(
 	// sparse single-point series at 24h, which Drilldown cannot render.
 	// Default 500 matches maxDrilldownSeries and Loki's default max_query_series.
 	// See memory [[drilldown-high-card-fields-known-limit]].
-	results = capStatsResultsByTotalCount(results, p.resolvedMaxStatsQuerySeries())
+	results = p.capStatsSeriesReported(results, "stats_query_range")
 	seriesMap := make(map[string]manualSeriesSamples, len(results))
 	streamLabelCache := make(map[string]map[string]string, len(results))
 
