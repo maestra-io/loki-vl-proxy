@@ -2617,10 +2617,11 @@ func TestDrilldown_LogsTabCounter_SumCountOverTimeParserReturnsSingleSeries(t *t
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("parse form: %v", err)
 		}
-		// Match the raw-row endpoint regardless of the limit value: the limit is
-		// a safety cap that changed (1_000_000 -> 10_000 on 10.09.2026) and is
-		// not what this test is about.
-		if r.URL.Path == "/select/logsql/query" && r.Form.Get("limit") != "" {
+		// Match the raw-row endpoint however it is bounded: the scan cap has moved
+		// from a VictoriaLogs `limit` (which VL implements as a sort) to a
+		// proxy-side row count, and which one is in force is not what this test is
+		// about.
+		if r.URL.Path == "/select/logsql/query" {
 			w.Header().Set("Content-Type", "application/x-ndjson")
 			ts := time.Unix(1700000000, 0).Add(-time.Hour)
 			for _, s := range streams {

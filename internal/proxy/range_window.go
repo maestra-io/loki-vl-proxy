@@ -90,11 +90,16 @@ func planRangeWindowRollupDetailed(logqlQuery, startRaw, endRaw, stepRaw string)
 	if !ok || stepDur <= 0 {
 		return plan, nil, false
 	}
-	// Only a range SHORTER than the step needs the finer grid. When the range is
-	// longer the existing pushdown already evaluates the full window per point
-	// (measured against Loki 3.7.1: `[2m]`@60s, `[4m]`@120s and `[30m]`@900s all
-	// match point for point); re-folding those would double-count.
-	if rangeDur >= stepDur {
+	// Equal range and step is the one case the pushdown gets right on its own.
+	//
+	// Everything else needs the finer grid, including a range LONGER than the
+	// step: the pushdown evaluates a window of `floor(range/step)·step`, so
+	// `[15m]` at step=600 came back point-for-point identical to `[10m]` and
+	// `[1h30m]` at step=3600 identical to `[1h]`. It looks correct only while the
+	// ratio is a whole number — and Grafana's own step choices are exactly what
+	// makes it fractional. On the gcd grid the ratio is integral by construction,
+	// so the inner evaluation is exact and the fold below is a pure selection.
+	if rangeDur == stepDur {
 		return plan, nil, false
 	}
 	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)

@@ -60,7 +60,12 @@ func TestPlanRangeWindowRollup(t *testing.T) {
 		{"range shorter, not a divisor", `count_over_time({a="b"}[7m])`, "600", true, int64(time.Minute)},
 		{"rate is additive over its constant divisor", `sum(rate({a="b"}[5m]))`, "3600", true, int64(5 * time.Minute)},
 		{"range equal to step", `count_over_time({a="b"}[1h])`, "3600", false, 0},
-		{"range longer than step", `count_over_time({a="b"}[30m])`, "600", false, 0},
+		// A range LONGER than the step needs the finer grid too: round 8 measured
+		// the pushdown evaluating `floor(range/step)·step`, so `[15m]`@600 came back
+		// identical to `[10m]`. gcd(30m, 10m) is the step itself here, which makes
+		// the plan a no-op in practice but keeps the ratio integral by construction.
+		{"range longer than step", `count_over_time({a="b"}[30m])`, "600", true, int64(10 * time.Minute)},
+		{"range longer than step, fractional ratio", `count_over_time({a="b"}[15m])`, "600", true, int64(5 * time.Minute)},
 		{"non-additive aggregation", `avg_over_time({a="b"} | unwrap d [30m])`, "3600", false, 0},
 		{"subquery keeps its own grid", `max_over_time(rate({a="b"}[5m])[1h:5m])`, "3600", false, 0},
 		{"not a metric query", `{a="b"}`, "3600", false, 0},

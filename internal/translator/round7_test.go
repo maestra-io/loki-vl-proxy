@@ -51,7 +51,9 @@ func TestTranslate_WhitespaceBeforeCallParen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("quoted: %v", err)
 	}
-	if !strings.Contains(quoted, `sum (x)`) {
+	// The literal survives — escaped, because `|=` is a substring filter and its
+	// parens must not become a regexp group.
+	if !strings.Contains(quoted, `sum \\(x\\)`) {
 		t.Fatalf("quoted text was rewritten: %s", quoted)
 	}
 }

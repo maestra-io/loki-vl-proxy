@@ -37,6 +37,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A plain line filter was translated as a REGEXP, unescaped.** `|=` and `!=`
+  are SUBSTRING matches in LogQL, but their value went to LogsQL's `~` verbatim,
+  so every metacharacter was live: `|= "manifests."` matched `manifestsX`, `|=
+  "a+b"` matched nothing at all, and `|= "\x1b"` matched every line. Panel
+  numbers were silently inflated. The value is now escaped; `|~`/`!~` keep the
+  pattern the user wrote. Measured against Loki 3.7.1 over ten filters: every
+  count matches.
+- **The range window was still wrong for a non-integer range/step ratio.** The
+  pushdown evaluated `floor(range/step)·step`, so `[15m]` at `step=600` was
+  point-for-point `[10m]` and `[1h30m]` at `step=3600` was `[1h]` — and those
+  ratios are exactly what Grafana's own step choices produce. The gcd grid now
+  engages for every range except one equal to the step, which makes the ratio
+  integral by construction. Measured over 39 query/range/step combinations
+  (489 points): 78 mismatching points before, 0 after.
+- **An unparsed LogQL query was shipped to the backend as a search phrase.**
+  `topk (5, …)` with a space fell through to the bare-text branch, and
+  VictoriaLogs answered with a parse error naming the proxy's own output — an
+  error about a query nobody wrote. Whitespace LogQL does not care about is now
+  canonicalised once at the entry (runs collapsed outside quoted spans, not just
+  the single gap before a paren), and a metric expression that still fails to
+  translate is refused here instead of being handed over as text.
+- **`detected_level` was inferred from the line text on the logs path only**, so
+  `sum by (detected_level) (…)` lost every entry whose only evidence was the word
+  in the message. The stats chain now carries the same measured rule as a guarded
+  backend-side extraction. Over the 391-line corpus the two agree exactly, modulo
+  the synonym folding this repo already applied to named-field levels
+  (critical/fatal → error, trace → debug).
+- **`${__auto_interval_step}` was a parse error** — Grafana's
+  `${__auto_interval_<name>}` spelling was missing from the token table.
+
+- **A `label_format`-derived grouping was refused above 10 000 rows.** A grouping
+  label the backend cannot see — built by `| regexp` + `| label_format` — forces
+  the raw-row path, and its cap turned Trow Registry panels Loki draws (3 series
+  / 354 points) into a 400. The cap had to be small because it was a
+  VictoriaLogs `limit`, which VL executes by SORTING the whole match — that sort
+  is what OOM-killed both VLSingle instances. No `limit` is sent now: VL streams
+  the matching rows in arbitrary order, the proxy folds each into a per-series
+  map, and the cap is a proxy-side row count that stops the scan the moment it is
+  passed, so the default rises to 1 000 000.
+
+  That row cap is NOT what bounds memory, though: the fold retains one sample per
+  accepted row until the scan finishes, and `-max-concurrent` counts requests,
+  not bytes. Two guards do bound it — a GLOBAL budget of retained samples
+  (≈32 MiB) that every in-flight scan draws from, and a distinct-series cap per
+  scan, since each new series also adds a label map and a translated copy of it.
+  All three refuse with a 400 naming the remedy and log the reason; a scan past
+  any of them is never folded into a smaller-but-plausible number.
+- **A binary expression answered with VictoriaLogs' field names.** `or`,
+  `unless`, `and` and the arithmetic operators were the one path that skipped the
+  label translator, so the same series came back as
+  `{kubernetes.pod_namespace="flux-system"}` where every other path says
+  `{namespace="flux-system"}` — Grafana drew it under two identities depending on
+  the operator. Both operands are still fetched and matched on VL names, which is
+  what keeps the join consistent; the translation now runs once, on the way out.
+- **The bucketed fold read VictoriaLogs' grid as-is.** VL buckets `[b, b+step)`
+  while LogQL's range vector is the right-closed `(t-range, t]`, so an entry
+  sitting exactly on a bucket edge landed in the window that OPENS there instead
+  of the one that ENDS there. On uniform data the two errors cancelled and only
+  the edges of a series showed it: `sum(count_over_time({…}[30m]))` at `step=900`
+  returned 36 on its last point where Loki returned 35. The fold now asks for the
+  same epsilon-shifted grid the single-operand path uses. Measured against Loki
+  3.7.1 over 28 combinations of `count_over_time`/`rate`, bare/`sum`/`sum by`, and
+  seven range/step pairs: 10 mismatching points before, 0 after.
+
 - **A range vector's window was the STEP, not the range.** Every pushdown asks
   VictoriaLogs for `stats_query_range` buckets whose width IS the request's step,
   so `count_over_time({namespace="flux-system"}[30m])` at `step=3600` was
