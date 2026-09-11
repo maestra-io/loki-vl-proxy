@@ -72,8 +72,16 @@ func TestTranslate_NeverShipsAMetricExpressionAsAPhrase(t *testing.T) {
 func TestLevelNormalizePipes_CarryTheLineTextRule(t *testing.T) {
 	m := &MappingOptions{DerivedLevelFields: []string{"level", "LogLevel"}, MaterializeLevel: true}
 	pipes := strings.Join(m.levelNormalizePipes(), " ")
-	if !strings.Contains(pipes, "extract_regexp if (NOT (level:*))") {
-		t.Fatalf("no guarded line-text extraction in the stats chain:\n%s", pipes)
+	// The guard is the absence of a RECOGNISED value, not of any value: a field
+	// holding `custom` is no level at all to Loki, and `level:*` would let it
+	// suppress the heuristic and group the entry under `custom`. Verified against
+	// VictoriaLogs: with `level="custom"` and `_msg` carrying `[error]`, the old
+	// guard grouped the row under `custom`, the new one under `error`.
+	if strings.Contains(pipes, "extract_regexp if (NOT (level:*))") {
+		t.Fatalf("the extraction is guarded on ANY value, not a recognised one:\n%s", pipes)
+	}
+	if !strings.Contains(pipes, "extract_regexp if (-level:~\""+anyLevelValuePattern()+"\")") {
+		t.Fatalf("no recognised-level guard on the line-text extraction:\n%s", pipes)
 	}
 	if !strings.Contains(pipes, "(?P<level>trace|debug|info|warning|warn|error|err|critical|fatal)") {
 		t.Fatalf("the extraction does not carry the measured keyword set:\n%s", pipes)
