@@ -55,6 +55,12 @@ type MappingOptions struct {
 	// MaterializeLevel appends the unpack + coalesce + normalise pipe chain so
 	// VL exposes a real `level` field (needed for `sum by (level)`).
 	MaterializeLevel bool
+
+	// InferLevelFromText allows the normalisation chain to derive a level from
+	// the LINE TEXT when no named field carries a recognised value. Only
+	// `detected_level` is Loki's inferred label; `level` is a stored one, and
+	// filling it in from the message invented series the store does not have.
+	InferLevelFromText bool
 }
 
 func (m *MappingOptions) expand(lokiLabel string) []string {
@@ -301,9 +307,36 @@ func (m *MappingOptions) levelNormalizePipes() []string {
 	// The guard is the absence of a RECOGNISED value, not of any value: a field
 	// holding `custom` is no level at all to Loki, and guarding on `level:*` would
 	// let it suppress the heuristic and group the entry under `custom`.
-	pipes = append(pipes, "| extract_regexp if ("+
-		buildFieldFilterStr("level", logsql.FieldOpRegexp, anyLevelValuePattern(), true)+") "+
-		strconv.Quote(lokiTextLevelCapturePattern)+" from _msg")
+	if m.InferLevelFromText {
+		pipes = append(pipes, "| extract_regexp if ("+
+			buildFieldFilterStr("level", logsql.FieldOpRegexp, anyLevelValuePattern(), true)+") "+
+			strconv.Quote(lokiTextLevelCapturePattern)+" from _msg")
+	}
+	if m.InferLevelFromText {
+		// Loki's OWN canonical set for `detected_level`, measured on 3.7.1: it keeps
+		// `trace` distinct from `debug` and `critical`/`fatal` distinct from
+		// `error`, and labels anything it cannot place `unknown` rather than
+		// leaving the label empty. The repo's synonym table folds all of those
+		// together, which is right for a STORED level (that mapping predates this
+		// and other paths depend on it) but wrong for the one Loki derives.
+		for _, r := range lokiDetectedLevelReplacements {
+			pipes = append(pipes, logsql.PipeReplaceRegexp{
+				Field:       "level",
+				Regex:       "(?i)^(" + r.alternation + ")$",
+				Replacement: r.canonical,
+			}.String())
+		}
+		// An entry Loki cannot place is `unknown` — and that covers a value it does
+		// not RECOGNISE as well as an empty one. A derived field holding `custom`
+		// survives the coalesce chain, matches none of the replacements above and
+		// is not empty, so without this the query emitted
+		// `detected_level="custom"`. The guard is a negated filter rather than a
+		// negative lookahead, which RE2 (and therefore VictoriaLogs) has not got.
+		pipes = append(pipes, "| format if ("+
+			buildFieldFilterStr("level", logsql.FieldOpRegexp, lokiDetectedLevelSetPattern(), true)+
+			`) "unknown" as level`)
+		return pipes
+	}
 	for _, canonical := range []string{"error", "warn", "info", "debug"} {
 		pipes = append(pipes, logsql.PipeReplaceRegexp{
 			Field:       "level",
@@ -312,6 +345,31 @@ func (m *MappingOptions) levelNormalizePipes() []string {
 		}.String())
 	}
 	return pipes
+}
+
+// lokiDetectedLevelReplacements is Loki's canonical `detected_level` mapping, in
+// the order the stages run. `trace` and `critical`/`fatal` come FIRST: a later
+// stage rewrites what an earlier one produced, and the repo's `debug` synonyms
+// would otherwise swallow `trace`.
+// lokiDetectedLevelSetPattern matches exactly the values Loki reports in
+// `detected_level`. Anything else — including the empty string — is `unknown`.
+func lokiDetectedLevelSetPattern() string {
+	names := make([]string, 0, len(lokiDetectedLevelReplacements)+1)
+	for _, r := range lokiDetectedLevelReplacements {
+		names = append(names, r.canonical)
+	}
+	names = append(names, "unknown")
+	return "(?i)^(" + strings.Join(names, "|") + ")$"
+}
+
+var lokiDetectedLevelReplacements = []struct{ canonical, alternation string }{
+	{"trace", "trace"},
+	{"critical", "critical|crit"},
+	{"fatal", "fatal"},
+	{"error", "err|error|errors|emerg|panic|alert"},
+	{"warn", "warn|warning|warnings"},
+	{"info", "info|information|informational|notice"},
+	{"debug", "debug|fine|verbose"},
 }
 
 // groupingLabelFn wraps a label translation function so labels materialised by

@@ -509,6 +509,23 @@ func NormalizeCallWhitespace(logql string) string {
 			for j < len(logql) && isLogQLSpace(logql[j]) {
 				j++
 			}
+			// Whitespace hugging a bracket carries no meaning either: `sum ( rate (
+			// … ) )` is the same query, and leaving the inner spaces in place kept
+			// the shape-matching below from recognising it — a 400 on a query Loki
+			// answers. Commas are deliberately left alone: `topk(5, …)` is the form
+			// every downstream check is written against.
+			prev := byte(0)
+			if out := b.String(); out != "" {
+				prev = out[len(out)-1]
+			}
+			next := byte(0)
+			if j < len(logql) {
+				next = logql[j]
+			}
+			if prev == '(' || prev == '[' || next == ')' || next == ']' {
+				i = j
+				continue
+			}
 			b.WriteByte(' ')
 			i = j
 			continue

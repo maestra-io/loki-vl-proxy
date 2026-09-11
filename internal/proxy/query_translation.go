@@ -2539,6 +2539,80 @@ func isLevelLabel(label string) bool {
 	return false
 }
 
+// isDetectedLevelLabel matches ONLY Loki's derived label. `level` is a stream
+// label the store either has or does not; `detected_level` is the one Loki
+// INFERS, from the line text when no structured field carries a recognised
+// value. Grouping by the two is therefore not the same question, and answering
+// `sum by (level)` with an inferred value moved 192 rows into a series
+// (`{level="info"}`) that exists neither in Loki nor in the store.
+func isDetectedLevelLabel(label string) bool {
+	return strings.TrimSpace(label) == "detected_level"
+}
+
+// groupingUsesDetectedLevel is groupingUsesLevel narrowed to `detected_level`.
+func groupingUsesDetectedLevel(expr logqlpkg.Expr) bool {
+	switch e := expr.(type) {
+	case *logqlpkg.VectorAggregation:
+		if groupingHasDetectedLevel(e.Grouping) {
+			return true
+		}
+		return e.Inner != nil && groupingUsesDetectedLevel(e.Inner)
+	case *logqlpkg.RangeAggregation:
+		if groupingHasDetectedLevel(e.Grouping) {
+			return true
+		}
+		return e.Inner != nil && groupingUsesDetectedLevel(e.Inner)
+	case *logqlpkg.BinOpExpr:
+		return (e.Left != nil && groupingUsesDetectedLevel(e.Left)) ||
+			(e.Right != nil && groupingUsesDetectedLevel(e.Right))
+	case *logqlpkg.OpaqueMetricExpr:
+		return textGroupsByDetectedLevel(e.Raw)
+	}
+	return false
+}
+
+func groupingHasDetectedLevel(g *logqlpkg.Grouping) bool {
+	if g == nil || g.Without {
+		// `without (detected_level)` REMOVES the label; it does not ask for one.
+		// The post-processing behind it adds `stats by (_stream, level)` and then
+		// drops `detected_level` — it never merges two groups that ended up with
+		// different INFERRED levels, so inferring here would split a series the
+		// query asked to collapse.
+		return false
+	}
+	for _, label := range g.Labels {
+		if isDetectedLevelLabel(label) {
+			return true
+		}
+	}
+	return false
+}
+
+func textGroupsByDetectedLevel(logql string) bool {
+	stripped := stripQuotedSpans(logql)
+	for _, m := range levelGroupingRE.FindAllStringSubmatch(stripped, -1) {
+		// Same rule as the structural check: a `without` clause removes the label.
+		if strings.Contains(strings.ToLower(m[0]), "without") {
+			continue
+		}
+		for _, label := range strings.Split(m[1], ",") {
+			if isDetectedLevelLabel(label) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// logqlGroupsByDetectedLevel reports whether the query groups by Loki's DERIVED
+// level label, which is what licenses inferring one from the line text.
+func logqlGroupsByDetectedLevel(logql string) bool {
+	if expr, err := logqlpkg.Parse(logql); err == nil && expr != nil {
+		return groupingUsesDetectedLevel(expr)
+	}
+	return textGroupsByDetectedLevel(logql)
+}
+
 // groupingUsesLevel walks a parsed LogQL expression and reports whether any
 // aggregation groups by (or without) the level label.
 func groupingUsesLevel(expr logqlpkg.Expr) bool {
@@ -2672,6 +2746,8 @@ func (p *Proxy) buildMappingOptions(logql string) *translator.MappingOptions {
 	opts := &translator.MappingOptions{
 		DerivedLevelFields: p.derivedLevelFields,
 		MaterializeLevel:   p.derivedLevelGroupBy && logqlGroupsByLevel(logql),
+		// Only `detected_level` licenses inferring a level from the line text.
+		InferLevelFromText: p.derivedLevelGroupBy && logqlGroupsByDetectedLevel(logql),
 	}
 	// A grouping by a fallback-chain label needs the chain coalesced into a real
 	// field first — VL cannot group by a Loki label that is backed by several
