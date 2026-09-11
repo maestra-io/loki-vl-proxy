@@ -160,3 +160,57 @@ func TestQueryRange_BareComparisonFiltersBoolScores(t *testing.T) {
 		t.Fatalf("arithmetic changed: %v", got)
 	}
 }
+
+// `or` and `unless` select series; they are not arithmetic. Routing them through
+// the arithmetic path emptied them once a comparison started dropping left
+// series without a right-hand match.
+func TestCombineMetricResults_SetOperations(t *testing.T) {
+	left := []byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
+		`{"metric":{"level":"info"},"values":[[100,"4"],[160,"6"]]},` +
+		`{"metric":{"level":"debug"},"values":[[100,"1"],[160,"2"]]}]}}`)
+	right := []byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
+		`{"metric":{"level":"debug"},"values":[[100,"1"]]},` +
+		`{"metric":{"level":"warn"},"values":[[160,"9"]]}]}}`)
+
+	read := func(body []byte) map[string][][]interface{} {
+		t.Helper()
+		var resp struct {
+			Data struct {
+				Result []struct {
+					Metric map[string]string `json:"metric"`
+					Values [][]interface{}   `json:"values"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		out := map[string][][]interface{}{}
+		for _, s := range resp.Data.Result {
+			out[s.Metric["level"]] = s.Values
+		}
+		return out
+	}
+
+	// `or`: every left series survives, and a right-only series joins them.
+	got := read(combineMetricResults(left, right, "or", "matrix"))
+	if len(got) != 3 || len(got["info"]) != 2 || len(got["warn"]) != 1 {
+		t.Fatalf("or lost series: %v", got)
+	}
+	// `unless`: the left samples the right also has are removed.
+	got = read(combineMetricResults(left, right, "unless", "matrix"))
+	if len(got["info"]) != 2 {
+		t.Fatalf("unless dropped an unmatched left series: %v", got)
+	}
+	if len(got["debug"]) != 1 || fmt.Sprintf("%v", got["debug"][0][0]) != "160" {
+		t.Fatalf("unless kept the matched sample: %v", got)
+	}
+	// `and`: only the samples the right also has.
+	got = read(combineMetricResults(left, right, "and", "matrix"))
+	if _, ok := got["info"]; ok {
+		t.Fatalf("and kept an unmatched series: %v", got)
+	}
+	if len(got["debug"]) != 1 || fmt.Sprintf("%v", got["debug"][0][0]) != "100" {
+		t.Fatalf("and kept the wrong sample: %v", got)
+	}
+}

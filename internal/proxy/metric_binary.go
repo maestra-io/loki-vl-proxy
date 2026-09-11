@@ -3876,6 +3876,15 @@ func combineMetricResults(leftBody, rightBody []byte, op, resultType string) []b
 		rightMap[key] = samplePointIndex(rm)
 	}
 
+	// The SET operations are not arithmetic: they decide which series and which
+	// samples survive, and `or`/`unless` specifically keep the left samples that
+	// have NO counterpart on the right.
+	if isSetOp(op) {
+		setMetricResults(leftResp, combineSetOperation(leftResults, rightResults, rightMap, op))
+		result, _ := json.Marshal(leftResp)
+		return wrapAsLokiResponse(result, resultType)
+	}
+
 	// Combine: for each left result, find matching right result and apply op
 	kept := make([]interface{}, 0, len(leftResults))
 	for _, r := range leftResults {

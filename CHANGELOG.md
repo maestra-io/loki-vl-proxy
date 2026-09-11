@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`or` / `unless` returned nothing.** The set operations went through the
+  arithmetic combiner, which — once a bare comparison started dropping the
+  samples it filters out — also dropped every left series with no right-hand
+  match. That is exactly what `or` and `unless` are for, so
+  `sum(count_over_time(…)) or vector(0)` and `… unless …` came back with zero
+  series. They are now evaluated as set operations: `and`/`unless` keep the left
+  samples whose timestamp the right does (or does not) carry, `or` keeps every
+  left sample and fills in the right's where the left has none.
 - **A mapped grouping label was ALSO grouped by its raw name.** The underscore
   fallback adds the Loki label name as a second `stats by (…)` key so data that
   spells the same label with underscores still groups (`service_name` for OTel's
