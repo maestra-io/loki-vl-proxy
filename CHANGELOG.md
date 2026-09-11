@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Patterns served PARTIAL range coverage as a complete answer.** The
+  `/loki/api/v1/patterns` miner splits the requested range into windows and
+  queries VictoriaLogs per window; a window whose fetch errored was dropped
+  silently, and `shouldAcceptWindowedPatternResults` then returned the
+  surviving windows as the whole answer — a Drilldown panel covering a third
+  of the range it asked for, indistinguishable from "that is all the data
+  there is". A failed window is now retried once, serially, and if it still
+  errors the windowed result is refused so the request falls back to the
+  full-range fetch. A window that is legitimately EMPTY is unchanged.
 - **`or` / `unless` returned nothing.** The set operations went through the
   arithmetic combiner, which — once a bare comparison started dropping the
   samples it filters out — also dropped every left series with no right-hand
