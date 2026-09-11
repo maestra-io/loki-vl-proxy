@@ -72,3 +72,38 @@ func TestMatchLineFilter_OrList(t *testing.T) {
 		}
 	}
 }
+
+// CodeRabbit 3985990715: the scanner DECODES a literal, so a value carrying a
+// quote or a backslash has to be re-quoted on the way out — direct interpolation
+// emitted `or "b"c"`, which no longer parses.
+func TestLineFilterStage_StringEscapesValues(t *testing.T) {
+	stage := &LineFilterStage{
+		Op:    LineFilterContains,
+		Value: `a"b`,
+		Or:    []string{`c\d`, "e\tf"},
+	}
+	got := `{ns="x"} ` + stage.String()
+	if _, err := Parse(got); err != nil {
+		t.Fatalf("re-serialized filter does not parse: %s\n%v", got, err)
+	}
+	reparsed, err := Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lq, ok := reparsed.(*LogQuery)
+	if !ok || len(lq.Pipeline) != 1 {
+		t.Fatalf("unexpected shape %T", reparsed)
+	}
+	round, ok := lq.Pipeline[0].(*LineFilterStage)
+	if !ok {
+		t.Fatalf("unexpected stage %T", lq.Pipeline[0])
+	}
+	if round.Value != stage.Value || len(round.Or) != len(stage.Or) {
+		t.Fatalf("round trip lost data: %+v vs %+v", round, stage)
+	}
+	for i, alt := range stage.Or {
+		if round.Or[i] != alt {
+			t.Fatalf("alternative %d round-tripped as %q, want %q", i, round.Or[i], alt)
+		}
+	}
+}

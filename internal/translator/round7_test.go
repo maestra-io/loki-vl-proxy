@@ -1,6 +1,7 @@
 package translator
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -96,11 +97,32 @@ func TestDerivedLevelFilter_FallsBackToLineText(t *testing.T) {
 	if !strings.Contains(got, `_msg:~`) {
 		t.Fatalf("no line-text alternative in %s", got)
 	}
-	if !strings.Contains(got, `NOT ("level":* OR "LogLevel":*)`) && !strings.Contains(got, "NOT (level:* OR LogLevel:*)") {
-		t.Fatalf("text fallback is not guarded by the absence of a level field: %s", got)
+	// The guard is the absence of a RECOGNISED value, not of any value: Loki falls
+	// back to the line text when the level key holds something it does not know.
+	if !strings.Contains(got, `NOT (level:~"`+anyLevelValuePattern()+`" OR LogLevel:~"`+anyLevelValuePattern()+`")`) {
+		t.Fatalf("text fallback is not guarded by the absence of a RECOGNISED level: %s", got)
 	}
 	// A negated matcher keeps the old shape — the heuristic has no negative form.
 	if neg := m.derivedLevelFilter("error", true, false); strings.Contains(neg, "_msg:~") {
 		t.Fatalf("negated matcher must not gain the text fallback: %s", neg)
+	}
+}
+
+// An UNRECOGNISED named value must not suppress the line-text heuristic — Loki
+// reads `"LogLevel":"Information"` as unknown and then looks at the line.
+func TestAnyLevelValuePattern_CoversEveryRecognisedValue(t *testing.T) {
+	re := regexp.MustCompile(anyLevelValuePattern())
+	for _, v := range []string{"error", "ERR", "Fatal", "warning", "info", "notice", "debug", "trace", "unknown"} {
+		if !re.MatchString(v) {
+			t.Errorf("%q should be a recognised level value", v)
+		}
+	}
+	// "information"/"notice" ARE in this repo's synonym table (levelSynonyms), so
+	// they count as recognised here — the guard has to match the very set the
+	// pushdown filter itself matches on, or the two disagree about what a level is.
+	for _, v := range []string{"", "banana", "err0r", "informative"} {
+		if re.MatchString(v) {
+			t.Errorf("%q should NOT be a recognised level value", v)
+		}
 	}
 }

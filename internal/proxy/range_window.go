@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"strconv"
@@ -33,10 +34,11 @@ type rangeWindowPlan struct {
 	fineNs  int64
 }
 
-// maxRangeWindowFineBuckets caps the fine grid. A `[7m]` window at step=1h over a
-// 24h range would otherwise ask for 1-minute buckets across the whole span; the
-// cap keeps one panel from turning into a scan the backend cannot afford, and the
-// query then keeps its previous (step-wide) behaviour rather than failing.
+// maxRangeWindowFineBuckets caps the fine grid. A `[7m]` window at step=10m over
+// weeks asks for 1-minute buckets across the whole span; the cap keeps one panel
+// from turning into a scan the backend cannot afford. Beyond it the request is
+// REFUSED — the only fallback available is the step-wide window, which is the
+// defect this file exists to remove.
 const maxRangeWindowFineBuckets = 20_000
 
 // additiveRangeOps are the range aggregations whose window value is the SUM of
@@ -55,35 +57,69 @@ var additiveRangeOps = map[logqlpkg.RangeOp]bool{
 // returns the grid to use. It engages only when the LogQL range differs from the
 // step — when they are equal the existing single-pass pushdown is already exact.
 func planRangeWindowRollup(logqlQuery, startRaw, endRaw, stepRaw string) (rangeWindowPlan, bool) {
+	plan, _, ok := planRangeWindowRollupDetailed(logqlQuery, startRaw, endRaw, stepRaw)
+	return plan, ok
+}
+
+// errRangeWindowTooFine reports that the grid a correct evaluation needs is
+// finer than this instance will scan. Returning it is deliberate: the only
+// alternative is the step-wide window, which is the defect this file removes, and
+// a silently wrong number is worse than a refusal that names its own remedy.
+type errRangeWindowTooFine struct {
+	rangeDur time.Duration
+	stepDur  time.Duration
+	buckets  int64
+}
+
+func (e *errRangeWindowTooFine) Error() string {
+	return fmt.Sprintf(
+		"range %s with step %s needs %d evaluation buckets to be computed correctly, over the %d this instance allows; "+
+			"widen the step or shorten the time range",
+		e.rangeDur, e.stepDur, e.buckets, maxRangeWindowFineBuckets)
+}
+
+// planRangeWindowRollupDetailed is planRangeWindowRollup plus the reason a
+// needed rollup could not be planned.
+func planRangeWindowRollupDetailed(logqlQuery, startRaw, endRaw, stepRaw string) (rangeWindowPlan, error, bool) {
 	var plan rangeWindowPlan
 	rangeDur, ok := logqlRangeWindow(logqlQuery)
 	if !ok || rangeDur <= 0 {
-		return plan, false
+		return plan, nil, false
 	}
 	stepDur, ok := parsePositiveStepDuration(stepRaw)
 	if !ok || stepDur <= 0 {
-		return plan, false
+		return plan, nil, false
 	}
 	// Only a range SHORTER than the step needs the finer grid. When the range is
 	// longer the existing pushdown already evaluates the full window per point
 	// (measured against Loki 3.7.1: `[2m]`@60s, `[4m]`@120s and `[30m]`@900s all
 	// match point for point); re-folding those would double-count.
 	if rangeDur >= stepDur {
-		return plan, false
+		return plan, nil, false
 	}
 	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)
 	endNs, hasEnd := parseLokiTimeToUnixNano(endRaw)
 	if !hasStart || !hasEnd || endNs < startNs {
-		return plan, false
+		return plan, nil, false
 	}
 	stepNs := stepDur.Nanoseconds()
 	rangeNs := rangeDur.Nanoseconds()
 	fineNs := gcdInt64(rangeNs, stepNs)
 	if fineNs <= 0 {
-		return plan, false
+		return plan, nil, false
 	}
-	if (endNs-startNs+rangeNs)/fineNs > maxRangeWindowFineBuckets {
-		return plan, false
+	if fineNs < int64(time.Second) {
+		// VictoriaLogs buckets at second resolution, so a sub-second grid is not
+		// implementable — and it only ever arises from Grafana's fractional `$__auto`
+		// step against a whole-second range (`[1s]` at step 1.964s), where the
+		// residual is under one bucket. Leave those on the existing path instead of
+		// refusing a panel over a rounding artefact.
+		return plan, nil, false
+	}
+	if buckets := (endNs - startNs + rangeNs) / fineNs; buckets > maxRangeWindowFineBuckets {
+		// Refuse rather than fall back: the fallback is the step-wide window, which
+		// is exactly the wrong answer this file exists to stop returning.
+		return plan, &errRangeWindowTooFine{rangeDur: rangeDur, stepDur: stepDur, buckets: buckets}, false
 	}
 	return rangeWindowPlan{
 		startNs: startNs,
@@ -91,7 +127,7 @@ func planRangeWindowRollup(logqlQuery, startRaw, endRaw, stepRaw string) (rangeW
 		stepNs:  stepNs,
 		rangeNs: rangeNs,
 		fineNs:  fineNs,
-	}, true
+	}, nil, true
 }
 
 // logqlRangeWindow returns the range selector's window for a query the rollup can
@@ -111,11 +147,10 @@ func logqlRangeWindow(logqlQuery string) (time.Duration, bool) {
 			if e.Step != "" || !additiveRangeOps[e.Op] {
 				return 0, false
 			}
-			d, err := time.ParseDuration(e.Range)
-			if err != nil {
-				return 0, false
-			}
-			return d, true
+			// LogQL accepts `d`, `w` and `y`, which time.ParseDuration rejects —
+			// `[1d12h]` would otherwise fail to parse here and silently keep the
+			// step-wide window this whole file exists to remove.
+			return parsePositiveStepDuration(e.Range)
 		default:
 			return 0, false
 		}

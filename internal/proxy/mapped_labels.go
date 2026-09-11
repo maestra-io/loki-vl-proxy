@@ -239,6 +239,18 @@ func normalizeLevelValue(v string) string {
 	}
 }
 
+// isRecognizedLevelValue reports whether a raw level value is one Loki maps onto
+// a canonical level. normalizeLevelValue lowercases anything else unchanged, so
+// the two agreeing is the test.
+func isRecognizedLevelValue(v string) bool {
+	switch normalizeLevelValue(v) {
+	case "info", "warn", "error", "debug", "trace":
+		return true
+	default:
+		return false
+	}
+}
+
 // levelFromSubstring derives a level from a raw log line the way Loki does at
 // ingest — a level KEYWORD delimited by the characters Loki accepts, first match
 // wins. A plain substring scan read `user terrorized the db` as an error and
@@ -264,8 +276,13 @@ func (p *Proxy) applyDerivedLevel(labels map[string]string, msg string) {
 			level = v
 		}
 	}
-	if level == "" {
-		level = levelFromSubstring(msg)
+	// An UNRECOGNISED named value is no level at all to Loki (`"LogLevel":
+	// "Information"` reads as unknown), and it must not suppress the line-text
+	// heuristic the way a real level does.
+	if level == "" || !isRecognizedLevelValue(level) {
+		if fromText := levelFromSubstring(msg); fromText != "" {
+			level = fromText
+		}
 	}
 	if level == "" {
 		return

@@ -2083,8 +2083,16 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// window. Wrapping the ENTIRE handler is what makes this hold for every
 	// dispatch path below — the direct pushdown, the compat decomposition and the
 	// drilldown fast paths alike.
-	if plan, ok := planRangeWindowRollup(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step")); ok &&
-		!rangeWindowRollupActive(r.Context()) {
+	plan, planErr, planOK := planRangeWindowRollupDetailed(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
+	if planErr != nil && !rangeWindowRollupActive(r.Context()) {
+		// The correct grid is finer than this instance will scan. The only other
+		// option is the step-wide window — the very defect this path removes — so
+		// say so instead of returning a plausible wrong number.
+		p.writeError(w, http.StatusBadRequest, planErr.Error())
+		p.metrics.RecordRequest("query_range", http.StatusBadRequest, time.Since(start))
+		return
+	}
+	if planOK && !rangeWindowRollupActive(r.Context()) {
 		inner := requestWithFineStep(r, plan)
 		buf := &bufferedResponseWriter{}
 		p.handleQueryRange(buf, inner)

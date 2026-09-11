@@ -292,12 +292,21 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 			bucket[field] = struct{}{}
 		}
 	}
+	lt.learnedMu.Lock()
+	defer lt.learnedMu.Unlock()
+
+	// A field that shows up in a LATER inventory owns its own name: drop any alias
+	// learned for it earlier, or ToVL keeps answering with the aliased field.
+	// This runs before the empty-bucket return, which an inventory of nothing but
+	// exact names produces.
+	for name := range known {
+		delete(lt.learnedLokiToVL, name)
+		delete(lt.learnedAmbiguous, name)
+	}
+
 	if len(buckets) == 0 {
 		return
 	}
-
-	lt.learnedMu.Lock()
-	defer lt.learnedMu.Unlock()
 
 	for alias, bucket := range buckets {
 		// Explicit and known mappings always win.

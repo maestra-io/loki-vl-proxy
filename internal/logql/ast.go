@@ -2,6 +2,7 @@ package logql
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -114,9 +115,11 @@ func (s *LineFilterStage) String() string {
 	case LineFilterExcludePat:
 		op = "!>"
 	}
-	out := fmt.Sprintf(`%s "%s"`, op, s.Value)
+	// The scanner DECODES the literal, so a value carrying a quote or a backslash
+	// must be re-quoted on the way out or the emitted query stops parsing.
+	out := op + " " + strconv.Quote(s.Value)
 	for _, alt := range s.Or {
-		out += fmt.Sprintf(` or "%s"`, alt)
+		out += " or " + strconv.Quote(alt)
 	}
 	return out
 }
