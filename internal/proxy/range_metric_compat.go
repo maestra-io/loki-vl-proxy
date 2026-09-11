@@ -973,6 +973,15 @@ func (p *Proxy) collectRangeMetricHits(
 	params.Set("start", strconv.FormatInt(start.Unix(), 10))
 	params.Set("end", strconv.FormatInt(end.Unix(), 10))
 	params.Set("step", strconv.FormatFloat(hitStep.Seconds(), 'f', 0, 64)+"s")
+	// VictoriaLogs buckets `[b, b+step)` while LogQL's range vector is the
+	// RIGHT-closed `(t-range, t]`. A negative `offset` moves the grid one
+	// microsecond right, so each bucket becomes `(b, b+step]` and the fold below
+	// lines up with Loki. Without it an entry sitting exactly on a bucket edge was
+	// counted in the window that OPENS there instead of the one that ends there —
+	// invisible on uniform data, because the sample wrongly added at `t-range`
+	// replaced the one wrongly dropped at `t`, and visible at the edges of the
+	// series where only one of the two exists.
+	params.Set("offset", "-"+formatVLDurationSeconds(lokiGridBucketEpsilonNanos))
 
 	// Acquire concurrency slot. The Drilldown Fields page fires ~30 of these
 	// in parallel; without a cap all 30 hit VL simultaneously, causing a CPU storm.
@@ -1066,7 +1075,13 @@ func (p *Proxy) collectRangeMetricHits(
 			}
 			tsUnix, tsErr := arr[0].Int64()
 			if tsErr != nil {
-				continue
+				// The epsilon offset makes VictoriaLogs label buckets `b+0.000001`,
+				// which is no longer an integer second.
+				tsFloat, floatErr := arr[0].Float64()
+				if floatErr != nil {
+					continue
+				}
+				tsUnix = int64(math.Round(tsFloat))
 			}
 			valStr := string(arr[1].GetStringBytes())
 			val, valErr := strconv.ParseFloat(valStr, 64)
@@ -1110,9 +1125,12 @@ func statusForRangeMetricCollectError(err error) int {
 }
 
 // defaultManualRangeMetricRowLimit caps the raw-row scan of the manual
-// compatibility path. Lowered from 1,000,000 on 10.09.2026 — see
-// collectRangeMetricSamples for why that number was dangerous.
-const defaultManualRangeMetricRowLimit = 10_000
+// compatibility path. It is a PROXY-SIDE count now (see collectRangeMetricSamples):
+// the scan stops when it is exceeded, and no `limit` — and therefore no sort — is
+// asked of VictoriaLogs. 10,000 was the ceiling while the cap had to be a VL
+// `limit`, and it refused dashboard panels Loki answers; the number that was
+// dangerous as a sorted limit is safe as a streamed count.
+const defaultManualRangeMetricRowLimit = 1_000_000
 
 // rawRowScanTruncatedError reports that the manual path hit its row cap, so any
 // number it could return would be short by an unknown amount.
@@ -1121,8 +1139,8 @@ type rawRowScanTruncatedError struct{ limit int }
 func (e *rawRowScanTruncatedError) Error() string {
 	return fmt.Sprintf(
 		"query needs more than %d raw log rows to evaluate; the result would be silently incomplete. "+
-			"Narrow the time range or the stream selector, add a by(...) grouping so the aggregation runs "+
-			"in the backend, or raise -manual-range-metric-row-limit if this instance can afford the scan",
+			"Narrow the time range or the stream selector, group by a label the backend can see so the "+
+			"aggregation runs there, or raise -manual-range-metric-row-limit if this instance can afford the scan",
 		e.limit)
 }
 
@@ -1131,24 +1149,29 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 	params.Set("query", baseQuery)
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
-	// This path reads RAW ROWS and folds them client-side, and VictoriaLogs
-	// executes a `limit` by sorting: the request becomes
-	// `| sort by (_time) desc limit N`. At N=1,000,000 over a busy namespace
-	// that sort is what OOM-killed both 4Gi VLSingle instances five times on
-	// 10.09.2026 — taking every other query on the cluster down with it.
+	// This path reads RAW ROWS and folds them client-side.
 	//
-	// The limit is therefore a safety cap, not a tuning knob, and truncation is
-	// reported rather than folded into a smaller-but-plausible number: a
-	// silently short aggregate is indistinguishable from a real drop in traffic.
+	// It sends NO `limit`. VictoriaLogs executes one by sorting — the request
+	// becomes `| sort by (_time) desc limit N` — and at N=1,000,000 over a busy
+	// namespace that sort is what OOM-killed both 4Gi VLSingle instances five
+	// times on 10.09.2026. The danger was the SORT, not the row count: without a
+	// limit VictoriaLogs streams matching rows in arbitrary order and never
+	// materialises them, and this loop folds each row into a per-series bucket
+	// map, so memory on BOTH sides is bounded by the number of series, not by the
+	// number of rows.
+	//
+	// The cap therefore moves to the proxy side, where it costs nothing: rows are
+	// counted as they stream and the scan stops the moment it is exceeded. A
+	// 10,000-row ceiling turned legitimate Trow Registry panels into a 400 while
+	// Loki drew them (3 series / 354 points), because a grouping label built by
+	// `| regexp` + `| label_format` cannot be pushed down and every row has to be
+	// read. Truncation is still reported rather than folded into a
+	// smaller-but-plausible number: a silently short aggregate is
+	// indistinguishable from a real drop in traffic.
 	rowLimit := p.rangeMetricRowLimit
 	if rowLimit <= 0 {
 		rowLimit = defaultManualRangeMetricRowLimit
 	}
-	// Ask for ONE MORE row than the cap allows. A response of exactly rowLimit
-	// rows is ambiguous — it can be a complete result that happens to land on
-	// the cap — so the extra row is the overflow probe: seeing it proves there
-	// was more to read, and not seeing it proves there was not.
-	params.Set("limit", strconv.Itoa(rowLimit+1))
 
 	resp, err := p.vlPost(ctx, "/select/logsql/query", params)
 	if err != nil {
@@ -1183,6 +1206,11 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 			continue
 		}
 		rowsScanned++
+		if rowsScanned > rowLimit {
+			// Stop reading immediately: the body is closed by the deferred call, so
+			// VictoriaLogs stops producing rather than streaming the whole match.
+			return nil, &rawRowScanTruncatedError{limit: rowLimit}
+		}
 
 		v, parseErr := fjp.ParseBytes(line)
 		if parseErr != nil {
@@ -1263,10 +1291,6 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 	if scanErr := scanner.Err(); scanErr != nil {
 		return nil, fmt.Errorf("scanning VL response: %w", scanErr)
 	}
-	if rowsScanned > rowLimit {
-		return nil, &rawRowScanTruncatedError{limit: rowLimit}
-	}
-
 	for key, series := range seriesMap {
 		sort.Slice(series.Samples, func(i, j int) bool { return series.Samples[i].ts < series.Samples[j].ts })
 		seriesMap[key] = series

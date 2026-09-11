@@ -3611,8 +3611,20 @@ func (p *Proxy) proxyBinaryMetricVM(w http.ResponseWriter, r *http.Request, op, 
 		result = clampStatsQRToRequestWindow(result, startRaw, endRaw)
 	}
 
+	p.writeBinOpResult(w, r, result)
+}
+
+// writeBinOpResult renames the combined operands' labels back to Loki's names.
+// Both sides are fetched and MATCHED on VictoriaLogs field names — which is what
+// keeps the join consistent — so the translation belongs here, once, on the way
+// out. Without it a binary expression was the one path that answered with the
+// backend's own names: `{kubernetes.pod_namespace="flux-system"}` where every
+// other path says `{namespace="flux-system"}`, so Grafana drew the same series
+// under two different identities depending on the operator.
+func (p *Proxy) writeBinOpResult(w http.ResponseWriter, r *http.Request, result []byte) {
+	result = p.trimAndTranslateStatsQRFJ(r.Context(), result, nil, r.FormValue("query"))
 	w.Header().Set("Content-Type", "application/json")
-	w.Write(result)
+	_, _ = w.Write(result)
 }
 
 func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, leftQL, rightQL, vlEndpoint, resultType string) {
@@ -3652,8 +3664,7 @@ func (p *Proxy) proxyBinaryMetric(w http.ResponseWriter, r *http.Request, op, le
 		result = clampStatsQRToRequestWindow(result, startRaw, endRaw)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(result)
+	p.writeBinOpResult(w, r, result)
 }
 
 // fetchBinOpSides resolves both sides of a binary metric expression, whatever

@@ -37,6 +37,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `label_format`-derived grouping was refused above 10 000 rows.** A grouping
+  label the backend cannot see — built by `| regexp` + `| label_format` — forces
+  the raw-row path, and its cap turned Trow Registry panels Loki draws (3 series
+  / 354 points) into a 400. The cap had to be small because it was a
+  VictoriaLogs `limit`, which VL executes by SORTING the whole match — that sort
+  is what OOM-killed both VLSingle instances. No `limit` is sent now: VL streams
+  the matching rows in arbitrary order, the proxy folds each into a per-series
+  bucket map, and the cap is a proxy-side row count that stops the scan the
+  moment it is passed. Memory on both sides is bounded by the number of series,
+  not of rows, so the default rises to 1 000 000. Truncation past the cap is
+  still reported, never folded into a smaller-but-plausible number.
+- **A binary expression answered with VictoriaLogs' field names.** `or`,
+  `unless`, `and` and the arithmetic operators were the one path that skipped the
+  label translator, so the same series came back as
+  `{kubernetes.pod_namespace="flux-system"}` where every other path says
+  `{namespace="flux-system"}` — Grafana drew it under two identities depending on
+  the operator. Both operands are still fetched and matched on VL names, which is
+  what keeps the join consistent; the translation now runs once, on the way out.
+- **The bucketed fold read VictoriaLogs' grid as-is.** VL buckets `[b, b+step)`
+  while LogQL's range vector is the right-closed `(t-range, t]`, so an entry
+  sitting exactly on a bucket edge landed in the window that OPENS there instead
+  of the one that ENDS there. On uniform data the two errors cancelled and only
+  the edges of a series showed it: `sum(count_over_time({…}[30m]))` at `step=900`
+  returned 36 on its last point where Loki returned 35. The fold now asks for the
+  same epsilon-shifted grid the single-operand path uses. Measured against Loki
+  3.7.1 over 28 combinations of `count_over_time`/`rate`, bare/`sum`/`sum by`, and
+  seven range/step pairs: 10 mismatching points before, 0 after.
+
 - **A range vector's window was the STEP, not the range.** Every pushdown asks
   VictoriaLogs for `stats_query_range` buckets whose width IS the request's step,
   so `count_over_time({namespace="flux-system"}[30m])` at `step=3600` was

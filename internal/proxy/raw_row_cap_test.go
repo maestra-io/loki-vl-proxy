@@ -11,12 +11,15 @@ import (
 	"time"
 )
 
-// TestCollectRangeMetricSamples_RowCapBoundary pins the overflow probe.
+// TestCollectRangeMetricSamples_RowCapBoundary pins the raw-row scan cap.
 //
-// The cap is enforced by asking VictoriaLogs for rowLimit+1 rows: a response of
-// exactly rowLimit rows can be a COMPLETE result that happens to land on the
-// cap, so only the extra row proves there was more to read. Comparing
-// `rowsScanned >= rowLimit` instead turns every exactly-full result into a 400.
+// The cap is PROXY-SIDE: no `limit` is sent, because VictoriaLogs executes one by
+// SORTING the whole match — the thing that OOM-killed VLSingle — while an
+// unlimited query streams in arbitrary order and is folded row by row. Rows are
+// counted as they arrive and the scan stops the moment the cap is passed, so a
+// result of exactly rowLimit rows is COMPLETE and only rowLimit+1 proves there
+// was more to read. Comparing `rowsScanned >= rowLimit` instead turns every
+// exactly-full result into a 400.
 func TestCollectRangeMetricSamples_RowCapBoundary(t *testing.T) {
 	const rowCap = 10
 
@@ -46,13 +49,10 @@ func TestCollectRangeMetricSamples_RowCapBoundary(t *testing.T) {
 					return
 				}
 				requestedLimit = r.Form.Get("limit")
-				limit, _ := strconv.Atoi(requestedLimit)
 
-				// Behave like VL: return at most `limit` rows.
+				// Behave like an UNLIMITED VictoriaLogs query: stream every matching
+				// row, in no particular order, and let the proxy stop reading.
 				n := tc.rowsAvailable
-				if limit > 0 && n > limit {
-					n = limit
-				}
 				w.Header().Set("Content-Type", "application/x-ndjson")
 				for i := 0; i < n; i++ {
 					_, _ = fmt.Fprintln(w, vlLineTS(base.Add(time.Duration(i)*time.Millisecond), "msg", `{app="api"}`))
@@ -72,10 +72,11 @@ func TestCollectRangeMetricSamples_RowCapBoundary(t *testing.T) {
 			rec := httptest.NewRecorder()
 			p.handleQueryRange(rec, req)
 
-			// The overflow probe must be visible on the wire: without the +1 the
-			// cap cannot distinguish "exactly full" from "truncated".
-			if requestedLimit != strconv.Itoa(rowCap+1) {
-				t.Errorf("requested limit = %q, want %q (cap+1 overflow probe)", requestedLimit, strconv.Itoa(rowCap+1))
+			// No `limit` may reach VictoriaLogs: it implements one as a sort over the
+			// whole match, which is what made the cap have to be small enough to
+			// refuse panels Loki answers.
+			if requestedLimit != "" {
+				t.Errorf("a limit reached the backend (%q) — that is the sort this path must avoid", requestedLimit)
 			}
 
 			gotErr := rec.Code == http.StatusBadRequest
