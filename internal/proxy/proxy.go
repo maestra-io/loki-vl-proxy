@@ -2074,6 +2074,33 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// every downstream path builds its request and its grid from Loki's bounds.
 	alignRangeRequestToStepGrid(r, logqlQuery)
 
+	// A LogQL range vector carries its OWN window, independent of the step. Every
+	// pushdown here asks VictoriaLogs for buckets whose width IS the step, so
+	// `count_over_time({…}[30m])` at step=1h was evaluated as `[1h]` — measured
+	// against Loki 3.7.1, 21823 vs 11982, with the error exactly zero only when
+	// range == step. Evaluate the whole request on a grid of gcd(range, step)
+	// instead, then fold each point from the ones inside its `(t-range, t]`
+	// window. Wrapping the ENTIRE handler is what makes this hold for every
+	// dispatch path below — the direct pushdown, the compat decomposition and the
+	// drilldown fast paths alike.
+	if plan, ok := planRangeWindowRollup(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step")); ok &&
+		!rangeWindowRollupActive(r.Context()) {
+		inner := requestWithFineStep(r, plan)
+		buf := &bufferedResponseWriter{}
+		p.handleQueryRange(buf, inner)
+		for k, v := range buf.Header() {
+			w.Header()[k] = v
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if buf.code != 0 && buf.code != http.StatusOK {
+			w.WriteHeader(buf.code)
+			_, _ = w.Write(buf.body)
+			return
+		}
+		_, _ = w.Write(rollupStatsQRWindow(buf.body, plan))
+		return
+	}
+
 	categorizedLabels := requestWantsCategorizedLabels(r)
 	emitStructuredMetadata := p.shouldEmitStructuredMetadata(r)
 	tupleMode := tupleModeForRequest(categorizedLabels, emitStructuredMetadata)

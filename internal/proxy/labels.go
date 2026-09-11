@@ -268,22 +268,29 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 		return
 	}
 
+	// A leaf alias must never shadow a field the backend already has under that
+	// exact name.
+	known := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		if field = strings.TrimSpace(field); field != "" {
+			known[field] = struct{}{}
+		}
+	}
+
 	buckets := make(map[string]map[string]struct{}, len(fields))
 	for _, field := range fields {
 		field = strings.TrimSpace(field)
 		if field == "" {
 			continue
 		}
-		alias := strings.TrimSpace(lt.ToLoki(field))
-		if alias == "" || alias == field {
-			continue
+		for _, alias := range lt.aliasCandidates(field, known) {
+			bucket := buckets[alias]
+			if bucket == nil {
+				bucket = make(map[string]struct{}, 1)
+				buckets[alias] = bucket
+			}
+			bucket[field] = struct{}{}
 		}
-		bucket := buckets[alias]
-		if bucket == nil {
-			bucket = make(map[string]struct{}, 1)
-			buckets[alias] = bucket
-		}
-		bucket[field] = struct{}{}
 	}
 	if len(buckets) == 0 {
 		return
@@ -319,6 +326,50 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 		}
 		lt.learnedLokiToVL[alias] = candidate
 	}
+}
+
+// k8sLabelContainers are the VL field prefixes that hold a Kubernetes label or
+// annotation map. Loki's own discovery names such a label by its SANITIZED KEY
+// alone — `strimzi.io/cluster` becomes the label `strimzi_io_cluster` — while VL
+// keeps the whole path. Sanitizing the full path (the default alias) therefore
+// never matches what a dashboard actually selects on.
+var k8sLabelContainers = []string{
+	"kubernetes.pod_labels.",
+	"kubernetes.namespace_labels.",
+	"kubernetes.pod_annotations.",
+	"kubernetes.namespace_annotations.",
+	"kubernetes.labels.",
+}
+
+// aliasCandidates lists the Loki label names a VL field may legitimately answer
+// to: the sanitized full path, and — for a Kubernetes label/annotation map — the
+// sanitized leaf key, which is the name Loki uses.
+func (lt *LabelTranslator) aliasCandidates(field string, known map[string]struct{}) []string {
+	var out []string
+	add := func(alias string) {
+		alias = strings.TrimSpace(alias)
+		if alias == "" || alias == field {
+			return
+		}
+		if _, collides := known[alias]; collides {
+			// The backend has a field of that exact name — it owns the label.
+			return
+		}
+		for _, existing := range out {
+			if existing == alias {
+				return
+			}
+		}
+		out = append(out, alias)
+	}
+	add(lt.ToLoki(field))
+	for _, prefix := range k8sLabelContainers {
+		if leaf, ok := strings.CutPrefix(field, prefix); ok && leaf != "" {
+			add(SanitizeLabelName(leaf))
+			break
+		}
+	}
+	return out
 }
 
 func appendUniqueString(values []string, value string) []string {

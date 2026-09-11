@@ -135,6 +135,7 @@ var (
 		"$__range_s",
 		"$__interval",
 		"$__range",
+		"$__auto_interval",
 		"$__auto",
 	}
 )
@@ -289,7 +290,7 @@ func resolveGrafanaTemplateTokenDuration(token, start, end, step string) (time.D
 	}
 
 	switch canonicalToken {
-	case "$__auto", "$__interval", "$__interval_ms":
+	case "$__auto", "$__auto_interval", "$__interval", "$__interval_ms":
 		return stepDur, true
 	case "$__rate_interval", "$__rate_interval_ms":
 		rateInterval := stepDur * 4
@@ -318,6 +319,8 @@ func canonicalGrafanaRangeToken(token string) (string, bool) {
 
 	switch normalized {
 	case "$__auto",
+		// Grafana's newer "auto" step variable, emitted by the Loki query builder.
+		"$__auto_interval",
 		"$__interval",
 		"$__interval_ms",
 		"$__rate_interval",

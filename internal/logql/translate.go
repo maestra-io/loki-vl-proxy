@@ -216,20 +216,32 @@ func translateMatcher(m LabelMatcher, opts TranslateOptions) (string, error) {
 // Loki |= is a substring match; VL's ~"text" is the closest equivalent.
 // Pattern filters (|> and !>) fall through to the string translator.
 func translateLineFilter(s *LineFilterStage) (string, error) {
-	quoted := logsql.QuotePattern(s.Value)
+	// An OR-list (`|= "a" or "b"`) becomes one parenthesised alternation so the
+	// single NOT of a negative filter covers every alternative.
+	values := s.Values()
+	alternation := ""
+	for i, v := range values {
+		if i > 0 {
+			alternation += " OR "
+		}
+		alternation += "~" + logsql.QuotePattern(v)
+	}
+	if len(values) > 1 {
+		alternation = "(" + alternation + ")"
+	}
 	switch s.Op {
 	case LineFilterContains:
 		// |= "text" → ~"text" (substring/regexp match in VL)
-		return "~" + quoted, nil
+		return alternation, nil
 	case LineFilterExcludes:
 		// != "text" → NOT ~"text"
-		return "NOT ~" + quoted, nil
+		return "NOT " + alternation, nil
 	case LineFilterMatchRe:
 		// |~ "re" → ~"re"
-		return "~" + quoted, nil
+		return alternation, nil
 	case LineFilterExcludeRe:
 		// !~ "re" → NOT ~"re"
-		return "NOT ~" + quoted, nil
+		return "NOT " + alternation, nil
 	case LineFilterContainsPat:
 		// |> "pattern" — no direct VL equivalent without capabilities context
 		return "", errFallthrough

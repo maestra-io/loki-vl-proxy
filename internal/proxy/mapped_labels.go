@@ -217,15 +217,6 @@ func fjFieldGetter(rawLabels map[string]string, val *fj.Value) func(string) stri
 	}
 }
 
-// levelSubstringOrder is the substring fallback used when no structured level
-// key is present in the message, matching the order the retired Vector
-// aggregator used: the first match wins.
-var levelSubstringOrder = []struct{ needle, level string }{
-	{"debug", "debug"},
-	{"warn", "warn"},
-	{"error", "error"},
-}
-
 // normalizeLevelValue maps a raw level value onto Loki's canonical set.
 // "information" → info, "warning" → warn, "err"/"fatal"/"critical" → error.
 // Unknown values are lowercased and returned unchanged.
@@ -248,15 +239,12 @@ func normalizeLevelValue(v string) string {
 	}
 }
 
-// levelFromSubstring implements the substring fallback over a raw log line.
+// levelFromSubstring derives a level from a raw log line the way Loki does at
+// ingest — a level KEYWORD delimited by the characters Loki accepts, first match
+// wins. A plain substring scan read `user terrorized the db` as an error and
+// `debugging` as debug; Loki reads both as unknown.
 func levelFromSubstring(msg string) string {
-	lower := strings.ToLower(msg)
-	for _, c := range levelSubstringOrder {
-		if strings.Contains(lower, c.needle) {
-			return c.level
-		}
-	}
-	return ""
+	return translator.LokiTextLevel(msg)
 }
 
 // applyDerivedLevel normalises level/detected_level for a result entry when

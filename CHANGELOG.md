@@ -37,6 +37,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A range vector's window was the STEP, not the range.** Every pushdown asks
+  VictoriaLogs for `stats_query_range` buckets whose width IS the request's step,
+  so `count_over_time({namespace="flux-system"}[30m])` at `step=3600` was
+  evaluated as `[1h]` — 21823 against Loki's 11982, and the translated LogsQL
+  carried no window at all. A range SHORTER than the step now evaluates the whole
+  request on a grid of `gcd(range, step)` and folds the points that land on the
+  requested grid; a range longer than the step already evaluated its full window
+  (verified point for point against Loki 3.7.1 at `[2m]`/60s, `[4m]`/120s and
+  `[30m]`/900s) and is left alone. Measured over 12 range/step pairs: every point
+  now matches Loki.
+- **Compound durations were a parse error.** The scanner read one value+unit pair
+  and stopped, so `[4h30m]`, `[1h30m]` and `[1m30s]` — what Grafana emits for
+  `$__range` on any non-round window — answered
+  `expected ], got DURATION ("30m")` while `[270m]` and `[4h]` worked.
+- **`or` inside a line filter was a parse error.** LogQL allows
+  `|= "a" or "b"` and `!= "a" or "b"`; the proxy stopped at the first value and
+  reported `unexpected token RAWSTRING`. The list now translates to one
+  parenthesised alternation, so a negative filter's single NOT covers all of it.
+- **A space between an aggregation and its paren broke metric detection.**
+  `sum (count_over_time (…))` — the form Grafana stores in saved panel JSON — was
+  no longer recognised as a metric query, fell through to the raw-log branch and
+  400ed on the LogsQL the proxy itself had built. Whitespace before a call's `(`
+  is now insignificant, and quoted spans are left alone.
+- **A Kubernetes pod/namespace label did not resolve through the mapping.** Loki
+  names such a label by its sanitized KEY alone (`strimzi.io/cluster` →
+  `strimzi_io_cluster`) while VictoriaLogs keeps the whole path, and the alias
+  learner only derived the sanitized full path — so `{strimzi_io_cluster="…"}`
+  went upstream as a field that does not exist: 0 rows where Loki returned
+  41 035. The leaf name is now learned as well, and never shadows a real field of
+  the same name.
+- **`detected_level` ignored the line text.** Loki derives it from the LINE when
+  no level field carries a recognised value; the proxy checked only the seven
+  named fields, so a panel filtering `detected_level="error"` returned 0 where
+  Loki returned 8. The keyword set and its delimiters are measured against Loki
+  3.7.1 — 391 lines pushed and read back, 0 mismatches — and the read-path
+  fallback, which used a plain substring scan (`user terrorized the db` read as
+  an error), now uses the same rule.
+- **`[$__auto_interval]` was a parse error** (`expected ], got IDENT
+  ("_interval")`) — the token was missing from the resolver's table.
+
 - **A Grafana template duration was rejected with 400.** `$__interval`,
   `$__range` and `${__interval}` were resolved AFTER LogQL validation, and the
   parser answers `[$__interval]` with `expected DURATION, got ERROR ("$")` — so

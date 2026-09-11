@@ -434,28 +434,45 @@ func (s *scanner) scanIdent() Token {
 	return Token{Typ: TokIdent, Val: val}
 }
 
-// scanNumberOrDuration scans an integer; if followed by time-unit letters it
-// returns TokDuration, otherwise TokNumber.
+// scanNumberOrDuration scans a number; if it carries time-unit letters it returns
+// TokDuration, otherwise TokNumber.
+//
+// A LogQL duration is a SEQUENCE of value+unit pairs — `4h30m`, `1m30s`, `1d12h` —
+// which is what Grafana emits for `$__range` on any non-round dashboard window.
+// Scanning a single pair stopped at `4h` and left `30m` to be read as the next
+// token, so `[4h30m]` failed with `expected ], got DURATION ("30m")`.
 func (s *scanner) scanNumberOrDuration() Token {
 	start := s.pos
+	sawUnit := false
 	for {
-		r, size := s.peek()
-		if size == 0 || (!unicode.IsDigit(r) && r != '.') {
+		digitStart := s.pos
+		for {
+			r, size := s.peek()
+			if size == 0 || (!unicode.IsDigit(r) && r != '.') {
+				break
+			}
+			s.pos += size
+		}
+		if s.pos == digitStart {
+			// No value for this segment — a trailing unit is not ours to consume.
 			break
 		}
-		s.pos += size
-	}
-	// Check for duration unit suffix
-	unitStart := s.pos
-	for {
-		r, size := s.peek()
-		if size == 0 || !unicode.IsLetter(r) {
+		unitStart := s.pos
+		for {
+			r, size := s.peek()
+			if size == 0 || !unicode.IsLetter(r) {
+				break
+			}
+			s.pos += size
+		}
+		if s.pos == unitStart {
+			// A bare number ends the token: `5` is TokNumber, `4h30` stops after 30.
 			break
 		}
-		s.pos += size
+		sawUnit = true
 	}
 	val := s.src[start:s.pos]
-	if s.pos > unitStart {
+	if sawUnit {
 		return Token{Typ: TokDuration, Val: val}
 	}
 	return Token{Typ: TokNumber, Val: val}

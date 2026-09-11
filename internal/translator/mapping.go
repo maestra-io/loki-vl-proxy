@@ -220,6 +220,21 @@ func (m *MappingOptions) derivedLevelFilter(value string, negate, isRe bool) str
 	if len(parts) == 0 {
 		return ""
 	}
+	if !negate && !isRe {
+		// Loki falls back to the LINE TEXT when no level field carries a value,
+		// so a panel filtering on detected_level="error" also returns the rows
+		// whose only evidence is the word in the message. Reproduce that here,
+		// guarded by "no named level field is present" so a real level always
+		// wins — which is Loki's precedence too.
+		if textPattern := LokiTextLevelPattern(value); textPattern != "" {
+			present := make([]string, 0, len(m.DerivedLevelFields))
+			for _, f := range m.DerivedLevelFields {
+				present = append(present, quoteVLField(f)+":*")
+			}
+			parts = append(parts, "(NOT ("+strings.Join(present, " OR ")+") AND "+
+				buildFieldFilterStr("_msg", logsql.FieldOpRegexp, textPattern, false)+")")
+		}
+	}
 	if len(parts) == 1 {
 		return parts[0]
 	}
