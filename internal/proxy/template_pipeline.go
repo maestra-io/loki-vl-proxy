@@ -182,8 +182,11 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 	}
 	// Bounded sort: the proxy-side row cap below stops READING at rowLimit, but
 	// an unbounded `| sort` has already made VictoriaLogs materialise the whole
-	// match before it emits the first row. Same ceiling, declared to the backend.
-	logsql += sortByTimePipe(forward, rowLimit)
+	// match before it emits the first row. Same ceiling, declared to the backend
+	// — plus ONE row, because the cap below is detected by scanning PAST it. Ask
+	// for exactly rowLimit and `rowsScanned > rowLimit` can never fire, so a
+	// truncated aggregate would be served as a complete one.
+	logsql += sortByTimePipe(forward, rowLimit+1)
 	params.Set("query", logsql)
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))

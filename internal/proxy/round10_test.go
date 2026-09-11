@@ -175,6 +175,72 @@ func TestLearnedAliasRoundTripsBothWays(t *testing.T) {
 	}
 }
 
+// A pipeline label filter names a label exactly as the selector does, and the
+// translator resolves it the same way — so it has to drive discovery too.
+func TestLabelFilterStageNames(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want []string
+	}{
+		{`strimzi_io_cluster="kf-x"`, []string{"strimzi_io_cluster"}},
+		{`detected_level =~ "err.*"`, []string{"detected_level"}},
+		{`status >= 500`, []string{"status"}},
+		{`a="1" and b!="2"`, []string{"a", "b"}},
+		{`a="1" or b=~"2"`, []string{"a", "b"}},
+		{`not_a_filter`, nil},
+	} {
+		got := labelFilterStageNames(tc.raw)
+		if len(got) != len(tc.want) {
+			t.Errorf("labelFilterStageNames(%q) = %v, want %v", tc.raw, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("labelFilterStageNames(%q) = %v, want %v", tc.raw, got, tc.want)
+				break
+			}
+		}
+	}
+	if names := queryLabelNames(`{app="x"} | strimzi_io_cluster="kf-x"`); !containsString(names, "strimzi_io_cluster") {
+		t.Errorf("queryLabelNames missed the pipeline filter label: %v", names)
+	}
+}
+
+// A label the inventory could not account for must NOT have its translation
+// cached: the discovery window is an hour wide, and pinning a query against a
+// field VictoriaLogs does not have is the defect this closes.
+func TestAliasDiscoveryRefusesToCacheAnUnresolvedLabel(t *testing.T) {
+	var fieldNamesCalls atomic.Int32
+	vl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if strings.Contains(r.URL.Path, "field_names") {
+			fieldNamesCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			// The inventory knows nothing about the label the query names.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"values": []map[string]any{{"value": "app", "hits": 1}},
+			})
+			return
+		}
+		_, _ = w.Write([]byte{})
+	}))
+	defer vl.Close()
+
+	c := cache.New(60*time.Second, 1000)
+	p, err := New(Config{BackendURL: vl.URL, Cache: c, LogLevel: "error", LabelStyle: LabelStyleUnderscores})
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+
+	if p.ensureQueryLabelAliases(context.Background(), `{strimzi_io_cluster="kf-x"}`) {
+		t.Error("an unresolved label must forfeit the translation-cache write")
+	}
+	if fieldNamesCalls.Load() == 0 {
+		t.Error("the inventory was never consulted")
+	}
+}
+
 // NeedsAliasDiscovery must not send the proxy to the backend for a label it can
 // already answer — that is what keeps the cost at one cached call per replica.
 func TestNeedsAliasDiscoveryScope(t *testing.T) {
