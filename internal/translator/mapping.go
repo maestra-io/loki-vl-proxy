@@ -326,8 +326,15 @@ func (m *MappingOptions) levelNormalizePipes() []string {
 				Replacement: r.canonical,
 			}.String())
 		}
-		// An entry Loki cannot place is `unknown`, not an empty label.
-		pipes = append(pipes, `| format if (level:"") "unknown" as level`)
+		// An entry Loki cannot place is `unknown` — and that covers a value it does
+		// not RECOGNISE as well as an empty one. A derived field holding `custom`
+		// survives the coalesce chain, matches none of the replacements above and
+		// is not empty, so without this the query emitted
+		// `detected_level="custom"`. The guard is a negated filter rather than a
+		// negative lookahead, which RE2 (and therefore VictoriaLogs) has not got.
+		pipes = append(pipes, "| format if ("+
+			buildFieldFilterStr("level", logsql.FieldOpRegexp, lokiDetectedLevelSetPattern(), true)+
+			`) "unknown" as level`)
 		return pipes
 	}
 	for _, canonical := range []string{"error", "warn", "info", "debug"} {
@@ -344,6 +351,17 @@ func (m *MappingOptions) levelNormalizePipes() []string {
 // the order the stages run. `trace` and `critical`/`fatal` come FIRST: a later
 // stage rewrites what an earlier one produced, and the repo's `debug` synonyms
 // would otherwise swallow `trace`.
+// lokiDetectedLevelSetPattern matches exactly the values Loki reports in
+// `detected_level`. Anything else — including the empty string — is `unknown`.
+func lokiDetectedLevelSetPattern() string {
+	names := make([]string, 0, len(lokiDetectedLevelReplacements)+1)
+	for _, r := range lokiDetectedLevelReplacements {
+		names = append(names, r.canonical)
+	}
+	names = append(names, "unknown")
+	return "(?i)^(" + strings.Join(names, "|") + ")$"
+}
+
 var lokiDetectedLevelReplacements = []struct{ canonical, alternation string }{
 	{"trace", "trace"},
 	{"critical", "critical|crit"},

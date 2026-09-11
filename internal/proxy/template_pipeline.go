@@ -232,17 +232,6 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 			}
 			break
 		}
-		// Every retained entry costs memory until the whole scan is folded, so it
-		// draws on the same budget every other in-flight scan draws from.
-		if !reservation.account() {
-			if truncationFatal {
-				p.log.Warn("template pipeline scan refused",
-					"reason", "shared retained-sample budget exhausted",
-					"budget_samples", defaultManualScanSampleBudget, "rows_scanned", rowsScanned)
-				return nil, &manualScanBudgetError{budget: defaultManualScanSampleBudget}
-			}
-			break
-		}
 		v, parseErr := fjp.ParseBytes(raw)
 		if parseErr != nil {
 			continue
@@ -262,6 +251,19 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 		entry := logqlpkg.Entry{TS: time.Unix(0, ts), Line: string(v.GetStringBytes("_msg")), Labels: merged}
 		if !plan.pipeline.Process(&entry) {
 			continue
+		}
+		// Only an entry that SURVIVES costs memory until the fold. Charging rows
+		// the parser, the timestamp check or the pipeline threw away spent the
+		// shared budget on nothing and refused scans that fit it.
+		if !reservation.account() {
+			if truncationFatal {
+				p.log.Warn("template pipeline scan refused",
+					"reason", "shared retained-sample budget exhausted",
+					"budget_samples", defaultManualScanSampleBudget,
+					"rows_scanned", rowsScanned, "entries_retained", len(out))
+				return nil, &manualScanBudgetError{budget: defaultManualScanSampleBudget}
+			}
+			break
 		}
 		te := templateEntry{ts: ts, line: entry.Line, labels: entry.Labels}
 		te.stream, te.sm, te.parsed = splitTemplateLabels(entry.Labels, streamLabels, smFields)
@@ -554,8 +556,12 @@ func templateMetricLabels(labels map[string]string, spec statsCompatSpec) map[st
 	for _, n := range names {
 		// A label the user NAMED in by() identifies the series even when its value
 		// is empty: Loki answers `{lf=""}`, and dropping the name made it `{}` —
-		// the same numbers under a different series in Grafana.
-		out[n] = labels[n]
+		// the same numbers under a different series in Grafana. A label that is
+		// ABSENT is a different thing again, and Loki omits that one, so the
+		// comma-ok is load-bearing.
+		if value, ok := labels[n]; ok {
+			out[n] = value
+		}
 	}
 	return out
 }

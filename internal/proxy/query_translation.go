@@ -2572,7 +2572,12 @@ func groupingUsesDetectedLevel(expr logqlpkg.Expr) bool {
 }
 
 func groupingHasDetectedLevel(g *logqlpkg.Grouping) bool {
-	if g == nil {
+	if g == nil || g.Without {
+		// `without (detected_level)` REMOVES the label; it does not ask for one.
+		// The post-processing behind it adds `stats by (_stream, level)` and then
+		// drops `detected_level` — it never merges two groups that ended up with
+		// different INFERRED levels, so inferring here would split a series the
+		// query asked to collapse.
 		return false
 	}
 	for _, label := range g.Labels {
@@ -2584,7 +2589,12 @@ func groupingHasDetectedLevel(g *logqlpkg.Grouping) bool {
 }
 
 func textGroupsByDetectedLevel(logql string) bool {
-	for _, m := range levelGroupingRE.FindAllStringSubmatch(stripQuotedSpans(logql), -1) {
+	stripped := stripQuotedSpans(logql)
+	for _, m := range levelGroupingRE.FindAllStringSubmatch(stripped, -1) {
+		// Same rule as the structural check: a `without` clause removes the label.
+		if strings.Contains(strings.ToLower(m[0]), "without") {
+			continue
+		}
 		for _, label := range strings.Split(m[1], ",") {
 			if isDetectedLevelLabel(label) {
 				return true

@@ -1,6 +1,7 @@
 package translator
 
 import (
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -46,8 +47,14 @@ func TestLevelNormalizePipes_DetectedLevelUsesLokisCanonicalSet(t *testing.T) {
 	pipes := m.levelNormalizePipes()
 	joined := strings.Join(pipes, " ")
 
-	if !strings.Contains(joined, `| format if (level:"") "unknown" as level`) {
-		t.Fatalf("no `unknown` fallback — Loki never leaves the label empty:\n%s", joined)
+	// The fallback covers a value Loki does not RECOGNISE as well as an empty one:
+	// a derived field holding `custom` matches none of the replacements and is not
+	// empty, so a guard on emptiness alone left `detected_level="custom"`.
+	if !strings.Contains(joined, `| format if (-level:~"`+lokiDetectedLevelSetPattern()+`") "unknown" as level`) {
+		t.Fatalf("no `unknown` fallback over the whole non-canonical set:\n%s", joined)
+	}
+	if strings.Contains(joined, `| format if (level:"") "unknown" as level`) {
+		t.Fatalf("the fallback still only covers the EMPTY value:\n%s", joined)
 	}
 	// `trace` must be rewritten to itself BEFORE any stage whose alternation
 	// contains it, or a later stage swallows it into `debug`.
@@ -75,6 +82,23 @@ func TestLevelNormalizePipes_DetectedLevelUsesLokisCanonicalSet(t *testing.T) {
 	for _, p := range pipes {
 		if strings.Contains(p, `"debug")`) && strings.Contains(p, "trace") {
 			t.Fatalf("the debug stage still swallows trace: %s", p)
+		}
+	}
+}
+
+// An unrecognised value must reach `unknown`, not survive as itself. Verified
+// against VictoriaLogs on the 391-line corpus with `level="custom"` injected:
+// the `custom` series disappears and the eight Loki buckets are unchanged.
+func TestLokiDetectedLevelSetPattern_CoversExactlyLokisSet(t *testing.T) {
+	re := regexp.MustCompile(lokiDetectedLevelSetPattern())
+	for _, v := range []string{"trace", "debug", "info", "warn", "error", "critical", "fatal", "unknown", "ERROR"} {
+		if !re.MatchString(v) {
+			t.Errorf("%q is one of Loki's detected_level values", v)
+		}
+	}
+	for _, v := range []string{"custom", "", "warning", "err", "notice", "information"} {
+		if re.MatchString(v) {
+			t.Errorf("%q is not a canonical detected_level — it must be rewritten before this guard", v)
 		}
 	}
 }

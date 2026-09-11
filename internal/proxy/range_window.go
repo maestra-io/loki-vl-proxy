@@ -442,13 +442,19 @@ func (p *Proxy) evaluatePerPointWindows(w http.ResponseWriter, r *http.Request, 
 	}
 	wg.Wait()
 
-	kept := make([]perPointBody, 0, len(results))
+	// EVERY window must have answered. Dropping the ones that failed or were
+	// cancelled and merging the rest serves a partial series as a complete one —
+	// the same silent under-report the patterns path had, and indistinguishable
+	// from a real gap in the data. Declining here sends the caller to the explicit
+	// 400 instead.
 	for _, res := range results {
-		if len(res.body) > 0 {
-			kept = append(kept, res)
+		if len(res.body) == 0 {
+			p.log.Warn("per-point window evaluation refused",
+				"reason", "a window did not answer", "windows", len(results))
+			return false
 		}
 	}
-	merged, ok := mergePerPointMatrices(kept)
+	merged, ok := mergePerPointMatrices(results)
 	if !ok {
 		return false
 	}
@@ -522,7 +528,10 @@ func mergePerPointMatrices(bodies []perPointBody) ([]byte, bool) {
 			if last == nil {
 				continue
 			}
-			key := string(metric)
+			// Key by the LABEL SET, not by the metric's JSON text: Go writes a map
+			// in whatever order it iterates, so two identical label sets can arrive
+			// as different strings and split one series into several.
+			key := canonicalMetricKey(metric)
 			s, seen := byKey[key]
 			if !seen {
 				s = &series{metric: metric}
@@ -562,6 +571,16 @@ func mergePerPointMatrices(bodies []perPointBody) ([]byte, bool) {
 // mistake for another unit.
 func formatRangeBound(ns int64) string {
 	return time.Unix(0, ns).UTC().Format(time.RFC3339Nano)
+}
+
+// canonicalMetricKey turns a metric object into an order-independent key.
+// Falls back to the raw text only when it does not decode as a label map.
+func canonicalMetricKey(metric json.RawMessage) string {
+	var labels map[string]string
+	if err := json.Unmarshal(metric, &labels); err != nil {
+		return string(metric)
+	}
+	return canonicalLabelsKey(labels)
 }
 
 // requestWithWindow clones r for ONE evaluation window: start/end bracket the

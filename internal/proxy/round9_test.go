@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -203,3 +205,162 @@ func TestTemplateMetricLabels_KeepsAnEmptyNamedLabel(t *testing.T) {
 }
 
 var _ = logqlpkg.Parse
+
+// CodeRabbit 3988862287: dropping the windows that failed and merging the rest
+// serves a partial series as a complete one — the same silent under-report the
+// patterns path had, and indistinguishable from a real gap in the data.
+func TestEvaluatePerPointWindows_RefusesWhenAWindowFails(t *testing.T) {
+	var mu sync.Mutex
+	var seen int
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		mu.Lock()
+		seen++
+		nth := seen
+		mu.Unlock()
+		if nth == 2 {
+			// One window the backend refuses.
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var points []string
+		for ts := int64(1700000000); ts <= 1700003000; ts += 661 {
+			points = append(points, fmt.Sprintf(`[%d,"7"]`, ts))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"success","data":{"resultType":"matrix","result":[`+
+			`{"metric":{"app":"a"},"values":[%s]}]}}`, strings.Join(points, ","))
+	}))
+	defer backend.Close()
+
+	p, err := New(Config{BackendURL: backend.URL, LogLevel: "error"})
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	plan := rangeWindowPlan{
+		startNs: 1700000000 * int64(time.Second),
+		endNs:   1700000000*int64(time.Second) + 4*int64(11*time.Minute),
+		stepNs:  int64(11 * time.Minute),
+		rangeNs: int64(7 * time.Minute),
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		"/loki/api/v1/query_range?query="+url.QueryEscape(`count_over_time({a="b"}[7m])`)+
+			"&start=1700000000&end=1700002640&step=660", nil)
+	if p.evaluatePerPointWindows(rec, req, plan) {
+		t.Fatalf("a batch with a failed window must be refused, got: %s", rec.Body.String())
+	}
+}
+
+// CodeRabbit 3988862291: Go writes a map in whatever order it iterates, so two
+// IDENTICAL label sets can arrive as different JSON text. Keying the merge on
+// that text split one series into several, each holding a slice of the points.
+func TestMergePerPointMatrices_KeysOnTheLabelSetNotItsText(t *testing.T) {
+	bodies := []perPointBody{
+		{ts: 1700000000 * int64(time.Second), body: []byte(
+			`{"data":{"resultType":"matrix","result":[{"metric":{"app":"a","pod":"p"},"values":[[1700000000,"1"]]}]}}`)},
+		{ts: 1700000060 * int64(time.Second), body: []byte(
+			`{"data":{"resultType":"matrix","result":[{"metric":{"pod":"p","app":"a"},"values":[[1700000060,"2"]]}]}}`)},
+	}
+	merged, ok := mergePerPointMatrices(bodies)
+	if !ok {
+		t.Fatal("merge failed")
+	}
+	var parsed struct {
+		Data struct {
+			Result []struct {
+				Values [][]json.RawMessage `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(merged, &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(parsed.Data.Result) != 1 {
+		t.Fatalf("the same label set became %d series: %s", len(parsed.Data.Result), merged)
+	}
+	if len(parsed.Data.Result[0].Values) != 2 {
+		t.Fatalf("the points were split across series: %s", merged)
+	}
+}
+
+// CodeRabbit 3988862277: `without (detected_level)` REMOVES the label, it does
+// not ask for one. Inferring a level there splits a series the query asked to
+// collapse — the post-processing drops `detected_level` but never merges two
+// groups that ended up with different inferred levels.
+func TestLogqlGroupsByDetectedLevel_IgnoresWithout(t *testing.T) {
+	for _, q := range []string{
+		`sum without (detected_level) (count_over_time({app="a"}[1h]))`,
+		`sum without (detected_level, pod) (count_over_time({app="a"}[1h]))`,
+	} {
+		if logqlGroupsByDetectedLevel(q) {
+			t.Errorf("%s: `without` removes the label, it does not license inference", q)
+		}
+	}
+	// The text fallback, for a query the parser rejects, must draw the same line.
+	if logqlGroupsByDetectedLevel(`sum without (detected_level) (rate({app="a"}[$unparseable]))`) {
+		t.Error("the text fallback read a `without` clause as a grouping")
+	}
+	// `by` still licenses it.
+	if !logqlGroupsByDetectedLevel(`sum by (detected_level) (count_over_time({app="a"}[1h]))`) {
+		t.Error("`by (detected_level)` must still infer")
+	}
+}
+
+// CodeRabbit 3988862308: an ABSENT label and a label PRESENT with an empty value
+// are different things to Loki — it omits the first and reports `{lf=""}` for
+// the second.
+func TestTemplateMetricLabels_AbsentIsNotPresentEmpty(t *testing.T) {
+	spec := statsCompatSpec{GroupBy: []string{"lf", "missing"}, OrigGroupBy: []string{"lf", "missing"}, ByExplicit: true}
+	out := templateMetricLabels(map[string]string{"lf": ""}, spec)
+	if v, ok := out["lf"]; !ok || v != "" {
+		t.Fatalf("a present-but-empty label must survive: %v", out)
+	}
+	if _, ok := out["missing"]; ok {
+		t.Fatalf("an absent label must not be invented: %v", out)
+	}
+}
+
+// CodeRabbit 3988862301: the reservation ran BEFORE parsing, the timestamp check
+// and the pipeline, so rows those threw away spent the shared memory budget on
+// nothing — and a scan that fits in memory was refused because of the rows that
+// never reached it.
+func TestFetchTemplatePipelineEntries_ChargesOnlyRetainedEntries(t *testing.T) {
+	// More discarded rows than one reservation chunk, so charging them exhausts a
+	// budget of exactly one chunk while the three retained entries fit easily.
+	const kept = 3
+	discarded := manualScanReservationChunk + 100
+
+	base := time.Unix(1700000040, 0).UTC()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		// Rows the parser throws away: they must not be charged.
+		for i := 0; i < discarded; i++ {
+			_, _ = fmt.Fprintln(w, "{not json")
+		}
+		for i := 0; i < kept; i++ {
+			_, _ = fmt.Fprintln(w, vlLineTS(base.Add(time.Duration(i)*time.Second), "hello", `{app="a"}`))
+		}
+	}))
+	defer backend.Close()
+
+	p := newGapTestProxy(t, backend.URL)
+	// A budget far smaller than the discarded rows, larger than the retained ones.
+	p.manualScanBudget = newManualScanBudget(manualScanReservationChunk)
+
+	pipeline, err := logqlpkg.NewPipeline(nil)
+	if err != nil {
+		t.Fatalf("pipeline: %v", err)
+	}
+	plan := &templatePlan{pipeline: pipeline, baseLogsQL: `app:="a"`, fallbackLogsQL: `app:="a"`}
+	entries, err := p.fetchTemplatePipelineEntries(context.Background(), plan,
+		base, base.Add(time.Minute), true, true)
+	if err != nil {
+		t.Fatalf("%d discarded rows exhausted a budget that fits the %d retained ones: %v",
+			discarded, kept, err)
+	}
+	if len(entries) != kept {
+		t.Fatalf("kept %d entries, want %d", len(entries), kept)
+	}
+}
