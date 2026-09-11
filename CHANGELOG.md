@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Grafana template duration was rejected with 400.** `$__interval`,
+  `$__range` and `${__interval}` were resolved AFTER LogQL validation, and the
+  parser answers `[$__interval]` with `expected DURATION, got ERROR ("$")` — so
+  a perfectly good dashboard panel never reached translation. The tokens are
+  now resolved first, on both `query_range` and `query`, which also puts them
+  ahead of the step-grid alignment and the cache key.
 - **Patterns served PARTIAL range coverage as a complete answer.** The
   `/loki/api/v1/patterns` miner splits the requested range into windows and
   queries VictoriaLogs per window; a window whose fetch errored was dropped

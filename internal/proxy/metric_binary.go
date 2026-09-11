@@ -4047,6 +4047,11 @@ func applyBinaryToSample(sample map[string]interface{}, rightIndex map[string]fl
 			} else {
 				delete(sample, "value")
 			}
+		} else {
+			// Same rule as the matrix branch above: LogQL drops a left sample whose
+			// timestamp the right-hand side does not carry. Leaving it in place
+			// emitted the raw left value as if the operation had been applied.
+			delete(sample, "value")
 		}
 	}
 }

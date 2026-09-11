@@ -26,7 +26,12 @@ type patternFetchDiagnostics struct {
 	// or a non-2xx status) — as opposed to a window that simply has no rows.
 	// A single unrecovered error means the mined set covers less than the
 	// requested range, which must never be served as a complete answer.
-	windowFailed      int
+	windowFailed int
+	// windowCompleted counts windows whose fetch actually RAN (with any outcome).
+	// A worker that returns while waiting on the semaphore — the request context
+	// was cancelled — never reaches fetchWindow, so without this the remaining
+	// windows look like the whole range.
+	windowCompleted   int
 	secondPassWindows int
 	minedPreMerge     int
 	minedPostMerge    int
@@ -340,6 +345,15 @@ func (p *Proxy) handlePatterns(w http.ResponseWriter, r *http.Request) {
 	p.metrics.RecordRequest("patterns", http.StatusOK, time.Since(start))
 }
 
+// patternWindowSetIncomplete reports whether the mined windows cover less than
+// the requested range. A window that ERRORED is an obvious hole; so is one that
+// never RAN — a worker returns while waiting on the semaphore when the request
+// context is cancelled, and then appears neither as accepted nor as failed, so
+// the surviving windows would otherwise look like the whole range.
+func patternWindowSetIncomplete(diag patternFetchDiagnostics, total int) bool {
+	return diag.windowFailed > 0 || diag.windowCompleted != total
+}
+
 //nolint:gocyclo // iterates windows with first/second-pass logic, per-window limits, error fan-in and diagnostic accumulation; branching is inherent to windowed mining.
 func (p *Proxy) fetchPatternsFromWindows(
 	r *http.Request,
@@ -452,6 +466,7 @@ func (p *Proxy) fetchPatternsFromWindows(
 			entries, stats, ok, failed := fetchWindow(window, effectiveLimit)
 
 			mu.Lock()
+			diag.windowCompleted++
 			diag.recordExtraction(effectiveLimit, stats, true)
 			if failed {
 				failedWindows = append(failedWindows, window)
@@ -508,10 +523,11 @@ func (p *Proxy) fetchPatternsFromWindows(
 		}
 	}
 	diag.minedPostMerge = len(collected)
-	if len(collected) == 0 || diag.windowAccepted == 0 || diag.windowFailed > 0 || (diag.windowCapped > 0 && len(collected) <= max(1, diag.windowAccepted/2)) {
+	incomplete := patternWindowSetIncomplete(diag, len(windows))
+	if len(collected) == 0 || diag.windowAccepted == 0 || incomplete || (diag.windowCapped > 0 && len(collected) <= max(1, diag.windowAccepted/2)) {
 		diag.markLowCoverage()
 	}
-	if len(collected) == 0 || diag.windowFailed > 0 {
+	if len(collected) == 0 || incomplete {
 		return nil, 0, diag
 	}
 	return collected, diag.windowAccepted, diag

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -84,5 +85,100 @@ func TestFetchPatternsFromWindows_RefusesPartialCoverageOnWindowError(t *testing
 	}
 	if body, _ := json.Marshal(entries); !strings.Contains(string(body), "pattern") {
 		t.Fatalf("expected mined pattern entries, got %s", body)
+	}
+}
+
+// CodeRabbit 3985252726: a worker that returns while waiting on the semaphore —
+// the request context was cancelled — never reaches fetchWindow, so it shows up
+// neither as accepted nor as failed. Without counting the windows that actually
+// RAN, the surviving ones look like the whole range and get served (and cached)
+// as a complete answer.
+func TestFetchPatternsFromWindows_RefusesWindowsSkippedOnCancelledContext(t *testing.T) {
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		<-release // hold the in-flight workers so the rest stay queued on the semaphore
+		startNs, _ := strconv.ParseInt(r.FormValue("start"), 10, 64)
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"_time":"%s","_msg":"stable pattern alpha component=collector"}`+"\n",
+			time.Unix(0, startNs).UTC().Format(time.RFC3339Nano))
+	}))
+	defer backend.Close()
+
+	enabled := true
+	p, err := New(Config{
+		BackendURL:      backend.URL,
+		Cache:           cache.New(60*time.Second, 100),
+		LogLevel:        "error",
+		PatternsEnabled: &enabled,
+	})
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+
+	base := time.Date(2026, 9, 10, 22, 0, 0, 0, time.UTC).UnixNano()
+	windows := make([]queryRangeWindow, 0, 16)
+	for i := 0; i < 16; i++ {
+		windows = append(windows, queryRangeWindow{
+			startNs: base + int64(i)*int64(5*time.Minute),
+			endNs:   base + int64(i+1)*int64(5*time.Minute) - 1,
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/patterns", nil).WithContext(ctx)
+
+	done := make(chan struct{})
+	var entries []patternResultEntry
+	var successes int
+	var diag patternFetchDiagnostics
+	go func() {
+		defer close(done)
+		entries, successes, diag = p.fetchPatternsFromWindows(req, "*", 2000, 200, 4, windows, "30", 100)
+	}()
+
+	// Cancel while the queued workers are blocked on the semaphore (the in-flight
+	// ones are parked in the handler), then let the in-flight ones answer.
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	close(release)
+	<-done
+
+	// The semaphore is 8 wide, so at most 8 windows were ever in flight while the
+	// context was live: the set can never be complete here.
+	if diag.windowCompleted >= len(windows) {
+		t.Fatalf("expected the cancellation to skip queued windows, completed=%d/%d", diag.windowCompleted, len(windows))
+	}
+	if successes != 0 || len(entries) != 0 {
+		t.Fatalf("windows skipped on a cancelled context must not pass as full coverage: completed=%d/%d successes=%d entries=%d",
+			diag.windowCompleted, len(windows), successes, len(entries))
+	}
+	if !diag.likelyLowCoverage() {
+		t.Fatalf("an incomplete window set must be reported as low coverage: %+v", diag)
+	}
+}
+
+// The rule CodeRabbit 3985252726 asks for, stated directly: coverage is complete
+// only when every window RAN. Counting accepted+failed is not enough — a worker
+// cancelled while queued on the semaphore is in neither bucket.
+func TestPatternWindowSetIncomplete(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		diag  patternFetchDiagnostics
+		total int
+		want  bool
+	}{
+		{"every window ran", patternFetchDiagnostics{windowCompleted: 4, windowAccepted: 4}, 4, false},
+		{"every window ran, some empty", patternFetchDiagnostics{windowCompleted: 4, windowAccepted: 1}, 4, false},
+		{"a window errored", patternFetchDiagnostics{windowCompleted: 4, windowFailed: 1}, 4, true},
+		{"a window never ran", patternFetchDiagnostics{windowCompleted: 3, windowAccepted: 3}, 4, true},
+		{"three of four, as CodeRabbit put it", patternFetchDiagnostics{windowCompleted: 3, windowAccepted: 3}, 4, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := patternWindowSetIncomplete(tc.diag, tc.total); got != tc.want {
+				t.Fatalf("patternWindowSetIncomplete(%+v, %d) = %v, want %v", tc.diag, tc.total, got, tc.want)
+			}
+		})
 	}
 }

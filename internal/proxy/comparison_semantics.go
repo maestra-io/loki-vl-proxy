@@ -135,7 +135,6 @@ func combineSetOperation(leftResults, rightResults []interface{}, rightIndex map
 		}
 		metric, _ := series["metric"].(map[string]interface{})
 		key := metricKey(metric)
-		leftKeys[key] = series
 		if op != "or" {
 			filterSamplesByRight(series, rightIndex[key], op == "and")
 		}
@@ -145,6 +144,17 @@ func combineSetOperation(leftResults, rightResults []interface{}, rightIndex map
 
 	if op != "or" {
 		return kept
+	}
+	// Index only the series that SURVIVED: a left series that came in empty is
+	// gone from `kept`, and merging the right's samples into it would drop them
+	// from the result instead of adding the right series on its own.
+	for _, raw := range kept {
+		series, _ := raw.(map[string]interface{})
+		if series == nil {
+			continue
+		}
+		metric, _ := series["metric"].(map[string]interface{})
+		leftKeys[metricKey(metric)] = series
 	}
 	// `or` fills what the left does not cover.
 	for _, raw := range rightResults {

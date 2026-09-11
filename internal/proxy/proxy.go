@@ -2032,6 +2032,12 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// emits while the unwrap field picker is open. These are syntactically invalid
 	// and would return 400, leaving the field picker empty.
 	logqlQuery = stripIncompleteUnwrapStubs(logqlQuery)
+	// Grafana's template tokens must be resolved BEFORE validation: the LogQL
+	// parser expects a DURATION inside `[...]` and answers `$__interval` with
+	// `expected DURATION, got ERROR ("$")`, so a perfectly good dashboard panel
+	// would be rejected with 400 before it ever reached translation. Resolving
+	// here also puts it ahead of the step-grid alignment and the cache key.
+	logqlQuery = resolveGrafanaRangeTemplateTokens(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
 	logqlQuery, ok := p.validateQuery(w, logqlQuery, "query_range")
 	if !ok {
 		return
@@ -2378,6 +2384,9 @@ func (p *Proxy) queryRangeCacheKey(r *http.Request, logqlQuery string) string {
 func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	logqlQuery := r.FormValue("query")
+	// See handleQueryRange: the parser rejects `$__interval` as a duration, so
+	// the tokens must be resolved before validation.
+	logqlQuery = resolveGrafanaRangeTemplateTokens(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
 	logqlQuery, ok := p.validateQuery(w, logqlQuery, "query")
 	if !ok {
 		return

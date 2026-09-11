@@ -2033,7 +2033,6 @@ var rangeByClauseRE = regexp.MustCompile(`^by\s*\(([^)]*)\)`)
 
 // Package-level compiled regexes — compiled once at program start, not per-request.
 var (
-	boolModifierRE   = regexp.MustCompile(`\s+bool\s+`)
 	withoutMarkerRE  = regexp.MustCompile(`\bwithout\s*\(([^)]+)\)`)
 	goTemplateRE     = regexp.MustCompile(`\{\{\s*\.([\w.]+)\s*\}\}`)
 	vectorMatchRE    = regexp.MustCompile(`\s+(on|ignoring|group_left|group_right)\s*\(([^)]*)\)`)
@@ -2142,14 +2141,25 @@ const BinaryMetricPrefix = "__binary__:"
 //
 // Returns a special string "__binary__:op:leftQuery|||rightQuery" that the proxy
 // parses and evaluates by running both queries independently.
-// stripBoolModifier removes LogQL's `bool` from a comparison and reports that it
-// was there. A BARE comparison filters (the sample keeps its own value,
+// splitLeadingBoolModifier removes LogQL's `bool` from the RIGHT-HAND side of a
+// comparison — where the modifier actually sits (`a > bool 5`) — and reports
+// that it was there. A BARE comparison filters (the sample keeps its own value,
 // non-matching samples go, an emptied series goes with them); `bool` scores 1/0.
-func stripBoolModifier(logql string) (string, bool) {
-	if !boolModifierRE.MatchString(logql) {
-		return logql, false
+//
+// It must never scan the whole query: `rate({msg="a bool b"}[5m]) > 0` carries
+// the word inside a matcher, and a nested comparison carries its own modifier —
+// both would otherwise mark the selected top-level operator as `bool`.
+func splitLeadingBoolModifier(right string) (string, bool) {
+	trimmed := strings.TrimSpace(right)
+	rest, ok := strings.CutPrefix(trimmed, "bool")
+	if !ok || rest == "" || !isLogQLSpace(rest[0]) {
+		return right, false
 	}
-	return boolModifierRE.ReplaceAllString(logql, " "), true
+	return strings.TrimSpace(rest), true
+}
+
+func isLogQLSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
 func tryTranslateBinaryMetricExpr(logql string, labelFn LabelTranslateFunc) (string, bool) {
@@ -2159,15 +2169,9 @@ func tryTranslateBinaryMetricExpr(logql string, labelFn LabelTranslateFunc) (str
 func tryTranslateBinaryMetricExprM(logql string, labelFn LabelTranslateFunc, mapping *MappingOptions) (string, bool) {
 	logql = strings.TrimSpace(logql)
 
-	// `bool` rides ALONG WITH the operator (see boolModifierRE below): the
-	// proxy needs it to tell a filtering comparison from a scoring one.
-	logql, hasBoolModifier := stripBoolModifier(logql)
-	tagOperator := func(op string) string {
-		if hasBoolModifier {
-			return op + " bool"
-		}
-		return op
-	}
+	// `bool` rides ALONG WITH the operator: the proxy needs it to tell a
+	// filtering comparison from a scoring one. It is read off the SELECTED
+	// operator's right-hand side below, never scanned for across the query.
 
 	// Extract vector matching modifiers before stripping them.
 	// on(labels), ignoring(labels) control join behavior.
@@ -2200,7 +2204,11 @@ func tryTranslateBinaryMetricExprM(logql string, labelFn LabelTranslateFunc, map
 				if i+len(op) <= len(logql) && logql[i:i+len(op)] == op {
 					left := strings.TrimSpace(logql[:i])
 					right := strings.TrimSpace(logql[i+len(op):])
-					operator := tagOperator(strings.TrimSpace(op))
+					operator := strings.TrimSpace(op)
+					if stripped, hasBool := splitLeadingBoolModifier(right); hasBool {
+						right = stripped
+						operator += " bool"
+					}
 
 					// Both sides must be valid metric queries
 					leftQL, leftOK := tryTranslateMetricQueryM(left, labelFn, mapping)
