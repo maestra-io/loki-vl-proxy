@@ -44,6 +44,7 @@ type HandlerConfig struct {
 	enableQueryAnalytics                  bool
 	adminAuthToken                        string
 	rangeMetricRowLimit                   int
+	manualScanBudget                      *manualScanBudget
 	tailAllowedOrigins                    map[string]struct{}
 	tailMode                              TailMode
 	metricsTrustProxyHeaders              bool

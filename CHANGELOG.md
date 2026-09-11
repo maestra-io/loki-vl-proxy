@@ -74,10 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   VictoriaLogs `limit`, which VL executes by SORTING the whole match — that sort
   is what OOM-killed both VLSingle instances. No `limit` is sent now: VL streams
   the matching rows in arbitrary order, the proxy folds each into a per-series
-  bucket map, and the cap is a proxy-side row count that stops the scan the
-  moment it is passed. Memory on both sides is bounded by the number of series,
-  not of rows, so the default rises to 1 000 000. Truncation past the cap is
-  still reported, never folded into a smaller-but-plausible number.
+  map, and the cap is a proxy-side row count that stops the scan the moment it is
+  passed, so the default rises to 1 000 000.
+
+  That row cap is NOT what bounds memory, though: the fold retains one sample per
+  accepted row until the scan finishes, and `-max-concurrent` counts requests,
+  not bytes. Two guards do bound it — a GLOBAL budget of retained samples
+  (≈32 MiB) that every in-flight scan draws from, and a distinct-series cap per
+  scan, since each new series also adds a label map and a translated copy of it.
+  All three refuse with a 400 naming the remedy and log the reason; a scan past
+  any of them is never folded into a smaller-but-plausible number.
 - **A binary expression answered with VictoriaLogs' field names.** `or`,
   `unless`, `and` and the arithmetic operators were the one path that skipped the
   label translator, so the same series came back as

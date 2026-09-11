@@ -1121,6 +1121,17 @@ func statusForRangeMetricCollectError(err error) int {
 	if errors.As(err, &truncated) {
 		return http.StatusBadRequest
 	}
+	// The memory guards are the same kind of answer: the CLIENT's query is too
+	// broad for this path, not a backend fault, so they must not read as 502
+	// either — an operator chasing a 502 looks at the backend, which is healthy.
+	var overBudget *manualScanBudgetError
+	if errors.As(err, &overBudget) {
+		return http.StatusBadRequest
+	}
+	var tooManySeries *manualScanSeriesError
+	if errors.As(err, &tooManySeries) {
+		return http.StatusBadRequest
+	}
 	return http.StatusBadGateway
 }
 
@@ -1129,7 +1140,10 @@ func statusForRangeMetricCollectError(err error) int {
 // the scan stops when it is exceeded, and no `limit` — and therefore no sort — is
 // asked of VictoriaLogs. 10,000 was the ceiling while the cap had to be a VL
 // `limit`, and it refused dashboard panels Loki answers; the number that was
-// dangerous as a sorted limit is safe as a streamed count.
+// dangerous as a sorted limit is safe as a streamed count — but it is NOT what
+// bounds memory. The fold retains a sample per row until the scan finishes, so
+// the real bound is the shared budget in manual_scan_budget.go, which every
+// concurrent scan draws from.
 const defaultManualRangeMetricRowLimit = 1_000_000
 
 // rawRowScanTruncatedError reports that the manual path hit its row cap, so any
@@ -1184,6 +1198,13 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 		return nil, p.redactedBackendStatusError("backend returned", resp.StatusCode, body)
 	}
 
+	// The fold RETAINS one sample per accepted row until the whole scan is done,
+	// so the row cap alone bounds nothing across concurrent requests. Draw the
+	// retained samples from a shared budget and refuse — loudly — when it is gone.
+	reservation := p.newManualScanReservation()
+	defer reservation.release()
+	seriesLimit := defaultManualScanSeriesLimit
+
 	// seriesCache caches per (_stream + "|" + level) within this request.
 	// Avoids repeated label-map allocation for the dominant case where thousands
 	// of log lines share the same stream identity (same series).
@@ -1209,6 +1230,7 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 		if rowsScanned > rowLimit {
 			// Stop reading immediately: the body is closed by the deferred call, so
 			// VictoriaLogs stops producing rather than streaming the whole match.
+			p.log.Warn("manual range-metric scan refused", "reason", "row cap", "limit", rowLimit)
 			return nil, &rawRowScanTruncatedError{limit: rowLimit}
 		}
 
@@ -1281,9 +1303,23 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 			}
 		}
 
-		current := seriesMap[seriesEntry.key]
-		if current.Metric == nil {
+		current, seen := seriesMap[seriesEntry.key]
+		if !seen {
+			if len(seriesMap) >= seriesLimit {
+				// Every new series adds a label map and a translated copy of it, which
+				// a high-cardinality group-by multiplies past anything the samples cost.
+				err := &manualScanSeriesError{limit: seriesLimit}
+				p.log.Warn("manual range-metric scan refused", "reason", "series limit", "limit", seriesLimit)
+				return nil, err
+			}
 			current.Metric = seriesEntry.translated
+		}
+		if !reservation.account() {
+			err := &manualScanBudgetError{budget: defaultManualScanSampleBudget}
+			p.log.Warn("manual range-metric scan refused",
+				"reason", "shared retained-sample budget exhausted",
+				"budget_samples", defaultManualScanSampleBudget, "rows_scanned", rowsScanned)
+			return nil, err
 		}
 		current.Samples = append(current.Samples, rangeMetricSample{ts: ts, value: sampleValue})
 		seriesMap[seriesEntry.key] = current

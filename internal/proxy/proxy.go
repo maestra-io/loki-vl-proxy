@@ -450,66 +450,70 @@ var CacheTTLs = map[string]time.Duration{
 }
 
 type Proxy struct {
-	backend                               *url.URL
-	rulerBackend                          *url.URL
-	alertsBackend                         *url.URL
-	client                                *http.Client
-	tailClient                            *http.Client
-	cache                                 *cache.Cache
-	compatCache                           *cache.Cache
-	log                                   *slog.Logger
-	metrics                               *metrics.Metrics
-	queryTracker                          *metrics.QueryTracker
-	coalescer                             *mw.Coalescer
-	limiter                               *mw.RateLimiter
-	breaker                               *mw.CircuitBreaker
-	configMu                              sync.RWMutex // protects tenantMap and labelTranslator
-	tenantMap                             map[string]TenantMapping
-	tenantLabel                           string
-	authEnabled                           bool
-	requireTenantHeader                   bool
-	allowGlobalTenant                     bool
-	forwardTenantHeader                   bool
-	maxLines                              int
-	forwardHeaders                        []string          // headers to copy from client request to VL
-	forwardCookies                        map[string]bool   // cookie names to copy from client request to VL
-	backendHeaders                        map[string]string // static headers on all VL requests
-	backendCompression                    string
-	backendLoopback                       bool // true when backend host resolves to a loopback address
-	clientResponseCompression             string
-	clientResponseCompressionMinBytes     int
-	backendMinVersion                     string
-	backendAllowUnsupportedVersion        bool
-	backendVersionCheckTimeout            time.Duration
-	backendVersionStrict                  bool
-	derivedFields                         []DerivedField
-	streamResponse                        bool
-	emitStructuredMetadata                bool
-	patternsEnabled                       bool
-	patternsAutodetectFromQueries         bool
-	patternsCustom                        []string
-	labelTranslator                       *LabelTranslator
-	metadataFieldMode                     MetadataFieldMode
-	streamFieldsMap                       map[string]bool  // known _stream_fields for VL stream selector optimization
-	declaredLabelFields                   []string         // configured VL-native label fields (stream_fields + extras + mapped)
-	baseDeclaredLabelFields               []string         // stream_fields + extras only — the reload rebuild base
-	computedLabels                        []ComputedLabel  // Loki labels joined from other labels (e.g. job)
-	labelPromotions                       []labelPromotion // mapped/computed labels lifted into result stream labels
-	derivedLevelFields                    []string         // VL fields carrying a raw level inside _msg
-	derivedLevelGroupBy                   bool             // materialise `level` server-side for group-by
-	lineFieldMsg                          bool             // return _msg as the Loki log line
-	peerCache                             *cache.PeerCache // L3 fleet peer cache
-	peerAuthToken                         string
-	peerInsecureIPAllowlist               bool // gate the legacy IP-allowlist fallback (default false: token required)
-	coldRouter                            *ColdRouter
-	registerInstrumentation               bool
-	enablePprof                           bool
-	enableQueryAnalytics                  bool
-	adminAuthToken                        string
-	metricsConcurrencyLimiter             chan struct{}
-	rangeMetricRowLimit                   int           // max rows fetched per collectRangeMetricSamples call (0=1_000_000)
-	maxStatsQuerySeries                   int           // max series returned by collectRangeMetricHits (0=5000)
-	statsQueryRangeSem                    chan struct{} // limits concurrent VL stats_query_range calls (nil=unlimited)
+	backend                           *url.URL
+	rulerBackend                      *url.URL
+	alertsBackend                     *url.URL
+	client                            *http.Client
+	tailClient                        *http.Client
+	cache                             *cache.Cache
+	compatCache                       *cache.Cache
+	log                               *slog.Logger
+	metrics                           *metrics.Metrics
+	queryTracker                      *metrics.QueryTracker
+	coalescer                         *mw.Coalescer
+	limiter                           *mw.RateLimiter
+	breaker                           *mw.CircuitBreaker
+	configMu                          sync.RWMutex // protects tenantMap and labelTranslator
+	tenantMap                         map[string]TenantMapping
+	tenantLabel                       string
+	authEnabled                       bool
+	requireTenantHeader               bool
+	allowGlobalTenant                 bool
+	forwardTenantHeader               bool
+	maxLines                          int
+	forwardHeaders                    []string          // headers to copy from client request to VL
+	forwardCookies                    map[string]bool   // cookie names to copy from client request to VL
+	backendHeaders                    map[string]string // static headers on all VL requests
+	backendCompression                string
+	backendLoopback                   bool // true when backend host resolves to a loopback address
+	clientResponseCompression         string
+	clientResponseCompressionMinBytes int
+	backendMinVersion                 string
+	backendAllowUnsupportedVersion    bool
+	backendVersionCheckTimeout        time.Duration
+	backendVersionStrict              bool
+	derivedFields                     []DerivedField
+	streamResponse                    bool
+	emitStructuredMetadata            bool
+	patternsEnabled                   bool
+	patternsAutodetectFromQueries     bool
+	patternsCustom                    []string
+	labelTranslator                   *LabelTranslator
+	metadataFieldMode                 MetadataFieldMode
+	streamFieldsMap                   map[string]bool  // known _stream_fields for VL stream selector optimization
+	declaredLabelFields               []string         // configured VL-native label fields (stream_fields + extras + mapped)
+	baseDeclaredLabelFields           []string         // stream_fields + extras only — the reload rebuild base
+	computedLabels                    []ComputedLabel  // Loki labels joined from other labels (e.g. job)
+	labelPromotions                   []labelPromotion // mapped/computed labels lifted into result stream labels
+	derivedLevelFields                []string         // VL fields carrying a raw level inside _msg
+	derivedLevelGroupBy               bool             // materialise `level` server-side for group-by
+	lineFieldMsg                      bool             // return _msg as the Loki log line
+	peerCache                         *cache.PeerCache // L3 fleet peer cache
+	peerAuthToken                     string
+	peerInsecureIPAllowlist           bool // gate the legacy IP-allowlist fallback (default false: token required)
+	coldRouter                        *ColdRouter
+	registerInstrumentation           bool
+	enablePprof                       bool
+	enableQueryAnalytics              bool
+	adminAuthToken                    string
+	metricsConcurrencyLimiter         chan struct{}
+	rangeMetricRowLimit               int           // max rows fetched per collectRangeMetricSamples call (0=1_000_000)
+	maxStatsQuerySeries               int           // max series returned by collectRangeMetricHits (0=5000)
+	statsQueryRangeSem                chan struct{} // limits concurrent VL stats_query_range calls (nil=unlimited)
+	// manualScanBudget bounds the RETAINED samples of the manual range-metric
+	// fold across all in-flight requests. A per-request row cap cannot: the
+	// requests are concurrent and MaxConcurrent counts requests, not bytes.
+	manualScanBudget                      *manualScanBudget
 	statsQueryRangeInterQueryDelay        time.Duration // min pause between consecutive individual VL stats calls
 	drilldownCoalescer                    *DrilldownBurstCoalescer
 	drilldownFieldBatcher                 *drilldownFieldBatcher
@@ -1098,6 +1102,7 @@ func New(cfg Config) (*Proxy, error) {
 		forwardTenantHeader:                   cfg.ForwardTenantHeader,
 		maxLines:                              maxLines,
 		rangeMetricRowLimit:                   cfg.RangeMetricRowLimit,
+		manualScanBudget:                      newManualScanBudget(defaultManualScanSampleBudget),
 		maxStatsQuerySeries:                   cfg.MaxStatsQuerySeries,
 		statsQueryRangeSem:                    makeStatsQueryRangeSem(cfg.StatsQueryRangeConcurrency),
 		statsQueryRangeInterQueryDelay:        time.Duration(cfg.StatsQueryRangeInterQueryDelayMs) * time.Millisecond,
@@ -1278,6 +1283,7 @@ func New(cfg Config) (*Proxy, error) {
 			enableQueryAnalytics:                  p.enableQueryAnalytics,
 			adminAuthToken:                        p.adminAuthToken,
 			rangeMetricRowLimit:                   p.rangeMetricRowLimit,
+			manualScanBudget:                      p.manualScanBudget,
 			tailAllowedOrigins:                    p.tailAllowedOrigins,
 			tailMode:                              p.tailMode,
 			metricsTrustProxyHeaders:              p.metricsTrustProxyHeaders,

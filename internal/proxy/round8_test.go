@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -315,5 +316,70 @@ func TestQueryRange_WhitespaceVariantsDoNotReachTheBackendAsText(t *testing.T) {
 	defer mu.Unlock()
 	if sawPhrase {
 		t.Fatal("the query text reached VictoriaLogs as a search phrase")
+	}
+}
+
+// The fold RETAINS a sample per accepted row until the scan finishes, so a row
+// cap bounds nothing across concurrent requests: MaxConcurrent counts requests,
+// not bytes, and these pods run with a 256Mi limit. A high-cardinality scan must
+// be refused rather than grow, and the refusal must be explicit.
+func TestManualScan_HighCardinalityIsRefusedNotGrown(t *testing.T) {
+	const rows = 40_000
+
+	base := time.Unix(1700000040, 0).UTC()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		for i := 0; i < rows; i++ {
+			// Every row its own stream: one distinct series each.
+			_, _ = fmt.Fprintln(w, vlLineTS(base.Add(time.Duration(i%120)*time.Second), "msg",
+				fmt.Sprintf(`{app="trow",pod="pod-%d"}`, i)))
+		}
+	}))
+	defer backend.Close()
+
+	p := newGapTestProxy(t, backend.URL)
+	_, err := p.collectRangeMetricSamples(context.Background(), `app:="trow"`, nil, nil, false, "__count__", "",
+		base, base.Add(2*time.Minute))
+	if err == nil {
+		t.Fatal("a scan producing tens of thousands of distinct series must be refused, not folded")
+	}
+	var tooMany *manualScanSeriesError
+	if !errors.As(err, &tooMany) {
+		t.Fatalf("expected the series guard, got %v", err)
+	}
+	if got := statusForRangeMetricCollectError(err); got != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 — this is the client's query being too broad, not a backend fault", got)
+	}
+	if !strings.Contains(err.Error(), "silently incomplete") {
+		t.Fatalf("the refusal must say the result would be incomplete: %v", err)
+	}
+}
+
+// The retained-sample budget is SHARED, so concurrent scans cannot each take the
+// whole of it — that is the part a per-request row cap cannot express.
+func TestManualScanBudget_IsSharedAcrossConcurrentScans(t *testing.T) {
+	budget := newManualScanBudget(2 * manualScanReservationChunk)
+	p := &Proxy{manualScanBudget: budget}
+
+	first, second := p.newManualScanReservation(), p.newManualScanReservation()
+	for i := 0; i < manualScanReservationChunk; i++ {
+		if !first.account() {
+			t.Fatalf("the first scan ran out after %d samples, with the budget untouched", i)
+		}
+	}
+	for i := 0; i < manualScanReservationChunk; i++ {
+		if !second.account() {
+			t.Fatalf("the second scan ran out after %d samples", i)
+		}
+	}
+	// Both chunks are held: the next sample of EITHER scan has nothing left.
+	if first.account() || second.account() {
+		t.Fatal("the budget handed out more than it has — it is not shared")
+	}
+	// Releasing one scan returns its slots to the other.
+	first.release()
+	if !second.account() {
+		t.Fatal("a finished scan must return its slots to the pool")
 	}
 }
