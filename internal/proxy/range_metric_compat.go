@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +34,9 @@ type statsCompatSpec struct {
 	// outerAggregationOverSeries. OuterAggBy carries its by() labels.
 	OuterAggAcrossSeries string
 	OuterAggBy           []string
+	// OuterAggWithout says OuterAggBy lists the labels to DROP (`without (…)`)
+	// rather than the ones to keep.
+	OuterAggWithout bool
 
 	// UserParserStages records whether the CLIENT's LogQL carried a parser stage
 	// (| json, | logfmt, | pattern, | regexp, | unpack). It is read from the
@@ -62,11 +66,38 @@ type rangeMetricSample struct {
 }
 
 var (
-	rangeMetricUnwrapRE = regexp.MustCompile(`(?s)\|\s*unwrap\s+([^|\[]+)`)
-	outerAggregationRE  = regexp.MustCompile(`^(?:sum|avg|max|min|count(?:_values)?|stddev|stdvar|sort(?:_desc)?|topk|bottomk)\s*(?:(?:by|without)\s*\([^)]*\)\s*)?`)
-	outerByAfterRE      = regexp.MustCompile(`\)\s+by\s*\(([^)]+)\)\s*$`)
-	outerByBeforeRE     = regexp.MustCompile(`^(?:sum|avg|min|max|count[^(]*|stddev|stdvar)\s+by\s*\(([^)]+)\)\s*\(`)
+	rangeMetricUnwrapRE  = regexp.MustCompile(`(?s)\|\s*unwrap\s+([^|\[]+)`)
+	outerAggregationRE   = regexp.MustCompile(`^(?:sum|avg|max|min|count(?:_values)?|stddev|stdvar|sort(?:_desc)?|topk|bottomk)\s*(?:(?:by|without)\s*\([^)]*\)\s*)?`)
+	outerByAfterRE       = regexp.MustCompile(`\)\s+by\s*\(([^)]+)\)\s*$`)
+	outerByBeforeRE      = regexp.MustCompile(`^(?:sum|avg|min|max|count[^(]*|stddev|stdvar)\s+by\s*\(([^)]+)\)\s*\(`)
+	outerWithoutAfterRE  = regexp.MustCompile(`\)\s+without\s*\(([^)]+)\)\s*$`)
+	outerWithoutBeforeRE = regexp.MustCompile(`^(?:sum|avg|min|max|count[^(]*|stddev|stdvar)\s+without\s*\(([^)]+)\)\s*\(`)
 )
+
+// parseOriginalWithoutLabels returns the labels of the outer `without (…)`
+// clause, nil when the aggregation has none.
+func parseOriginalWithoutLabels(logql string) []string {
+	var raw string
+	if m := outerWithoutAfterRE.FindStringSubmatch(logql); m != nil {
+		raw = m[1]
+	} else if m := outerWithoutBeforeRE.FindStringSubmatch(logql); m != nil {
+		raw = m[1]
+	}
+	return splitLabelList(raw)
+}
+
+func splitLabelList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, l := range strings.Split(raw, ",") {
+		if l = strings.TrimSpace(l); l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
 
 func parseStatsCompatSpec(logsqlQuery string) (statsCompatSpec, bool) {
 	idx := strings.Index(logsqlQuery, "| stats ")
@@ -337,16 +368,7 @@ func parseOriginalByLabels(logql string) []string {
 	} else if m := outerByBeforeRE.FindStringSubmatch(logql); m != nil {
 		raw = m[1]
 	}
-	if raw == "" {
-		return nil
-	}
-	var out []string
-	for _, l := range strings.Split(raw, ",") {
-		if l = strings.TrimSpace(l); l != "" {
-			out = append(out, l)
-		}
-	}
-	return out
+	return splitLabelList(raw)
 }
 
 // rejectMultiStageSlidingRange answers a two-stage range query that the native
@@ -790,13 +812,19 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 			// Fall through on error — coalescer failure is non-fatal.
 		}
 	}
-	if series, ok := p.collectStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); ok {
+	if series, ok, capErr := p.collectStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); ok {
+		if capErr != nil && !p.serveSeriesCapPartial(w, r, capErr) {
+			return true
+		}
 		result := buildHitsRangeMetricMatrix(manualFunc, series, startTS, endTS, step, origSpec.Window)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(result) // nosemgrep
 		return true
 	}
-	if series, ok := p.collectParserStageStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); ok {
+	if series, ok, capErr := p.collectParserStageStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); ok {
+		if capErr != nil && !p.serveSeriesCapPartial(w, r, capErr) {
+			return true
+		}
 		result := buildHitsRangeMetricMatrix(manualFunc, series, startTS, endTS, step, origSpec.Window)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(result) // nosemgrep
@@ -812,10 +840,13 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 
+	if capErr := p.seriesCapError(len(series), "manual_range_metric"); capErr != nil && !p.serveSeriesCapPartial(w, r, capErr) {
+		return true // buildManualRangeMetricMatrix trims a Drilldown partial to the busiest N
+	}
 	// collectRangeMetricSamples returns RAW log entries.
 	result := buildManualRangeMetricMatrix(manualFunc, quantile, series, startTS, endTS, step, origSpec.Window, p.resolvedMaxStatsQuerySeries(), false)
 	if spec.OuterAggAcrossSeries != "" {
-		result = reduceLokiSeriesAcrossSeries(result, spec.OuterAggAcrossSeries, spec.OuterAggBy)
+		result = reduceLokiSeriesAcrossSeries(result, spec.OuterAggAcrossSeries, spec.OuterAggBy, spec.OuterAggWithout)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(result) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter -- Content-Type set above; proxy returns pre-built JSON
@@ -849,7 +880,7 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 	// collectRangeMetricSamples returns RAW log entries.
 	result := buildManualRangeMetricVector(manualFunc, quantile, series, evalTS, origSpec.Window, false)
 	if spec.OuterAggAcrossSeries != "" {
-		result = reduceLokiSeriesAcrossSeries(result, spec.OuterAggAcrossSeries, spec.OuterAggBy)
+		result = reduceLokiSeriesAcrossSeries(result, spec.OuterAggAcrossSeries, spec.OuterAggBy, spec.OuterAggWithout)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(result) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter -- Content-Type set above; proxy returns pre-built JSON
@@ -859,23 +890,39 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 // collectStatsFastPathHits handles count_over_time / rate / bytes_* queries that have no
 // parser stages and an explicit groupBy — served from VL's stats_query_range endpoint.
 // Returns nil, false when the fast path is not applicable or VL returns an error.
-func (p *Proxy) collectStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool) {
+func (p *Proxy) collectStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool, error) {
 	if statsAggFunc == "" || spec.UserParserStages {
-		return nil, false
+		return nil, false, nil
 	}
 	for _, g := range spec.GroupBy {
 		if g == "_stream" {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	if len(spec.GroupBy) == 0 && !spec.ByExplicit {
-		return nil, false
+		return nil, false, nil
 	}
 	series, err := p.collectRangeMetricHits(ctx, spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, statsAggFunc, windowStart, end, step)
 	if err != nil {
-		return nil, false
+		if capErr := seriesCapOnly(err); capErr != nil {
+			return series, true, capErr // the busiest N, for a Drilldown partial
+		}
+		return nil, false, nil
 	}
-	return series, true
+	return series, true, nil
+}
+
+// seriesCapOnly keeps a series-cap refusal and drops every other error: the
+// stats fast paths are optimisations whose other failures fall back to the raw
+// scan, but a query over the cap must not be retried as a raw scan of every
+// row — that scan is the OOM shape the cap exists to prevent, and it would
+// end in the same refusal.
+func seriesCapOnly(err error) error {
+	var overCap *maxSeriesError
+	if errors.As(err, &overCap) {
+		return overCap
+	}
+	return nil
 }
 
 // collectParserStageStatsFastPathHits handles parser-stage GroupBy count queries
@@ -884,27 +931,33 @@ func (p *Proxy) collectStatsFastPathHits(ctx context.Context, spec statsCompatSp
 // Safe only when all remaining filters after stripping are field-existence checks.
 // Returns nil, false when inapplicable, on error, or when VL returns 0 series
 // (non-indexed JSON fields still need parser stages to evaluate correctly).
-func (p *Proxy) collectParserStageStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool) {
+func (p *Proxy) collectParserStageStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool, error) {
 	if statsAggFunc == "" || !spec.UserParserStages || len(spec.GroupBy) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	if !strings.Contains(spec.BaseQuery, "| delete __error__") {
-		return nil, false
+		return nil, false, nil
 	}
 	for _, g := range spec.GroupBy {
 		if g == "_stream" {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	strippedBase := strings.TrimSpace(drilldownParserPipeRE.ReplaceAllString(spec.BaseQuery, ""))
 	if strippedBase == spec.BaseQuery || !allFiltersAreExistenceChecks(strippedBase) {
-		return nil, false
+		return nil, false, nil
 	}
 	series, err := p.collectRangeMetricHits(ctx, strippedBase, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, statsAggFunc, windowStart, end, step)
-	if err != nil || len(series) == 0 {
-		return nil, false
+	if err != nil {
+		if capErr := seriesCapOnly(err); capErr != nil {
+			return series, true, capErr
+		}
+		return nil, false, nil
 	}
-	return series, true
+	if len(series) == 0 {
+		return nil, false, nil
+	}
+	return series, true, nil
 }
 
 func (p *Proxy) resolveManualMetricField(spec statsCompatSpec, origSpec originalRangeMetricSpec, manualFunc string) (string, float64, error) {
@@ -1045,7 +1098,7 @@ func (p *Proxy) collectRangeMetricHits(
 	// [[drilldown-high-card-fields-known-limit]] for the deep investigation.
 	// Keep the busiest maxSeries by total count (not the alphabetically-first
 	// maxSeries VL returns) so the chart shows signal, not the noise floor.
-	results = p.capStatsSeriesReported(results, "range_metric_hits")
+	results, capErr := p.capStatsSeriesReported(results, "range_metric_hits")
 	seriesMap := make(map[string]manualSeriesSamples, len(results))
 	for _, res := range results {
 		metricObj := res.GetObject("metric")
@@ -1099,7 +1152,7 @@ func (p *Proxy) collectRangeMetricHits(
 			seriesMap[seriesKey] = manualSeriesSamples{Metric: metric, Samples: samples}
 		}
 	}
-	return seriesMap, nil
+	return seriesMap, capErr
 }
 
 // metricSeriesCacheEntry holds the pre-computed labels and key for a metric series.
@@ -1130,6 +1183,10 @@ func statusForRangeMetricCollectError(err error) int {
 	}
 	var tooManySeries *manualScanSeriesError
 	if errors.As(err, &tooManySeries) {
+		return http.StatusBadRequest
+	}
+	var overCap *maxSeriesError
+	if errors.As(err, &overCap) {
 		return http.StatusBadRequest
 	}
 	return http.StatusBadGateway
@@ -1699,25 +1756,59 @@ func (p *Proxy) resolvedMaxStatsQuerySeries() int {
 	return 500
 }
 
-// capStatsSeriesReported applies the series cap and SAYS SO. The cap itself is
-// deliberate — an unbounded by() over a churning field returns tens of thousands
-// of single-point series Drilldown cannot render — but until now it was applied
-// silently, so a whole-cluster query answering 500 of its 5091 series was
-// indistinguishable from a cluster that has 500. The count and the cap are
-// logged at WARN with the surface that hit it, and `-max-stats-query-series`
-// raises it per deployment.
-func (p *Proxy) capStatsSeriesReported(results []*fj.Value, surface string) []*fj.Value {
+// maxSeriesError is Loki's own answer to a query producing more series than
+// `max_query_series` allows — the message is Loki's verbatim, and it travels
+// as a 400. A capped result was served as a complete one until round 11: a
+// whole-cluster `count_over_time` answering 500 of its 5091 series, HTTP 200,
+// empty `warnings`, nothing in the log — indistinguishable from a cluster that
+// has 500 series.
+type maxSeriesError struct{ limit, matched int }
+
+func (e *maxSeriesError) Error() string {
+	return fmt.Sprintf("maximum of series (%d) reached for a single query", e.limit)
+}
+
+// seriesCapError refuses a result of `matched` series when it exceeds the cap
+// (`-max-stats-query-series`, default 500 = Loki's stock max_query_series),
+// logging the surface that hit it. nil when the result fits.
+func (p *Proxy) seriesCapError(matched int, surface string) error {
 	maxSeries := p.resolvedMaxStatsQuerySeries()
-	capped := capStatsResultsByTotalCount(results, maxSeries)
-	if len(capped) < len(results) && p != nil && p.log != nil {
-		p.log.Warn("stats series truncated",
+	if matched <= maxSeries {
+		return nil
+	}
+	if p != nil && p.log != nil {
+		p.log.Warn("stats series cap exceeded",
 			"surface", surface,
-			"returned", len(capped),
-			"matched", len(results),
+			"matched", matched,
 			"limit", maxSeries,
 			"flag", "-max-stats-query-series")
 	}
-	return capped
+	return &maxSeriesError{limit: maxSeries, matched: matched}
+}
+
+// capStatsSeriesReported reports a stats result over the series cap. It
+// returns the busiest N series TOGETHER with the error: a Drilldown request is
+// served that partial result (with a Warning header), a dashboard panel gets
+// Loki's 400 — reading the trimmed result as the whole population is the
+// silent truncation of round 11.
+func (p *Proxy) capStatsSeriesReported(results []*fj.Value, surface string) ([]*fj.Value, error) {
+	if err := p.seriesCapError(len(results), surface); err != nil {
+		return capStatsResultsByTotalCount(results, p.resolvedMaxStatsQuerySeries()), err
+	}
+	return results, nil
+}
+
+// serveSeriesCapPartial decides what a series-cap error means for THIS request:
+// a Drilldown request keeps the busiest N (already trimmed by the caller) and
+// gets Loki's partial-results Warning; it returns true so the caller carries on.
+// Any other request is answered with the 400 and false.
+func (p *Proxy) serveSeriesCapPartial(w http.ResponseWriter, r *http.Request, capErr error) bool {
+	if isGrafanaDrilldownRequest(r) {
+		w.Header().Set("Warning", `199 - "`+capErr.Error()+`; returning partial results"`)
+		return true
+	}
+	p.writeError(w, http.StatusBadRequest, capErr.Error())
+	return false
 }
 
 // capStatsResultsByTotalCount keeps only the maxSeries VL stats results with the
@@ -2179,36 +2270,57 @@ func rateCounterWindow(values []float64, windowSeconds float64) float64 {
 // per-series p95s, and pooling returns the p95 of everything, which is lower
 // (measured on the T5 panel: 1488.7 pooled vs 1720 in Loki, −13.4%).
 func outerAggregationOverSeries(originalLogql, manualFunc string) (agg string, by []string, ok bool) {
-	switch manualFunc {
-	case "quantile", "min", "max", "avg", "stddev", "stdvar", "first", "last":
-	default:
-		// count/rate/bytes are ADDITIVE: pooling every row into one series is the
-		// same number the outer sum would produce, and it is the cheaper path.
-		return "", nil, false
-	}
-	trimmed := stripOuterLabelReplace(strings.TrimSpace(originalLogql))
-	loc := outerAggregationRE.FindStringIndex(trimmed)
-	if loc == nil || loc[0] != 0 || loc[1] >= len(trimmed) {
-		return "", nil, false
-	}
-	// outerAggregationRE matches a bare keyword, and every one of them is also
-	// the prefix of a RANGE aggregation: `min_over_time(...)` starts with `min`,
-	// `count_over_time(...)` with `count`. Only a `(` (after an optional
-	// by/without clause) makes it the outer operator.
-	if !strings.HasPrefix(strings.TrimSpace(trimmed[loc[1]:]), "(") {
-		return "", nil, false
-	}
-	name := strings.TrimSpace(trimmed[loc[0]:loc[1]])
-	if i := strings.IndexAny(name, "( \t"); i > 0 {
-		name = name[:i]
-	}
+	name := outerAggregationName(originalLogql)
 	switch name {
 	case "sum", "min", "max", "avg", "count":
 	default:
 		// topk/bottomk/sort/stddev keep their existing post-processing.
 		return "", nil, false
 	}
+	if name == "sum" && isAdditiveManualFunc(manualFunc) && len(parseOriginalWithoutLabels(originalLogql)) == 0 {
+		// count/rate/bytes are ADDITIVE: pooling every row into one series is the
+		// same number the outer sum would produce, and it is the cheaper path.
+		// Any OTHER outer aggregation over them (max(rate(...))) is a reduction
+		// across the per-series values and takes the decomposition below — as
+		// does `sum without (…)`, whose grouping is "everything but".
+		return "", nil, false
+	}
+	if without := parseOriginalWithoutLabels(originalLogql); len(without) > 0 {
+		return name, without, true
+	}
 	return name, parseOriginalByLabels(originalLogql), true
+}
+
+// isAdditiveManualFunc reports whether the range aggregation sums per-row
+// contributions, so pooling rows across series is exact.
+func isAdditiveManualFunc(manualFunc string) bool {
+	switch manualFunc {
+	case "rate", "count_over_time", "bytes_over_time", "bytes_rate", "count", "bytes":
+		return true
+	}
+	return false
+}
+
+// outerAggregationName returns the bare outer vector aggregation keyword of
+// the LogQL (`sum`, `max`, `topk`, …) or "" when there is none.
+func outerAggregationName(originalLogql string) string {
+	trimmed := stripOuterLabelReplace(strings.TrimSpace(originalLogql))
+	loc := outerAggregationRE.FindStringIndex(trimmed)
+	if loc == nil || loc[0] != 0 || loc[1] >= len(trimmed) {
+		return ""
+	}
+	// outerAggregationRE matches a bare keyword, and every one of them is also
+	// the prefix of a RANGE aggregation: `min_over_time(...)` starts with `min`,
+	// `count_over_time(...)` with `count`. Only a `(` (after an optional
+	// by/without clause) makes it the outer operator.
+	if !strings.HasPrefix(strings.TrimSpace(trimmed[loc[1]:]), "(") {
+		return ""
+	}
+	name := strings.TrimSpace(trimmed[loc[0]:loc[1]])
+	if i := strings.IndexAny(name, "( \t"); i > 0 {
+		name = name[:i]
+	}
+	return name
 }
 
 // applyLokiSeriesDecomposition makes the manual path evaluate the range
@@ -2221,13 +2333,20 @@ func applyLokiSeriesDecomposition(spec *statsCompatSpec, originalLogql, manualFu
 	agg, by, ok := outerAggregationOverSeries(originalLogql, manualFunc)
 	if !ok {
 		// A bare outer aggregation without by() collapses all streams into one
-		// empty-label series in Loki, and pooling gets there directly.
-		if len(spec.GroupBy) == 0 && !spec.ByExplicit && hasOuterAggregationWithoutBy(originalLogql) {
+		// empty-label series in Loki, and pooling gets there directly. The
+		// grouping on the translated LogsQL is then the translator's default
+		// inner grouping (`_stream, level`), not anything the user asked for —
+		// keeping it made `sum(rate({ns}[4h30m]))` answer seven per-pod series
+		// with full labels instead of `{}` (round 11).
+		if !spec.ByExplicit && hasOuterAggregationWithoutBy(originalLogql) &&
+			(len(spec.GroupBy) == 0 || (outerAggregationName(originalLogql) == "sum" && isAdditiveManualFunc(manualFunc))) {
+			spec.GroupBy, spec.OrigGroupBy = nil, nil
 			spec.ByExplicit = true
 		}
 		return
 	}
 	spec.OuterAggAcrossSeries, spec.OuterAggBy = agg, by
+	spec.OuterAggWithout = len(parseOriginalWithoutLabels(originalLogql)) > 0
 	// Only the POOLING is switched off. The grouping labels stay: the raw-row
 	// collector needs them to keep parser-derived dimensions in the series key
 	// (it only materialises the fields named in by(...)), and dropping them
@@ -2240,7 +2359,16 @@ func applyLokiSeriesDecomposition(spec *statsCompatSpec, originalLogql, manualFu
 // series per `by` group (one unlabelled series when by is empty).
 //
 // groupedMetricLabels keeps only the grouping labels of a series.
-func groupedMetricLabels(metric map[string]string, by []string) map[string]string {
+func groupedMetricLabels(metric map[string]string, by []string, without bool) map[string]string {
+	if without {
+		out := make(map[string]string, len(metric))
+		for k, v := range metric {
+			if v != "" && !slices.Contains(by, k) {
+				out[k] = v
+			}
+		}
+		return out
+	}
 	if len(by) == 0 {
 		return map[string]string{}
 	}
@@ -2253,7 +2381,7 @@ func groupedMetricLabels(metric map[string]string, by []string) map[string]strin
 	return out
 }
 
-func reduceLokiSeriesAcrossSeries(body []byte, agg string, by []string) []byte {
+func reduceLokiSeriesAcrossSeries(body []byte, agg string, by []string, without bool) []byte {
 	var resp map[string]interface{}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return body
@@ -2282,7 +2410,7 @@ func reduceLokiSeriesAcrossSeries(body []byte, agg string, by []string) []byte {
 	byTS := map[key]*acc{}
 	instant := false
 	add := func(ts int64, v float64, metric map[string]string) {
-		grouped := groupedMetricLabels(metric, by)
+		grouped := groupedMetricLabels(metric, by, without)
 		k := key{ts: ts, group: canonicalLabelsKey(grouped)}
 		a := byTS[k]
 		if a == nil {

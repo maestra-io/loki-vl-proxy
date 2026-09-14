@@ -591,10 +591,14 @@ func TestVLQuerySemantics(t *testing.T) {
 
 	chainNS := fmt.Sprintf("appchain-%d", runID)
 	parseNS := fmt.Sprintf("appparse-%d", runID)
+	r11NS := fmt.Sprintf("appr11-%d", runID)
+	msgNS := fmt.Sprintf("appmsg-%d", runID)
 
 	records := append(trowFixture(trowNS), levelFixture(mainNS, slowNS, tieNS)...)
 	records = append(records, chainFallbackFixture(chainNS)...)
 	records = append(records, parseFailureFixture(parseNS)...)
+	records = append(records, round11LevelFixture(r11NS)...)
+	records = append(records, msgAliasFixture(msgNS)...)
 	ingest(t, base, records, now)
 
 	// LVP_TEST_PROXY_LOG=1 makes the proxy log every translated LogsQL query and
@@ -629,6 +633,107 @@ func TestVLQuerySemantics(t *testing.T) {
 	t.Run("LabelMatcherAnchoring", func(t *testing.T) {
 		testLabelMatcherAnchoring(t, p, mainNS, tieNS, now)
 	})
+	t.Run("Round11DetectedLevelOperators", func(t *testing.T) {
+		testRound11DetectedLevelOperators(t, p, r11NS, now)
+	})
+	t.Run("Round11MsgFieldAlias", func(t *testing.T) {
+		testRound11MsgFieldAlias(t, p, msgNS, now)
+	})
+}
+
+// round11LevelFixture: one row per level shape Loki distinguishes — a named
+// level, no level but a keyword in the text (Loki derives it from the text),
+// and no level at all (Loki: unknown).
+func round11LevelFixture(ns string) []vlRecord {
+	rows := []struct {
+		msg map[string]interface{}
+	}{
+		{map[string]interface{}{"level": "error", "msg": "boom"}},
+		{map[string]interface{}{"level": "info", "msg": "hello"}},
+		{map[string]interface{}{"msg": "no level field but info word"}},
+		{map[string]interface{}{"level": "warn", "msg": "w"}},
+		{map[string]interface{}{"msg": "quiet line"}},
+	}
+	out := make([]vlRecord, 0, len(rows))
+	for i, r := range rows {
+		out = append(out, vlRecord{
+			tsOffset:  -time.Duration(i+1) * time.Minute,
+			namespace: ns, pod: "r11-0", container: "app", app: "r11",
+			msg: r.msg,
+		})
+	}
+	return out
+}
+
+// Defect 3 of round 11, measured against the real backend: the negated and
+// the regexp level matchers evaluate against the level Loki DERIVES.
+func testRound11DetectedLevelOperators(t *testing.T, p *proxyProc, ns string, now time.Time) {
+	sel := fmt.Sprintf(`{namespace=%q}`, ns)
+	total := func(got map[string]string) int {
+		n := 0
+		for _, v := range got {
+			f, _ := strconv.ParseFloat(v, 64)
+			n += int(f)
+		}
+		return n
+	}
+
+	// != "info" drops the named info row AND the text-derived one; keeps
+	// error, warn and the unknown row.
+	got := scalarByLabels(t, queryInstant(t, p, `sum by (detected_level) (count_over_time(`+sel+` | json | detected_level != "info" [1h]))`, now))
+	for k := range got {
+		if strings.Contains(k, `"info"`) {
+			t.Fatalf("detected_level != \"info\" returned an info series: %v", got)
+		}
+	}
+	if total(got) != 3 {
+		t.Fatalf("detected_level != \"info\": want 3 rows (error, warn, unknown), got %v", got)
+	}
+
+	// =~ matches the canonical levels, not the raw field values.
+	got = scalarByLabels(t, queryInstant(t, p, `sum by (detected_level) (count_over_time(`+sel+` | json | detected_level =~ "err.*|warn" [1h]))`, now))
+	if total(got) != 2 || len(got) != 2 {
+		t.Fatalf("detected_level =~ \"err.*|warn\": want error=1 and warn=1, got %v", got)
+	}
+	got = scalarByLabels(t, queryInstant(t, p, `sum(count_over_time(`+sel+` | json | detected_level !~ "err.*|warn" [1h]))`, now))
+	if total(got) != 3 {
+		t.Fatalf("detected_level !~ \"err.*|warn\": want 3, got %v", got)
+	}
+}
+
+// msgAliasFixture mirrors what vlagent's msgField does: the JSON `message`
+// key is lifted into _msg and is not a field any more; Loki, which keeps the
+// whole wrapper line, still parses it with `| json`.
+func msgAliasFixture(ns string) []vlRecord {
+	mk := func(i int, raw string, msg map[string]interface{}) vlRecord {
+		return vlRecord{tsOffset: -time.Duration(i+1) * time.Minute, namespace: ns, pod: "mm2-0", container: "app", app: "mm2", rawMsg: raw, msg: msg}
+	}
+	return []vlRecord{
+		mk(0, "2026 ERROR broker lost", map[string]interface{}{"x": 1}),
+		mk(1, "", map[string]interface{}{"message": "kept ERROR as a field", "x": 2}),
+		mk(2, "2026 INFO all good", map[string]interface{}{"x": 3}),
+	}
+}
+
+// Defect 8 of round 11: `| json | message=~"..."` reads _msg when the
+// collector lifted `message` out of the line.
+func testRound11MsgFieldAlias(t *testing.T, p *proxyProc, ns string, now time.Time) {
+	sel := fmt.Sprintf(`{namespace=%q}`, ns)
+	got := scalarByLabels(t, queryInstant(t, p, `sum(count_over_time(`+sel+` | json | message=~".* ERROR .*" [1h]))`, now))
+	if len(got) != 1 {
+		t.Fatalf("want one series, got %v", got)
+	}
+	for _, v := range got {
+		if v != "2" {
+			t.Fatalf("message=~ over a lifted field: want 2 (the _msg row and the field row), got %v", got)
+		}
+	}
+	got = scalarByLabels(t, queryInstant(t, p, `sum(count_over_time(`+sel+` | json | message!~".* ERROR .*" [1h]))`, now))
+	for _, v := range got {
+		if v != "1" {
+			t.Fatalf("message!~: want 1, got %v", got)
+		}
+	}
 }
 
 // testPipelineCounts asserts that a parser pipeline does not change the count

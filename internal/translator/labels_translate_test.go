@@ -165,14 +165,18 @@ func TestTranslateLogQLWithLabels(t *testing.T) {
 			want:  `app:="api" | unpack_json | filter source_message_bytes:="89"`,
 		},
 		{
-			name:  "repeated include on same field with different values keeps latest value",
+			// Round 11: two filters on one field with DIFFERENT values are both
+			// applied, as in Loki (`| Scopes=~"sql09" | Scopes=~"resumable"` on a
+			// production panel answered the second filter alone). Only the
+			// include/exclude of the SAME value collapses to the latest.
+			name:  "repeated include on same field with different values keeps both",
 			logql: `{app="api"} | json | traceID="a1" | traceID="b2"`,
-			want:  `app:="api" | unpack_json | filter traceID:="b2"`,
+			want:  `app:="api" | unpack_json | filter traceID:="a1" | filter traceID:="b2"`,
 		},
 		{
-			name:  "repeated exclude on same field with different values keeps latest value",
+			name:  "repeated exclude on same field with different values keeps both",
 			logql: `{app="api"} | json | traceID!="a1" | traceID!="b2"`,
-			want:  `app:="api" | unpack_json | filter -traceID:="b2"`,
+			want:  `app:="api" | unpack_json | filter -traceID:="a1" | filter -traceID:="b2"`,
 		},
 		{
 			name:  "range filters on same field are preserved",

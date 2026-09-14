@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`-msg-field-aliases`** (default `message,Message,msg,log`) names the JSON
+  keys the collector lifts into `_msg` (vlagent `msgField`). After `| json`
+  such a key is absent in VictoriaLogs while Loki, which stores the whole
+  wrapper line, still parses it — so a label filter on one of these names now
+  reads the field when present and `_msg` when not:
+  `(message:~"re" OR (-message:* AND _msg:~"re"))`, negated as `NOT (…)`.
+  Round 11: `| json | message=~".* ERROR .*"` answered 0 against Loki's 125.
 - **`-log-translated-queries`** writes the translated LogsQL (`logsql.query`)
   verbatim for both failed and successful upstream calls, so a backend 4xx can
   be pasted straight into VictoriaLogs instead of being reproduced by hand. It
@@ -37,6 +44,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Round 11 (the round-10 comparison on `1.63.1-maestra.14`).**
+  - The template log path bounded VictoriaLogs' sort to the raw-row ceiling —
+    `sort by (_time desc) limit 1000001` for a 5000-line panel. VictoriaLogs
+    either refused it (400 "requires more than 1310MB") or sorted a million
+    rows and OOM-killed vlsingle, which took the proxy down with it. The sort
+    now carries the request's own `limit`; a proxy-side stage that DROPS
+    entries re-reads with a ×8 bound only while the page came back full, and
+    the metric fold reads unsorted (it reads every row and is order-insensitive).
+  - The series cap (`-max-stats-query-series`, default 500) was applied
+    silently on every metric path: a whole-cluster `count_over_time` answered
+    500 of its 5091 series, HTTP 200, empty `warnings`. It is now Loki's 400
+    `maximum of series (500) reached for a single query`; a Drilldown request
+    keeps the busiest N plus a `Warning` header, as Loki does.
+  - `detected_level != "x"` was one `-field:~re` per candidate field, ANDed —
+    a row with no level field passed all of them and was then labelled from
+    its line text. `detected_level =~ "re"` was anchored twice and matched raw
+    values. Both now derive from ONE positive form: the regexp is evaluated
+    against the canonical levels Loki derives, `unknown` is "no recognised
+    field and no keyword in the text", and the negated operators are `NOT (…)`.
+  - Coprime range/step (`[7m]`@97s) answered half the points with the NEXT
+    window's count: `shiftStatsQRToLokiGrid` subtracted the request offset a
+    second time (VictoriaLogs already labels a bucket with its offset-shifted
+    start), which only shows when `start mod step` exceeds half a step — the
+    per-point fallback's inner requests. 115/224 wrong on omicron, exactly the
+    points with `t mod 420 > 210`; 0 on the aligned outer requests.
+  - `sum(rate({…}[4h30m]))` answered seven per-pod series with full labels:
+    the translator's default inner grouping (`_stream, level`) was taken for a
+    user `by()` and pooling was skipped. A bare outer `sum` over an additive
+    range function now pools into `{}`; `max/min/avg/count` over one reduce
+    across the per-series values instead of being dropped.
+  - `sum by (lf) (… | label_format lf=`{{ .level }}`)` was routed through the
+    proxy-side raw-row read for a stage VictoriaLogs evaluates natively: a
+    label_format whose template is one field reference (and names no label the
+    same stage writes) is `| format "<field>" as lf` and stays pushed down.
+  - A bare `max_over_time(… | line_format "{{ or .message __line__ }}" | regexp … | unwrap x [10m])`
+    took the bare-parser stats route, which hands the Go template to
+    VictoriaLogs as literal text — 200 with no series. A pipeline the proxy
+    must evaluate itself goes to the template route, which also keys the
+    series by every parsed label (Loki's identity for a bare range aggregation)
+    and drops the unwrapped one.
 - **A regexp embedded in LogsQL was quoted one backslash too shallow, and
   VictoriaLogs rejected the whole query.** `quoteLogsQLPattern` passed
   backslashes through verbatim on the theory that a regexp carries its own
@@ -126,6 +173,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries no meaning in LogQL; `sum  (  rate  ( … )  )` is the same query.
 - **A `label_format`-derived grouping lost the name of an empty label** — `{}`
   where Loki answers `{lf=""}`, the same numbers under a different series.
+  - Review round on the same PR: the series cap keeps Loki's Drilldown
+    partial-results behaviour on EVERY path (the busiest N plus a `Warning`
+    header), the bare-parser stats path never retries a capped result as a
+    raw scan, `without (…)` on the outer aggregation drops those labels
+    instead of collapsing to `{}`, the level predicates use Loki's
+    `detected_level` table (`fatal`, `critical`, `trace` are distinct), and a
+    level value or regexp Loki never reports matches nothing (`NOT *`) with
+    its negation matching everything.
+  - Two label filters on ONE field with different values collapsed to the
+    second one on the pushdown path (`| Scopes=~"sql09" | Scopes=~"resumable"`
+    answered the second filter alone, 276 725 vs Loki's AND); only the
+    include/exclude of the same value still collapses to the latest.
+  - `line_format "{{.message}}"` after `| json` was empty on the template
+    path: the collector lifted `message` into `_msg`. The lifted names the row
+    lacks (`-msg-field-aliases`) are exposed with the line, which is what
+    Loki's `| json` of the wrapper gives.
 
 - **A plain line filter was translated as a REGEXP, unescaped.** `|=` and `!=`
   are SUBSTRING matches in LogQL, but their value went to LogsQL's `~` verbatim,

@@ -1390,16 +1390,16 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			// Same anchoring as the stream selector: `| label =~ "re"` is a
 			// label matcher, so Loki requires a full-value match. ip("cidr") is
 			// not a regexp and keeps its own translation below.
-			if entry.entry.isRe {
-				if v := strings.Trim(value, "\"`"); !strings.HasPrefix(v, `ip("`) {
-					value = logsql.AnchorLabelMatcherRegex(v)
-				}
+			rawValue := strings.Trim(value, "\"`")
+			if entry.entry.isRe && !strings.HasPrefix(rawValue, `ip("`) {
+				value = logsql.AnchorLabelMatcherRegex(rawValue)
 			}
-			if mapping.isDerivedLevelLabel(label) {
-				if v := strings.Trim(value, "\"`"); v != "" {
-					if ff := mapping.derivedLevelFilter(v, entry.entry.negate, entry.entry.isRe); ff != "" {
-						return ff, true
-					}
+			if mapping.isDerivedLevelLabel(label) && rawValue != "" {
+				// The derived-level filter anchors the regexp itself (it matches it
+				// against the canonical levels); handing it the anchored form
+				// doubled the anchors in the emitted LogsQL.
+				if ff := mapping.derivedLevelFilter(rawValue, entry.entry.negate, entry.entry.isRe); ff != "" {
+					return ff, true
 				}
 			}
 			if chain := mapping.expand(label); len(chain) > 0 {
@@ -1442,6 +1442,9 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			if entry.entry.isComp {
 				// Comparison filters (>, >=, <, <=) do not quote the value.
 				return buildFieldFilterStr(label, entry.entry.vlOp, value, entry.entry.negate), true
+			}
+			if value != "" && mapping.isMsgFieldAlias(label) {
+				return msgAliasFieldFilter(label, entry.entry.vlOp, value, entry.entry.negate), true
 			}
 
 			if value == "" {
@@ -1628,14 +1631,11 @@ func translateMalformedDottedStage(stage string, labelFn LabelTranslateFunc) (st
 
 func canonicalLabelFilterStage(stage string, labelFn LabelTranslateFunc) (canonical string, baseKey string, ok bool) {
 	if translated, ok := translateSingleLabelFilter(stage, labelFn, logsql.Capabilities{}); ok {
-		if fieldKey, op, ok := translatedFilterFieldOp(translated); ok {
-			// Drilldown include/exclude interactions emit equality/regex filters.
-			// Keep only the latest filter per field so repeated clicks on the same
-			// field do not accumulate into impossible AND chains.
-			if op == ":=" || op == ":~" {
-				return translated, fieldKey, true
-			}
-		}
+		// The identity is the whole filter minus its sign: an include followed by
+		// an exclude of the SAME value collapses to the latest (Drilldown's
+		// click semantics), while two filters on the same field with DIFFERENT
+		// values stay an AND — `| Scopes=~"sql09" | Scopes=~"resumable"` is both,
+		// as in Loki, not the second one (round 11).
 		return translated, strings.TrimPrefix(translated, "-"), true
 	}
 	if translated, ok := translateMalformedDottedStage(stage, labelFn); ok {
@@ -1741,7 +1741,8 @@ func splitLabelFormatAssignments(s string) []string {
 // convertGoTemplate converts Go template syntax {{.label}} to LogsQL <label> syntax.
 // Handles dotted field names like {{.service.name}} → <service.name>.
 func convertGoTemplate(tmpl string) string {
-	tmpl = strings.Trim(tmpl, "\"")
+	// The parser re-serialises a backtick template with its backticks.
+	tmpl = strings.Trim(tmpl, "\"`")
 	result := goTemplateRE.ReplaceAllString(tmpl, "<$1>")
 	return `"` + result + `"`
 }

@@ -2,6 +2,7 @@ package translator
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/logsql"
@@ -41,6 +42,13 @@ type MappingOptions struct {
 	Expand LabelExpandFunc
 	// Computed lists labels synthesised by joining other labels.
 	Computed []ComputedLabel
+	// MsgFieldAliases lists the JSON keys the collector (vlagent `msgField`)
+	// lifts out of the line into `_msg`. After `| json` such a key is ABSENT in
+	// VictoriaLogs while Loki, which stores the whole wrapper, still sees it —
+	// so a filter on one of these names reads `_msg` when the field is missing
+	// (round 11: `| json | message=~".* ERROR .*"` answered 0 against Loki's 125).
+	MsgFieldAliases []string
+
 	// DerivedLevelFields lists the VL fields that may carry a raw log level once
 	// _msg has been unpacked. Empty disables level derivation.
 	DerivedLevelFields []string
@@ -216,52 +224,137 @@ func regexpQuoteLiteral(s string) string {
 	return b.String()
 }
 
+// lokiCanonicalLevels is the value set a derived level label can hold — the
+// canonical names of lokiDetectedLevelReplacements plus `unknown`. A regexp
+// matcher on `detected_level` is evaluated against THESE — the way Loki matches
+// it against the level it derived — never against the raw field values, which
+// is what made `detected_level =~ "err.*|warn"` an always-empty filter (round 11).
+var lokiCanonicalLevels = func() []string {
+	out := make([]string, 0, len(lokiDetectedLevelReplacements)+1)
+	for _, r := range lokiDetectedLevelReplacements {
+		out = append(out, r.canonical)
+	}
+	return append(out, "unknown")
+}()
+
+// lokiDetectedLevelPattern is the anchored, case-insensitive regexp of the raw
+// values Loki maps onto the canonical detected_level — the same table the
+// `by (detected_level)` materialisation uses, so `fatal`, `critical` and
+// `trace` stay distinct here too. "" for a name that is not a canonical level.
+func lokiDetectedLevelPattern(canonical string) string {
+	for _, r := range lokiDetectedLevelReplacements {
+		if r.canonical == canonical {
+			return "(?i)^(" + r.alternation + ")$"
+		}
+	}
+	return ""
+}
+
+// logsqlNeverMatch is the filter no row satisfies; its negation is every row.
+const logsqlNeverMatch = "NOT *"
+
 // derivedLevelFilter builds the LogsQL filter for a level matcher over the
 // configured raw level fields. The caller is responsible for injecting the
 // unpack pipes that make those fields available.
+//
+// Every operator is expressed through ONE positive form: `=` is the positive
+// form of the value, `=~` the disjunction of the positive forms of the canonical
+// levels the regexp matches, and the negated operators are `NOT (...)` of the
+// same expression. The earlier shape for `!=` — one `-field:~re` per candidate
+// field, ANDed — let a row carrying NO level field through and then labelled
+// it by the line text, so `detected_level != "info"` returned the rows Loki
+// excludes (round 11). A value or regexp matching no canonical level matches
+// no row (Loki never reports it), and its negation matches every row.
 func (m *MappingOptions) derivedLevelFilter(value string, negate, isRe bool) string {
 	if !m.derivesLevel() {
 		return ""
 	}
-	pattern := value
+	positive := ""
 	if isRe {
-		// User-supplied label regexp: anchor it like Loki does.
-		pattern = logsql.AnchorLabelMatcherRegex(value)
+		re, err := regexp.Compile(logsql.AnchorLabelMatcherRegex(value))
+		if err != nil {
+			return ""
+		}
+		parts := make([]string, 0, len(lokiCanonicalLevels))
+		for _, lvl := range lokiCanonicalLevels {
+			if re.MatchString(lvl) {
+				parts = append(parts, m.derivedLevelPositive(lvl))
+			}
+		}
+		switch len(parts) {
+		case 0:
+			positive = logsqlNeverMatch
+		case 1:
+			positive = parts[0]
+		default:
+			positive = "(" + strings.Join(parts, " OR ") + ")"
+		}
 	} else {
-		// levelValuePattern is generated already anchored.
-		pattern = levelValuePattern(value)
+		positive = m.derivedLevelPositive(value)
 	}
-	parts := make([]string, 0, len(m.DerivedLevelFields))
-	for _, f := range m.DerivedLevelFields {
-		parts = append(parts, buildFieldFilterStr(quoteVLField(f), logsql.FieldOpRegexp, pattern, negate))
-	}
-	if len(parts) == 0 {
+	if positive == "" {
 		return ""
 	}
-	if !negate && !isRe {
-		// Loki falls back to the LINE TEXT when no level field carries a value,
-		// so a panel filtering on detected_level="error" also returns the rows
-		// whose only evidence is the word in the message. Reproduce that here,
-		// guarded by "no named level field is present" so a real level always
-		// wins — which is Loki's precedence too.
-		if textPattern := LokiTextLevelPattern(value); textPattern != "" {
-			// Guard on a RECOGNISED named value, not on any value at all: Loki falls
-			// back to the line text when the level key holds something it does not
-			// know (`"LogLevel":"Information"`), so an unrecognised value must not
-			// suppress the heuristic.
-			present := make([]string, 0, len(m.DerivedLevelFields))
-			for _, f := range m.DerivedLevelFields {
-				present = append(present, buildFieldFilterStr(quoteVLField(f), logsql.FieldOpRegexp, anyLevelValuePattern(), false))
-			}
-			parts = append(parts, "(NOT ("+strings.Join(present, " OR ")+") AND "+
-				buildFieldFilterStr("_msg", logsql.FieldOpRegexp, textPattern, false)+")")
-		}
-	}
-	if len(parts) == 1 {
-		return parts[0]
-	}
 	if negate {
-		return "(" + strings.Join(parts, " ") + ")"
+		if positive == logsqlNeverMatch {
+			return "*"
+		}
+		return "NOT " + parenthesized(positive)
+	}
+	return positive
+}
+
+func parenthesized(expr string) string {
+	if strings.HasPrefix(expr, "(") && strings.HasSuffix(expr, ")") {
+		return expr
+	}
+	return "(" + expr + ")"
+}
+
+// derivedLevelPresent is the "some field carries a RECOGNISED level value"
+// guard the line-text heuristic hangs off.
+func (m *MappingOptions) derivedLevelPresent() string {
+	present := make([]string, 0, len(m.DerivedLevelFields))
+	for _, f := range m.DerivedLevelFields {
+		present = append(present, buildFieldFilterStr(quoteVLField(f), logsql.FieldOpRegexp, anyLevelValuePattern(), false))
+	}
+	return "(" + strings.Join(present, " OR ") + ")"
+}
+
+// derivedLevelPositive is the filter for `detected_level = "<value>"`: any raw
+// level field holding a value Loki maps onto it, or — when no field holds a
+// recognised level at all — the line text naming it, which is Loki's fallback
+// and its precedence too.
+func (m *MappingOptions) derivedLevelPositive(value string) string {
+	canonical := strings.ToLower(strings.TrimSpace(value))
+	if canonical == "unknown" {
+		// Loki derives `unknown` when no field carries a recognised level AND the
+		// line text names none.
+		return "(NOT " + m.derivedLevelPresent() + " AND " +
+			buildFieldFilterStr("_msg", logsql.FieldOpRegexp, lokiTextLevelRE.String(), true) + ")"
+	}
+	pattern := lokiDetectedLevelPattern(canonical)
+	if pattern == "" {
+		// Loki never reports this value, so nothing matches it.
+		return logsqlNeverMatch
+	}
+	parts := make([]string, 0, len(m.DerivedLevelFields)+1)
+	for _, f := range m.DerivedLevelFields {
+		parts = append(parts, buildFieldFilterStr(quoteVLField(f), logsql.FieldOpRegexp, pattern, false))
+	}
+	if textPattern := LokiTextLevelPattern(canonical); textPattern != "" {
+		// Guard on a RECOGNISED named value, not on any value at all: Loki falls
+		// back to the line text when the level key holds something it does not
+		// know (`"LogLevel":"Information"`), so an unrecognised value must not
+		// suppress the heuristic.
+		parts = append(parts, "(NOT "+m.derivedLevelPresent()+" AND "+
+			buildFieldFilterStr("_msg", logsql.FieldOpRegexp, textPattern, false)+")")
+	}
+	switch len(parts) {
+	case 0:
+		return ""
+	case 1:
+		return parts[0]
 	}
 	return "(" + strings.Join(parts, " OR ") + ")"
 }
@@ -576,4 +669,30 @@ func hasExactStage(parts []string, stage string) bool {
 		}
 	}
 	return false
+}
+
+// isMsgFieldAlias reports whether label is one of the keys the collector moves
+// into _msg.
+func (m *MappingOptions) isMsgFieldAlias(label string) bool {
+	if m == nil {
+		return false
+	}
+	for _, a := range m.MsgFieldAliases {
+		if a == label {
+			return true
+		}
+	}
+	return false
+}
+
+// msgAliasFieldFilter builds the filter for a label the collector may have
+// moved into _msg: the field when it is present, `_msg` when it is not. The
+// negated operators are the negation of that expression.
+func msgAliasFieldFilter(field string, op logsql.FieldOp, value string, negate bool) string {
+	positive := "(" + buildFieldFilterStr(field, op, value, false) +
+		" OR (-" + field + ":* AND " + buildFieldFilterStr("_msg", op, value, false) + "))"
+	if negate {
+		return "NOT " + positive
+	}
+	return positive
 }

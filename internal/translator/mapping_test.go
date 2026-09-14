@@ -256,9 +256,11 @@ func TestDerivedLevelSelectors(t *testing.T) {
 		wantParts   []string
 	}{
 		{
-			name:      "level matcher unpacks json then logfmt and filters both raw fields",
-			logql:     `{namespace="ns", level="error"}`,
-			wantParts: []string{`namespace:="ns"`, "| unpack_json", "| unpack_logfmt", `| filter (level:~"(?i)^(err|error|errors|fatal|critical|crit|emerg|panic|alert)$" OR loglevel:~"(?i)^(err|`},
+			name:  "level matcher unpacks json then logfmt and filters both raw fields",
+			logql: `{namespace="ns", level="error"}`,
+			// Round 11: the predicate uses Loki's detected_level table, where
+			// fatal and critical are their own levels.
+			wantParts: []string{`namespace:="ns"`, "| unpack_json", "| unpack_logfmt", `| filter (level:~"(?i)^(err|error|errors|emerg|panic|alert)$" OR loglevel:~"(?i)^(err|`},
 		},
 		{
 			name:      "information maps onto info",
@@ -271,9 +273,13 @@ func TestDerivedLevelSelectors(t *testing.T) {
 			wantParts: []string{`loglevel:~"(?i)^(warn|warning|warnings)$"`},
 		},
 		{
-			name:      "negated level is a conjunction",
+			// Round 11: the negation is `NOT (<positive form>)` so a row with no
+			// level field is excluded when its line text names the level (Loki
+			// labels it from the text) and kept otherwise — the per-field
+			// `-level:~` conjunction let every such row through.
+			name:      "negated level is the negation of the positive form",
 			logql:     `{namespace="ns", level!="error"}`,
-			wantParts: []string{`| filter (-level:~"(?i)^(err|`, ` -loglevel:~"(?i)^(err|`},
+			wantParts: []string{`| filter NOT (level:~"(?i)^(err|`, ` OR loglevel:~"(?i)^(err|`, `AND _msg:~"`},
 		},
 		{
 			name:      "pipeline level filter gets its own unpack chain",
