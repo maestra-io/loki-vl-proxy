@@ -1631,14 +1631,11 @@ func translateMalformedDottedStage(stage string, labelFn LabelTranslateFunc) (st
 
 func canonicalLabelFilterStage(stage string, labelFn LabelTranslateFunc) (canonical string, baseKey string, ok bool) {
 	if translated, ok := translateSingleLabelFilter(stage, labelFn, logsql.Capabilities{}); ok {
-		if fieldKey, op, ok := translatedFilterFieldOp(translated); ok {
-			// Drilldown include/exclude interactions emit equality/regex filters.
-			// Keep only the latest filter per field so repeated clicks on the same
-			// field do not accumulate into impossible AND chains.
-			if op == ":=" || op == ":~" {
-				return translated, fieldKey, true
-			}
-		}
+		// The identity is the whole filter minus its sign: an include followed by
+		// an exclude of the SAME value collapses to the latest (Drilldown's
+		// click semantics), while two filters on the same field with DIFFERENT
+		// values stay an AND — `| Scopes=~"sql09" | Scopes=~"resumable"` is both,
+		// as in Loki, not the second one (round 11).
 		return translated, strings.TrimPrefix(translated, "-"), true
 	}
 	if translated, ok := translateMalformedDottedStage(stage, labelFn); ok {

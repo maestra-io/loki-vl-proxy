@@ -224,12 +224,34 @@ func regexpQuoteLiteral(s string) string {
 	return b.String()
 }
 
-// lokiCanonicalLevels is the value set a derived level label can hold. A
-// regexp matcher on `detected_level` is evaluated against THESE — the way Loki
-// matches it against the level it derived — never against the raw field
-// values, which is what made `detected_level =~ "err.*|warn"` an always-empty
-// filter (round 11).
-var lokiCanonicalLevels = []string{"error", "critical", "warn", "info", "debug", "trace", "unknown"}
+// lokiCanonicalLevels is the value set a derived level label can hold — the
+// canonical names of lokiDetectedLevelReplacements plus `unknown`. A regexp
+// matcher on `detected_level` is evaluated against THESE — the way Loki matches
+// it against the level it derived — never against the raw field values, which
+// is what made `detected_level =~ "err.*|warn"` an always-empty filter (round 11).
+var lokiCanonicalLevels = func() []string {
+	out := make([]string, 0, len(lokiDetectedLevelReplacements)+1)
+	for _, r := range lokiDetectedLevelReplacements {
+		out = append(out, r.canonical)
+	}
+	return append(out, "unknown")
+}()
+
+// lokiDetectedLevelPattern is the anchored, case-insensitive regexp of the raw
+// values Loki maps onto the canonical detected_level — the same table the
+// `by (detected_level)` materialisation uses, so `fatal`, `critical` and
+// `trace` stay distinct here too. "" for a name that is not a canonical level.
+func lokiDetectedLevelPattern(canonical string) string {
+	for _, r := range lokiDetectedLevelReplacements {
+		if r.canonical == canonical {
+			return "(?i)^(" + r.alternation + ")$"
+		}
+	}
+	return ""
+}
+
+// logsqlNeverMatch is the filter no row satisfies; its negation is every row.
+const logsqlNeverMatch = "NOT *"
 
 // derivedLevelFilter builds the LogsQL filter for a level matcher over the
 // configured raw level fields. The caller is responsible for injecting the
@@ -241,7 +263,8 @@ var lokiCanonicalLevels = []string{"error", "critical", "warn", "info", "debug",
 // same expression. The earlier shape for `!=` — one `-field:~re` per candidate
 // field, ANDed — let a row carrying NO level field through and then labelled
 // it by the line text, so `detected_level != "info"` returned the rows Loki
-// excludes (round 11).
+// excludes (round 11). A value or regexp matching no canonical level matches
+// no row (Loki never reports it), and its negation matches every row.
 func (m *MappingOptions) derivedLevelFilter(value string, negate, isRe bool) string {
 	if !m.derivesLevel() {
 		return ""
@@ -260,8 +283,7 @@ func (m *MappingOptions) derivedLevelFilter(value string, negate, isRe bool) str
 		}
 		switch len(parts) {
 		case 0:
-			// No canonical level matches: keep the raw-field form, anchored once.
-			positive = m.derivedLevelRawRegexp(logsql.AnchorLabelMatcherRegex(value))
+			positive = logsqlNeverMatch
 		case 1:
 			positive = parts[0]
 		default:
@@ -274,6 +296,9 @@ func (m *MappingOptions) derivedLevelFilter(value string, negate, isRe bool) str
 		return ""
 	}
 	if negate {
+		if positive == logsqlNeverMatch {
+			return "*"
+		}
 		return "NOT " + parenthesized(positive)
 	}
 	return positive
@@ -284,22 +309,6 @@ func parenthesized(expr string) string {
 		return expr
 	}
 	return "(" + expr + ")"
-}
-
-// derivedLevelRawRegexp matches the anchored pattern against every raw level
-// field — the pre-round-11 shape, kept for a regexp no canonical level matches.
-func (m *MappingOptions) derivedLevelRawRegexp(pattern string) string {
-	parts := make([]string, 0, len(m.DerivedLevelFields))
-	for _, f := range m.DerivedLevelFields {
-		parts = append(parts, buildFieldFilterStr(quoteVLField(f), logsql.FieldOpRegexp, pattern, false))
-	}
-	switch len(parts) {
-	case 0:
-		return ""
-	case 1:
-		return parts[0]
-	}
-	return "(" + strings.Join(parts, " OR ") + ")"
 }
 
 // derivedLevelPresent is the "some field carries a RECOGNISED level value"
@@ -313,7 +322,7 @@ func (m *MappingOptions) derivedLevelPresent() string {
 }
 
 // derivedLevelPositive is the filter for `detected_level = "<value>"`: any raw
-// level field holding a synonym of the value, or — when no field holds a
+// level field holding a value Loki maps onto it, or — when no field holds a
 // recognised level at all — the line text naming it, which is Loki's fallback
 // and its precedence too.
 func (m *MappingOptions) derivedLevelPositive(value string) string {
@@ -324,12 +333,16 @@ func (m *MappingOptions) derivedLevelPositive(value string) string {
 		return "(NOT " + m.derivedLevelPresent() + " AND " +
 			buildFieldFilterStr("_msg", logsql.FieldOpRegexp, lokiTextLevelRE.String(), true) + ")"
 	}
-	pattern := levelValuePattern(value)
+	pattern := lokiDetectedLevelPattern(canonical)
+	if pattern == "" {
+		// Loki never reports this value, so nothing matches it.
+		return logsqlNeverMatch
+	}
 	parts := make([]string, 0, len(m.DerivedLevelFields)+1)
 	for _, f := range m.DerivedLevelFields {
 		parts = append(parts, buildFieldFilterStr(quoteVLField(f), logsql.FieldOpRegexp, pattern, false))
 	}
-	if textPattern := LokiTextLevelPattern(value); textPattern != "" {
+	if textPattern := LokiTextLevelPattern(canonical); textPattern != "" {
 		// Guard on a RECOGNISED named value, not on any value at all: Loki falls
 		// back to the line text when the level key holds something it does not
 		// know (`"LogLevel":"Information"`), so an unrecognised value must not

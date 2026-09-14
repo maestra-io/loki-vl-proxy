@@ -100,7 +100,7 @@ func TestReduceLokiSeriesAcrossSeries_MaxPerTimestamp(t *testing.T) {
 	body := []byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
 		`{"metric":{"ns":"a","id":"1"},"values":[[100,"3"],[160,"9"]]},` +
 		`{"metric":{"ns":"a","id":"2"},"values":[[100,"7"],[160,"1"]]}]}}`)
-	out := reduceLokiSeriesAcrossSeries(body, "max", []string{"ns"})
+	out := reduceLokiSeriesAcrossSeries(body, "max", []string{"ns"}, false)
 
 	var resp struct {
 		Data struct {
@@ -169,7 +169,7 @@ func TestApplyLokiSeriesDecomposition_KeepsGroupingLabels(t *testing.T) {
 func TestReduceLokiSeriesAcrossSeries_TrimsLabelsOfASingleSeries(t *testing.T) {
 	body := []byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
 		`{"metric":{"ns":"a","pod":"p-1"},"values":[[100,"3"],[160,"9"]]}]}}`)
-	out := reduceLokiSeriesAcrossSeries(body, "max", nil)
+	out := reduceLokiSeriesAcrossSeries(body, "max", nil, false)
 
 	var resp struct {
 		Data struct {

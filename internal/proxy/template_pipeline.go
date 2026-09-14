@@ -302,7 +302,20 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 		for k, val := range streamLabels {
 			merged[k] = val
 		}
-		entry := logqlpkg.Entry{TS: time.Unix(0, ts), Line: string(v.GetStringBytes("_msg")), Labels: merged}
+		line := string(v.GetStringBytes("_msg"))
+		// The collector lifted the JSON `message`/`msg`/… key into _msg, so a
+		// `| json` here finds no such key while Loki, holding the wrapper line,
+		// does. Expose the line under the lifted names the row lacks, so
+		// `line_format "{{.message}}"` reads what Loki reads.
+		// ponytail: every configured alias gets the line; the one the collector
+		// actually lifted is not recorded on the row.
+		for _, alias := range p.msgFieldAliases {
+			if _, present := merged[alias]; !present {
+				merged[alias] = line
+				smFields[alias] = line
+			}
+		}
+		entry := logqlpkg.Entry{TS: time.Unix(0, ts), Line: line, Labels: merged}
 		if !plan.pipeline.Process(&entry) {
 			continue
 		}
@@ -637,6 +650,9 @@ type templateMetricPlan struct {
 	manualFunc string
 	field      string
 	quantile   float64
+	// partialWarning is set when a Drilldown request exceeded the series cap
+	// and was served the busiest N; the handler emits it as Loki's Warning.
+	partialWarning string
 }
 
 // buildTemplateMetricPlan prepares a metric query whose pipeline needs
@@ -726,14 +742,16 @@ func (p *Proxy) templateMetricRangeBody(r *http.Request, mp *templateMetricPlan)
 	if err != nil {
 		return nil, err
 	}
-	if capErr := p.seriesCapError(len(series), "template_range_metric"); capErr != nil {
+	if capErr := p.seriesCapError(len(series), "template_range_metric"); capErr != nil && !isGrafanaDrilldownRequest(r) {
 		return nil, capErr
+	} else if capErr != nil {
+		mp.partialWarning = capErr.Error()
 	}
 	// The template pipeline yields RAW log entries.
 	body := buildManualRangeMetricMatrix(mp.manualFunc, mp.quantile, series,
 		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries(), false)
 	if mp.spec.OuterAggAcrossSeries != "" {
-		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy)
+		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy, mp.spec.OuterAggWithout)
 	}
 	return body, nil
 }
@@ -754,7 +772,7 @@ func (p *Proxy) templateMetricInstantBody(r *http.Request, mp *templateMetricPla
 	// The template pipeline yields RAW log entries.
 	body := buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window, false)
 	if mp.spec.OuterAggAcrossSeries != "" {
-		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy)
+		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy, mp.spec.OuterAggWithout)
 	}
 	return body, nil
 }
@@ -786,6 +804,9 @@ func (p *Proxy) handleTemplateMetric(
 	if err != nil {
 		p.writeError(w, templateFetchErrorStatus(err), err.Error())
 		return true
+	}
+	if mp.partialWarning != "" {
+		w.Header().Set("Warning", `199 - "`+mp.partialWarning+`; returning partial results"`)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(body) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter -- pre-built JSON, Content-Type set above

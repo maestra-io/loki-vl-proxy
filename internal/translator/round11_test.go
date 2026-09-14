@@ -27,11 +27,11 @@ func TestDerivedLevelFilter_RegexpMatchesCanonicalLevels(t *testing.T) {
 		t.Fatalf("user regexp reached the raw fields instead of the canonical levels: %s", got)
 	}
 	for _, lvl := range []string{"error", "warn"} {
-		if !strings.Contains(got, levelValuePattern(lvl)) {
+		if !strings.Contains(got, lokiDetectedLevelPattern(lvl)) {
 			t.Errorf("canonical level %q matched by the regexp is missing from %s", lvl, got)
 		}
 	}
-	if strings.Contains(got, levelValuePattern("info")) {
+	if strings.Contains(got, lokiDetectedLevelPattern("info")) {
 		t.Errorf("info does not match err.*|warn, yet it is in %s", got)
 	}
 	// The text fallback travels with each level, exactly as for `=`.
@@ -42,10 +42,35 @@ func TestDerivedLevelFilter_RegexpMatchesCanonicalLevels(t *testing.T) {
 	if neg := m.derivedLevelFilter("err.*|warn", true, true); neg != "NOT "+got {
 		t.Fatalf("!~ must be NOT (=~): %s", neg)
 	}
-	// A regexp no canonical level matches keeps the raw-field form, anchored once.
-	raw := m.derivedLevelFilter("Information", false, true)
-	if !strings.Contains(raw, `level:~"^(?:Information)$"`) || strings.Contains(raw, "^(?:^") {
-		t.Fatalf("unmatched regexp must fall back to the singly-anchored raw form: %s", raw)
+	// A regexp no canonical level matches matches no row — Loki never reports
+	// "Information" — and its negation matches every row (CodeRabbit on PR 22:
+	// a raw-field fallback still matched a stored "Information").
+	if got := m.derivedLevelFilter("Information", false, true); got != logsqlNeverMatch {
+		t.Fatalf("unmatched regexp must match nothing, got %s", got)
+	}
+	if got := m.derivedLevelFilter("Information", true, true); got != "*" {
+		t.Fatalf("negated unmatched regexp must match everything, got %s", got)
+	}
+	if got := m.derivedLevelFilter("custom", false, false); got != logsqlNeverMatch {
+		t.Fatalf("a literal Loki never reports must match nothing, got %s", got)
+	}
+}
+
+// CodeRabbit on PR 22: the predicates must use the same canonical table as the
+// `by (detected_level)` materialisation — fatal, critical and trace are
+// distinct levels, not synonyms of error/debug.
+func TestDerivedLevelFilter_UsesTheDetectedLevelTable(t *testing.T) {
+	m := &MappingOptions{DerivedLevelFields: []string{"level"}}
+	// The field predicate is the first OR branch; the "present" guard after it
+	// legitimately lists every recognised raw value.
+	if got := m.derivedLevelFilter("debug", false, false); !strings.HasPrefix(got, `(level:~"(?i)^(debug|fine|verbose)$" OR`) {
+		t.Fatalf("debug must not swallow trace: %s", got)
+	}
+	if got := m.derivedLevelFilter("error", false, false); !strings.HasPrefix(got, `(level:~"(?i)^(err|error|errors|emerg|panic|alert)$" OR`) {
+		t.Fatalf("error must not swallow fatal/critical: %s", got)
+	}
+	if got := m.derivedLevelFilter("fatal", false, true); !strings.Contains(got, `(?i)^(fatal)$`) || !strings.Contains(got, buildFieldFilterStr("_msg", logsql.FieldOpRegexp, LokiTextLevelPattern("fatal"), false)) {
+		t.Fatalf("fatal is a canonical level with its own text fallback: %s", got)
 	}
 }
 
@@ -93,7 +118,7 @@ func TestTranslate_DetectedLevelRegexpAnchoredOnce(t *testing.T) {
 		if strings.Contains(got, "^(?:^") {
 			t.Fatalf("%s\n-> double anchor in %s", q, got)
 		}
-		if !strings.Contains(got, levelValuePattern("error")) || !strings.Contains(got, levelValuePattern("warn")) {
+		if !strings.Contains(got, lokiDetectedLevelPattern("error")) || !strings.Contains(got, lokiDetectedLevelPattern("warn")) {
 			t.Fatalf("%s\n-> canonical levels missing in %s", q, got)
 		}
 	}
@@ -144,5 +169,28 @@ func TestTranslate_MsgFieldAliasReadsMsgWhenAbsent(t *testing.T) {
 		if strings.Contains(q, "-message:*") || strings.Contains(q, "-other:*") {
 			t.Fatalf("alias must not apply: %s", q)
 		}
+	}
+}
+
+// Round 11 (panel rewrite, omega): two label filters on the SAME field with
+// different values collapsed to the second one on the pushdown path —
+// `| Scopes=~"sql09" | Scopes=~"resumable"` answered 276 725 (the second filter
+// alone). Loki ANDs them; only an include/exclude of the same value collapses.
+func TestTranslate_TwoFiltersOnOneFieldStayAnded(t *testing.T) {
+	m := &MappingOptions{}
+	got, err := TranslateLogQLWithMapping(`{a="b"} | json | Scopes=~"sql09" | Scopes=~"resumable" | Category != "A" | Category != "B"`, nil, nil, logsql.Capabilities{}, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`Scopes:~"^(?:sql09)$"`, `Scopes:~"^(?:resumable)$"`, `-Category:="A"`, `-Category:="B"`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("filter %s lost: %s", want, got)
+		}
+	}
+	// The Drilldown click semantics survive: include then exclude of the same
+	// value keeps the latest.
+	got, _ = TranslateLogQLWithMapping(`{a="b"} | json | x="1" | x!="1"`, nil, nil, logsql.Capabilities{}, m)
+	if strings.Count(got, `x:="1"`) != 1 || !strings.Contains(got, `-x:="1"`) {
+		t.Fatalf("include then exclude of one value must keep the latest only: %s", got)
 	}
 }

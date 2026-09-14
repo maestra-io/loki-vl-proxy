@@ -237,11 +237,9 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 	// See memory [[drilldown-high-card-fields-known-limit]].
 	out := wrapAsLokiResponse(body, "matrix")
 	if capErr := p.seriesCapError(countLokiMatrixSeries(out), "stats_query_range_direct"); capErr != nil {
-		if !isGrafanaDrilldownRequest(r) {
-			p.writeError(w, http.StatusBadRequest, capErr.Error())
+		if !p.serveSeriesCapPartial(w, r, capErr) {
 			return false
 		}
-		w.Header().Set("Warning", `199 - "`+capErr.Error()+`; returning partial results"`)
 		out = limitLokiMatrixSeries(out, p.resolvedMaxStatsQuerySeries())
 	}
 	w.Header().Set("Content-Type", "application/json")

@@ -151,7 +151,7 @@ func statsQRWithSeries(n int) []byte {
 		if i > 0 {
 			sb.WriteString(",")
 		}
-		fmt.Fprintf(&sb, `{"metric":{"pod":"p%d"},"values":[[1700000060.000001,"%d"]]}`, i, i+1)
+		fmt.Fprintf(&sb, `{"metric":{"pod":"p%d","_stream":"{pod=\"p%d\"}"},"values":[[1700000060,"%d"],[1700000120,"%d"],[1700000180,"%d"],[1700000240,"%d"],[1700000300,"%d"],[1700000360,"%d"],[1700000420,"%d"],[1700000480,"%d"],[1700000540,"%d"],[1700000600,"%d"],[1700000660,"%d"],[1700000720,"%d"]]}`, i, i, i+1, i+1, i+1, i+1, i+1, i+1, i+1, i+1, i+1, i+1, i+1, i+1)
 	}
 	sb.WriteString(`]}}`)
 	return []byte(sb.String())
@@ -165,18 +165,20 @@ func TestSeriesCap_RefusesInsteadOfTrimming(t *testing.T) {
 	}{
 		{"direct stats path", `sum by (pod) (count_over_time({app="a"}[60s]))`, "60"},
 		{"sliding-window stats path", `sum by (pod) (count_over_time({app="a"}[5m]))`, "60"},
+		// CodeRabbit on PR 22: the bare-parser stats path must not fall back to
+		// the full-fetch scan on a cap error either.
+		{"bare-parser stats path", `count_over_time({app="a"} | json [5m])`, "60"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			vl, _ := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = w.Write(statsQRWithSeries(501))
 			})
+			// A fresh proxy per phase: the response caches would otherwise answer
+			// a later phase with an earlier phase's body.
 			p := newGapTestProxy(t, vl.URL)
-			// Distinct ranges per request: the response cache would otherwise
-			// answer the later requests with the first one's body.
-			target := "/loki/api/v1/query_range?query=" + url.QueryEscape(tc.query) + "&start=1700000000&end=1700000600&step=" + tc.step
-			targetDrilldown := strings.Replace(target, "end=1700000600", "end=1700000660", 1)
-			targetRaised := strings.Replace(target, "end=1700000600", "end=1700000720", 1)
+			target := "/loki/api/v1/query_range?query=" + url.QueryEscape(tc.query) + "&start=1700000000&end=1700000720&step=" + tc.step
+			targetDrilldown, targetRaised := target, target
 
 			rec := httptest.NewRecorder()
 			p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, target, nil))
@@ -185,17 +187,17 @@ func TestSeriesCap_RefusesInsteadOfTrimming(t *testing.T) {
 			}
 
 			// Drilldown gets the busiest N and a Warning header, as Loki does.
+			p = newGapTestProxy(t, vl.URL)
 			req := httptest.NewRequest(http.MethodGet, targetDrilldown, nil)
 			req.Header.Set("X-Query-Tags", "Source=grafana-lokiexplore-app")
 			rec = httptest.NewRecorder()
 			p.handleQueryRange(rec, req)
-			if tc.name == "direct stats path" {
-				if rec.Code != http.StatusOK || countLokiMatrixSeries(rec.Body.Bytes()) != 500 || !strings.Contains(rec.Header().Get("Warning"), "maximum of series") {
-					t.Fatalf("drilldown: want 200 with 500 series and a Warning, got %d (%d series, Warning=%q)", rec.Code, countLokiMatrixSeries(rec.Body.Bytes()), rec.Header().Get("Warning"))
-				}
+			if rec.Code != http.StatusOK || countLokiMatrixSeries(rec.Body.Bytes()) != 500 || !strings.Contains(rec.Header().Get("Warning"), "maximum of series") {
+				t.Fatalf("drilldown: want 200 with 500 series and a Warning, got %d (%d series, Warning=%q)", rec.Code, countLokiMatrixSeries(rec.Body.Bytes()), rec.Header().Get("Warning"))
 			}
 
 			// The cap is configurable per deployment.
+			p = newGapTestProxy(t, vl.URL)
 			p.maxStatsQuerySeries = 1000
 			rec = httptest.NewRecorder()
 			p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, targetRaised, nil))
@@ -332,5 +334,78 @@ func TestBareUnwrapOverTemplate_KeepsParsedLabelsDropsUnwrapField(t *testing.T) 
 		if m.Get("duration_ms") != nil {
 			t.Fatalf("the unwrapped label must leave the identity: %s", m.String())
 		}
+	}
+}
+
+// CodeRabbit on PR 22: a cap error on the bare-parser stats path was treated
+// as a failed optimisation and started the full-fetch raw scan.
+func TestSeriesCap_BareParserPathNeverFallsBackToRawScan(t *testing.T) {
+	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(statsQRWithSeries(501))
+	})
+	p := newGapTestProxy(t, vl.URL)
+	rec := httptest.NewRecorder()
+	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
+		url.QueryEscape(`count_over_time({app="a"} | json [5m])`)+"&start=1700000000&end=1700000600&step=60", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, q := range seen() {
+		if strings.Contains(q, "/select/logsql/query ") {
+			t.Fatalf("the cap error must not start the raw scan: %q", seen())
+		}
+	}
+}
+
+// CodeRabbit on PR 22: `without (…)` on the outer aggregation was read as
+// "no by()" and every label collapsed into `{}`.
+func TestOuterAggregationWithout_KeepsTheOtherLabels(t *testing.T) {
+	for _, q := range []string{
+		`max without (pod) (rate({app="a"}[10m]))`,
+		`sum without (pod) (rate({app="a"}[10m]))`,
+	} {
+		vl, _ := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			fmt.Fprint(w, `{"_time":"2023-11-14T22:13:30Z","_msg":"x","_stream":"{app=\"a\",pod=\"p1\"}","app":"a","pod":"p1"}`+"\n")
+			fmt.Fprint(w, `{"_time":"2023-11-14T22:13:40Z","_msg":"y","_stream":"{app=\"a\",pod=\"p2\"}","app":"a","pod":"p2"}`+"\n")
+		})
+		p := newGapTestProxy(t, vl.URL)
+		rec := httptest.NewRecorder()
+		p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
+			url.QueryEscape(q)+"&start=1700000000&end=1700000120&step=60", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: HTTP %d: %s", q, rec.Code, rec.Body.String())
+		}
+		v, err := fj.ParseBytes(rec.Body.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := v.GetArray("data", "result")
+		if len(result) != 1 || result[0].GetObject("metric").Get("app") == nil || result[0].GetObject("metric").Get("pod") != nil {
+			t.Fatalf("%s: want one series {app=\"a\"} (pod dropped, app kept), got %s", q, rec.Body.String())
+		}
+	}
+}
+
+// Round 11 (panel rewrite, omega): `line_format "{{.message}}"` after `| json`
+// was empty on the template path — the collector lifted `message` into _msg,
+// so the proxy-side `| json` finds no such key. The lifted names the row lacks
+// are exposed with the line, which is what Loki's `| json` of the wrapper gives.
+func TestTemplateLogPath_MsgFieldAliasReachesLineFormat(t *testing.T) {
+	vl, _ := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, `{"_time":"2023-11-14T22:13:30Z","_msg":"plain ERROR text","_stream":"{app=\"a\"}","app":"a"}`+"\n")
+	})
+	p := newGapTestProxy(t, vl.URL)
+	p.msgFieldAliases = []string{"message", "msg"}
+	rec := httptest.NewRecorder()
+	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
+		url.QueryEscape(`{app="a"} | json | line_format "{{.message}}!"`)+"&start=1700000000&end=1700003600&limit=10", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"plain ERROR text!"`) {
+		t.Fatalf("line_format did not see .message: %s", rec.Body.String())
 	}
 }

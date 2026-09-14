@@ -173,6 +173,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries no meaning in LogQL; `sum  (  rate  ( … )  )` is the same query.
 - **A `label_format`-derived grouping lost the name of an empty label** — `{}`
   where Loki answers `{lf=""}`, the same numbers under a different series.
+  - Review round on the same PR: the series cap keeps Loki's Drilldown
+    partial-results behaviour on EVERY path (the busiest N plus a `Warning`
+    header), the bare-parser stats path never retries a capped result as a
+    raw scan, `without (…)` on the outer aggregation drops those labels
+    instead of collapsing to `{}`, the level predicates use Loki's
+    `detected_level` table (`fatal`, `critical`, `trace` are distinct), and a
+    level value or regexp Loki never reports matches nothing (`NOT *`) with
+    its negation matching everything.
+  - Two label filters on ONE field with different values collapsed to the
+    second one on the pushdown path (`| Scopes=~"sql09" | Scopes=~"resumable"`
+    answered the second filter alone, 276 725 vs Loki's AND); only the
+    include/exclude of the same value still collapses to the latest.
+  - `line_format "{{.message}}"` after `| json` was empty on the template
+    path: the collector lifted `message` into `_msg`. The lifted names the row
+    lacks (`-msg-field-aliases`) are exposed with the line, which is what
+    Loki's `| json` of the wrapper gives.
 
 - **A plain line filter was translated as a REGEXP, unescaped.** `|=` and `!=`
   are SUBSTRING matches in LogQL, but their value went to LogsQL's `~` verbatim,

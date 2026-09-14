@@ -1355,9 +1355,6 @@ func (p *Proxy) fetchBareParserCountBytesViaStats(
 	// Default 500 matches maxDrilldownSeries and Loki's default max_query_series.
 	// See memory [[drilldown-high-card-fields-known-limit]].
 	results, capErr := p.capStatsSeriesReported(results, "stats_query_range")
-	if capErr != nil {
-		return nil, "", capErr
-	}
 	seriesMap := make(map[string]manualSeriesSamples, len(results))
 	streamLabelCache := make(map[string]map[string]string, len(results))
 
@@ -1410,7 +1407,7 @@ func (p *Proxy) fetchBareParserCountBytesViaStats(
 			seriesMap[seriesKey] = manualSeriesSamples{Metric: metric, Samples: samples}
 		}
 	}
-	return seriesMap, aggFunc, nil
+	return seriesMap, aggFunc, capErr
 }
 
 // fetchBareParserUnwrapViaStats fetches pre-aggregated per-step samples from
@@ -2152,6 +2149,19 @@ func (p *Proxy) proxyBareParserMetricQueryRange(w http.ResponseWriter, r *http.R
 		switch spec.funcName {
 		case "rate", "count_over_time", "bytes_over_time", "bytes_rate":
 			statsSeries, statsAggFn, statsErr := p.fetchBareParserCountBytesViaStats(r.Context(), spec, startNanos, endNanos, stepNanos)
+			if capErr := seriesCapOnly(statsErr); capErr != nil {
+				// Over the series cap: never the full-fetch fallback — that raw scan
+				// is the memory shape the cap prevents, and it ends in the same
+				// refusal. A Drilldown request keeps the busiest N (statsSeries is
+				// already trimmed), everything else gets the 400 now.
+				if !p.serveSeriesCapPartial(w, r, capErr) {
+					elapsed := time.Since(start)
+					p.metrics.RecordRequest("query_range", http.StatusBadRequest, elapsed)
+					p.queryTracker.Record("query_range", originalQuery, elapsed, true)
+					return
+				}
+				statsErr = nil
+			}
 			if statsErr == nil {
 				startT := time.Unix(0, startNanos)
 				endT := time.Unix(0, endNanos)
@@ -2226,8 +2236,7 @@ func (p *Proxy) tryUnwrapViaStatsFastPath(w http.ResponseWriter, r *http.Request
 	startT := time.Unix(0, startNanos)
 	endT := time.Unix(0, endNanos)
 	stepD := time.Duration(stepNanos)
-	if capErr := p.seriesCapError(len(uwSeries), "bare_unwrap_stats"); capErr != nil {
-		p.writeError(w, statusForRangeMetricCollectError(capErr), capErr.Error())
+	if capErr := p.seriesCapError(len(uwSeries), "bare_unwrap_stats"); capErr != nil && !p.serveSeriesCapPartial(w, r, capErr) {
 		elapsed := time.Since(start)
 		p.metrics.RecordRequest("query_range", http.StatusBadRequest, elapsed)
 		p.queryTracker.Record("query_range", originalQuery, elapsed, true)
