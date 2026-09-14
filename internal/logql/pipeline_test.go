@@ -278,7 +278,9 @@ func TestHasTemplateStage(t *testing.T) {
 		{`{a="b"} | line_format "constant text"`, false},
 		{`{a="b"} | label_format new=old`, false},
 		{`{a="b"} | label_format env="prod"`, false},
-		{`{a="b"} | label_format cls="{{.status}}"`, true},
+		// Round 11: one field reference is a LogsQL format pipe, not a template.
+		{`{a="b"} | label_format cls="{{.status}}"`, false},
+		{`{a="b"} | label_format cls="{{.status | upper}}"`, true},
 		{`{a="b"} | json | drop x`, false},
 	}
 	for _, tc := range cases {

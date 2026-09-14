@@ -271,9 +271,13 @@ func TestDerivedLevelSelectors(t *testing.T) {
 			wantParts: []string{`loglevel:~"(?i)^(warn|warning|warnings)$"`},
 		},
 		{
-			name:      "negated level is a conjunction",
+			// Round 11: the negation is `NOT (<positive form>)` so a row with no
+			// level field is excluded when its line text names the level (Loki
+			// labels it from the text) and kept otherwise — the per-field
+			// `-level:~` conjunction let every such row through.
+			name:      "negated level is the negation of the positive form",
 			logql:     `{namespace="ns", level!="error"}`,
-			wantParts: []string{`| filter (-level:~"(?i)^(err|`, ` -loglevel:~"(?i)^(err|`},
+			wantParts: []string{`| filter NOT (level:~"(?i)^(err|`, ` OR loglevel:~"(?i)^(err|`, `AND _msg:~"`},
 		},
 		{
 			name:      "pipeline level filter gets its own unpack chain",

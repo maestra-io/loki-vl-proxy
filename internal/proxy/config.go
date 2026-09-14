@@ -37,6 +37,7 @@ type HandlerConfig struct {
 	declaredLabelFields                   []string
 	computedLabels                        []ComputedLabel
 	derivedLevelFields                    []string
+	msgFieldAliases                       []string
 	derivedLevelGroupBy                   bool
 	lineFieldMsg                          bool
 	registerInstrumentation               bool

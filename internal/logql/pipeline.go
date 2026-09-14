@@ -110,14 +110,44 @@ func HasTemplateStage(stages []Stage) bool {
 				}
 				continue
 			}
-			for _, a := range st.Assignments {
-				if strings.Contains(a.Tmpl, "{{") {
-					return true
-				}
+			if !labelFormatPushable(st) {
+				return true
 			}
 		}
 	}
 	return false
+}
+
+// pureFieldRefRE is a template whose only action is one field reference:
+// `{{ .level }}`, `{{.service.name}}`.
+var pureFieldRefRE = regexp.MustCompile(`^\s*\{\{\s*\.([\w.]+)\s*\}\}\s*$`)
+
+// labelFormatPushable reports whether every templated assignment of the stage
+// is a pure field reference, which translates to LogsQL `| format "<field>"
+// as dst` exactly. The reference must not name a label another assignment of
+// the SAME stage writes: Loki evaluates all assignments against the pre-stage
+// labels, the translator emits sequential pipes, so `a={{.b}}, b={{.a}}` would
+// swap wrongly pushed down. Round 11: `sum by (lf) (... | label_format
+// lf=`{{ .level }}`)` was routed through the proxy-side raw-row read for a
+// stage VictoriaLogs evaluates natively.
+func labelFormatPushable(st *LabelFormatStage) bool {
+	dsts := make(map[string]struct{}, len(st.Assignments))
+	for _, a := range st.Assignments {
+		dsts[a.Dst] = struct{}{}
+	}
+	for _, a := range st.Assignments {
+		if !strings.Contains(a.Tmpl, "{{") {
+			continue
+		}
+		m := pureFieldRefRE.FindStringSubmatch(a.Tmpl)
+		if m == nil {
+			return false
+		}
+		if _, clash := dsts[m[1]]; clash {
+			return false
+		}
+	}
+	return true
 }
 
 // NewPipeline compiles the stages for repeated evaluation. Templates are

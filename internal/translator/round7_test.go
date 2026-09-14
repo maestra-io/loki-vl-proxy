@@ -104,9 +104,11 @@ func TestDerivedLevelFilter_FallsBackToLineText(t *testing.T) {
 	if !strings.Contains(got, `NOT (level:~"`+anyLevelValuePattern()+`" OR LogLevel:~"`+anyLevelValuePattern()+`")`) {
 		t.Fatalf("text fallback is not guarded by the absence of a RECOGNISED level: %s", got)
 	}
-	// A negated matcher keeps the old shape — the heuristic has no negative form.
-	if neg := m.derivedLevelFilter("error", true, false); strings.Contains(neg, "_msg:~") {
-		t.Fatalf("negated matcher must not gain the text fallback: %s", neg)
+	// A negated matcher is the negation of the SAME expression, text fallback
+	// included (round 11: without it a row carrying no level field passed
+	// `detected_level != "info"` and was then labelled info from its text).
+	if neg := m.derivedLevelFilter("error", true, false); neg != "NOT "+got {
+		t.Fatalf("negated matcher must be NOT (positive): %s", neg)
 	}
 }
 

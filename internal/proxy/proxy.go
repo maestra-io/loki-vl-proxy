@@ -241,6 +241,10 @@ type Config struct {
 	// _msg has been unpacked (e.g. level, loglevel, severity). Empty keeps the
 	// upstream behaviour where `level` is looked up as a stored VL field.
 	DerivedLevelFields []string
+	// MsgFieldAliases lists the JSON keys the collector lifts into _msg
+	// (vlagent msgField); a filter on one of them reads _msg when the field is
+	// absent after `| json`.
+	MsgFieldAliases []string
 	// DerivedLevelGroupBy appends the unpack + coalesce + normalise pipe chain to
 	// queries that reference level, so `sum by (level)` groups on VL's side.
 	DerivedLevelGroupBy bool
@@ -496,6 +500,7 @@ type Proxy struct {
 	computedLabels                    []ComputedLabel  // Loki labels joined from other labels (e.g. job)
 	labelPromotions                   []labelPromotion // mapped/computed labels lifted into result stream labels
 	derivedLevelFields                []string         // VL fields carrying a raw level inside _msg
+	msgFieldAliases                   []string         // JSON keys the collector lifted into _msg
 	derivedLevelGroupBy               bool             // materialise `level` server-side for group-by
 	lineFieldMsg                      bool             // return _msg as the Loki log line
 	peerCache                         *cache.PeerCache // L3 fleet peer cache
@@ -1133,6 +1138,7 @@ func New(cfg Config) (*Proxy, error) {
 		computedLabels:                        validComputedLabels(cfg.ComputedLabels),
 		labelPromotions:                       buildLabelPromotions(labelTranslator, validComputedLabels(cfg.ComputedLabels)),
 		derivedLevelFields:                    normalizeDerivedLevelFields(cfg.DerivedLevelFields),
+		msgFieldAliases:                       normalizeDerivedLevelFields(cfg.MsgFieldAliases),
 		derivedLevelGroupBy:                   cfg.DerivedLevelGroupBy,
 		lineFieldMsg:                          strings.TrimSpace(cfg.LineField) == "_msg",
 		peerCache:                             cfg.PeerCache,
@@ -1276,6 +1282,7 @@ func New(cfg Config) (*Proxy, error) {
 			declaredLabelFields:                   p.declaredLabelFields,
 			computedLabels:                        p.computedLabels,
 			derivedLevelFields:                    p.derivedLevelFields,
+			msgFieldAliases:                       p.msgFieldAliases,
 			derivedLevelGroupBy:                   p.derivedLevelGroupBy,
 			lineFieldMsg:                          p.lineFieldMsg,
 			registerInstrumentation:               p.registerInstrumentation,

@@ -376,7 +376,7 @@ func TestFetchTemplatePipelineEntries_ChargesOnlyRetainedEntries(t *testing.T) {
 	}
 	plan := &templatePlan{pipeline: pipeline, baseLogsQL: `app:="a"`, fallbackLogsQL: `app:="a"`}
 	entries, err := p.fetchTemplatePipelineEntries(context.Background(), plan,
-		base, base.Add(time.Minute), true, true)
+		base, base.Add(time.Minute), true, true, 0)
 	if err != nil {
 		t.Fatalf("%d discarded rows exhausted a budget that fits the %d retained ones: %v",
 			discarded, kept, err)

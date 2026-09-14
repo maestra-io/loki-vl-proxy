@@ -221,21 +221,41 @@ func (p *Proxy) proxyStatsQueryRangeDirect(w http.ResponseWriter, r *http.Reques
 	body = shiftStatsQRToLokiGrid(body, startRaw, r.FormValue("step"))
 	body = p.trimAndTranslateStatsQRFJ(r.Context(), body,
 		lokiGridWindowKeep(startRaw, endRaw), r.FormValue("query"))
-	// Cap to the busiest maxStatsQuerySeries (default 500, top-N by total count).
-	// This is the path taken by `sum by (pod|trace_id|*_id) (count_over_time(
-	// {...} | detected_level="error" [w]))` from the Drilldown labels page —
-	// the level filter is NOT the `| field!=""` existence pattern, so the query
-	// misses the Drilldown single-field fast paths (which already cap) and lands
-	// here. Without the cap VL's per-pod stats response is ~146k single-point
-	// series at 24h (each churning pod appears once), which squeaks under the
-	// 16 MB body cap and floods Grafana with unrenderable scattered spikes.
-	// limitLokiMatrixSeries ranks by total count so the busiest pods survive,
+	// The series cap (`-max-stats-query-series`, default 500 = Loki's stock
+	// max_query_series). Loki has two answers to a result over it, and so does
+	// this path:
+	//   - a Drilldown request gets the busiest N series plus a Warning header —
+	//     the labels page runs `sum by (pod|trace_id|*_id) (count_over_time(
+	//     {...} | detected_level="error" [w]))`, whose per-pod stats response is
+	//     ~146k single-point series at 24h, and it wants the top contributors;
+	//   - everything else gets Loki's 400 `maximum of series (N) reached for a
+	//     single query`. Until round 11 every caller got the trimmed result as
+	//     if it were complete: a whole-cluster panel showed 500 of 5091 series
+	//     with nothing in the response or the log saying so.
+	// limitLokiMatrixSeries ranks by total count so the busiest series survive,
 	// not VL's alphabetical first-N (the count==1 noise floor).
 	// See memory [[drilldown-high-card-fields-known-limit]].
-	out := limitLokiMatrixSeries(wrapAsLokiResponse(body, "matrix"), p.resolvedMaxStatsQuerySeries())
+	out := wrapAsLokiResponse(body, "matrix")
+	if capErr := p.seriesCapError(countLokiMatrixSeries(out), "stats_query_range_direct"); capErr != nil {
+		if !isGrafanaDrilldownRequest(r) {
+			p.writeError(w, http.StatusBadRequest, capErr.Error())
+			return false
+		}
+		w.Header().Set("Warning", `199 - "`+capErr.Error()+`; returning partial results"`)
+		out = limitLokiMatrixSeries(out, p.resolvedMaxStatsQuerySeries())
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(out)
 	return false
+}
+
+// countLokiMatrixSeries returns the number of series in a Loki matrix body.
+func countLokiMatrixSeries(body []byte) int {
+	v, err := fj.ParseBytes(body)
+	if err != nil {
+		return 0
+	}
+	return len(v.GetArray("data", "result"))
 }
 
 // maxDrilldownResponseBytes is the per-request body cap for Drilldown single-field
@@ -2621,14 +2641,22 @@ func shiftStatsQRToLokiGrid(body []byte, startRaw, stepRaw string) []byte {
 	if !ok || step <= 0 {
 		return body
 	}
-	// buildLokiGridStatsParams moved the grid left by `offset`, so the bucket
-	// labelled L is the LogQL point at `L + step - offset` — which lands on the
-	// client's own step grid. Snapping to that grid keeps the points exact even
-	// against a backend that ignored the offset (it then shifts by a fraction of
-	// one step, and the nearest grid position is still the right point).
+	// buildLokiGridStatsParams moved the grid left by `offset`, and VictoriaLogs
+	// labels each bucket with its REAL, offset-shifted start (v1.52.0: start
+	// 10:00:30, step 60s, offset -30.000001s labels the bucket covering
+	// (09:59:30, 10:00:30] as 09:59:30.000001). The offset is therefore already
+	// in the label L, and the LogQL point is `L + step - epsilon` whatever the
+	// alignment of `start`. Subtracting the whole offset here as well applied it
+	// twice: harmless while every outer request is step-aligned (offset ==
+	// epsilon), but the per-point fallback sends start = t - range, and with
+	// `start mod step` past half a step the snap below then landed one full
+	// step early — the point carried the NEXT window's count (round 11).
+	// Snapping to the client's grid keeps the points exact even against a
+	// backend that ignored the offset (it then shifts by a fraction of one
+	// step, and the nearest grid position is still the right point).
 	startNs, hasStart := parseLokiTimeToUnixNano(startRaw)
 	stepNs := step.Nanoseconds()
-	delta := stepNs - lokiGridOffsetNanos(startRaw, stepRaw)
+	delta := stepNs - lokiGridBucketEpsilonNanos
 	return mapStatsQRPointTimestamps(body, delta, func(tsNs int64) int64 {
 		if !hasStart {
 			return tsNs

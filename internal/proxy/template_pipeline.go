@@ -44,6 +44,11 @@ type templatePlan struct {
 	// filters Loki accepts (a `\d`-style regex inside a `| filter` pipe), so a
 	// backend 4xx retries with this narrower query rather than failing the panel.
 	fallbackLogsQL string
+	// suffixDropsRows says whether a stage the proxy evaluates itself (from the
+	// first template stage on) can drop an entry — a line or label filter. A
+	// suffix of pure transforms yields one entry per raw row, so a log query's
+	// backend limit can be the request's own limit.
+	suffixDropsRows bool
 }
 
 // templatePlanFor builds a plan when logqlQuery's log pipeline contains a
@@ -84,7 +89,25 @@ func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templa
 	if err != nil {
 		baseLogsQL = fallbackLogsQL
 	}
-	return &templatePlan{pipeline: pipeline, baseLogsQL: baseLogsQL, fallbackLogsQL: fallbackLogsQL}, nil
+	return &templatePlan{
+		pipeline:        pipeline,
+		baseLogsQL:      baseLogsQL,
+		fallbackLogsQL:  fallbackLogsQL,
+		suffixDropsRows: pipelineSuffixDropsRows(lq.Pipeline),
+	}, nil
+}
+
+// pipelineSuffixDropsRows reports whether a stage after the pushed-down
+// prefix filters entries out. Parsers, formats, drop/keep and decolorize keep
+// every entry (a failing parser adds __error__, it does not drop the line).
+func pipelineSuffixDropsRows(stages []logqlpkg.Stage) bool {
+	for _, s := range stages[len(pushdownPrefix(stages)):] {
+		switch s.(type) {
+		case *logqlpkg.LineFilterStage, *logqlpkg.LabelFilterStage:
+			return true
+		}
+	}
+	return false
 }
 
 // innermostLogQuery unwraps aggregations down to the log query they range over.
@@ -160,8 +183,38 @@ type templateEntry struct {
 // forward says the client asked for the OLDEST entries first. VictoriaLogs is
 // free to return rows in any order, so the cap below would otherwise keep an
 // arbitrary subset; the query carries an explicit sort matching the direction.
-func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *templatePlan, start, end time.Time, truncationFatal, forward bool) ([]templateEntry, error) {
-	entries, err := p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.baseLogsQL, start, end, truncationFatal, forward)
+// wantRows > 0 marks a LOG query for wantRows entries: the backend sort is then
+// bounded to the request's own limit — `sort by (_time desc) limit 1000001`
+// (the raw-row ceiling, +1) is what VictoriaLogs answered with 400 "requires
+// more than 1310MB" or, where it fit, what sorted a million rows for a
+// 5000-line panel and OOM-killed vlsingle (round 11). A pipeline whose
+// proxy-side stages can DROP entries is re-read with a larger bound while the
+// page came back full and fewer than wantRows survived, never past the raw-row
+// cap. wantRows == 0 is a metric fold: every row is read, unsorted.
+func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *templatePlan, start, end time.Time, truncationFatal, forward bool, wantRows int) ([]templateEntry, error) {
+	rowLimit := p.rangeMetricRowLimit
+	if rowLimit <= 0 {
+		rowLimit = defaultManualRangeMetricRowLimit
+	}
+	if wantRows <= 0 || wantRows > rowLimit {
+		entries, _, err := p.fetchTemplatePipelineEntriesWithFallback(ctx, plan, start, end, truncationFatal, forward, 0)
+		return entries, err
+	}
+	rows := wantRows
+	for {
+		entries, scanned, err := p.fetchTemplatePipelineEntriesWithFallback(ctx, plan, start, end, truncationFatal, forward, rows)
+		if err != nil {
+			return nil, err
+		}
+		if !plan.suffixDropsRows || len(entries) >= wantRows || scanned < rows || rows >= rowLimit {
+			return entries, nil
+		}
+		rows = min(rows*8, rowLimit)
+	}
+}
+
+func (p *Proxy) fetchTemplatePipelineEntriesWithFallback(ctx context.Context, plan *templatePlan, start, end time.Time, truncationFatal, forward bool, sortRows int) ([]templateEntry, int, error) {
+	entries, scanned, err := p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.baseLogsQL, start, end, truncationFatal, forward, sortRows)
 	// The pushed-down stages are an optimisation; VictoriaLogs rejecting them is
 	// not a reason to fail a panel Loki answers.
 	var rejected *templatePushdownRejectedError
@@ -169,24 +222,26 @@ func (p *Proxy) fetchTemplatePipelineEntries(ctx context.Context, plan *template
 		errors.As(err, &rejected) {
 		slog.WarnContext(ctx, "template pipeline pushdown rejected by backend, retrying with line filters only",
 			"status", rejected.status)
-		return p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.fallbackLogsQL, start, end, truncationFatal, forward)
+		return p.fetchTemplatePipelineEntriesQuery(ctx, plan, plan.fallbackLogsQL, start, end, truncationFatal, forward, sortRows)
 	}
-	return entries, err
+	return entries, scanned, err
 }
 
-func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *templatePlan, logsql string, start, end time.Time, truncationFatal, forward bool) ([]templateEntry, error) {
+// fetchTemplatePipelineEntriesQuery reads the rows of one LogsQL query and
+// runs the proxy-side pipeline over them. sortRows > 0 appends VictoriaLogs'
+// bounded sort (`sort by (_time …) limit sortRows`) — the "newest N" a log
+// query is; 0 reads the match unsorted, which VictoriaLogs streams without
+// materialising it, and the proxy-side raw-row cap bounds the read. The scan
+// count is returned so a caller can tell a full page from an exhausted match.
+func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *templatePlan, logsql string, start, end time.Time, truncationFatal, forward bool, sortRows int) ([]templateEntry, int, error) {
 	params := url.Values{}
 	rowLimit := p.rangeMetricRowLimit
 	if rowLimit <= 0 {
 		rowLimit = defaultManualRangeMetricRowLimit
 	}
-	// Bounded sort: the proxy-side row cap below stops READING at rowLimit, but
-	// an unbounded `| sort` has already made VictoriaLogs materialise the whole
-	// match before it emits the first row. Same ceiling, declared to the backend
-	// — plus ONE row, because the cap below is detected by scanning PAST it. Ask
-	// for exactly rowLimit and `rowsScanned > rowLimit` can never fire, so a
-	// truncated aggregate would be served as a complete one.
-	logsql += sortByTimePipe(forward, rowLimit+1)
+	if sortRows > 0 {
+		logsql += sortByTimePipe(forward, sortRows)
+	}
 	params.Set("query", logsql)
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))
@@ -198,16 +253,16 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 
 	resp, err := p.vlPost(ctx, "/select/logsql/query", params)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := readBodyLimited(resp.Body, maxUpstreamErrorBodyBytes)
 		err := p.redactedBackendStatusError("backend returned", resp.StatusCode, body)
 		if resp.StatusCode < 500 {
-			return nil, &templatePushdownRejectedError{status: resp.StatusCode, err: err}
+			return nil, 0, &templatePushdownRejectedError{status: resp.StatusCode, err: err}
 		}
-		return nil, err
+		return nil, 0, err
 	}
 
 	fjp := vlFJParserPool.Get()
@@ -227,7 +282,7 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 		if rowsScanned > rowLimit {
 			if truncationFatal {
 				p.log.Warn("template pipeline scan refused", "reason", "row cap", "limit", rowLimit)
-				return nil, &rawRowScanTruncatedError{limit: rowLimit}
+				return nil, rowsScanned, &rawRowScanTruncatedError{limit: rowLimit}
 			}
 			break
 		}
@@ -260,7 +315,7 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 					"reason", "shared retained-sample budget exhausted",
 					"budget_samples", defaultManualScanSampleBudget,
 					"rows_scanned", rowsScanned, "entries_retained", len(out))
-				return nil, &manualScanBudgetError{budget: defaultManualScanSampleBudget}
+				return nil, rowsScanned, &manualScanBudgetError{budget: defaultManualScanSampleBudget}
 			}
 			break
 		}
@@ -269,9 +324,9 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 		out = append(out, te)
 	}
 	if scanErr := scanner.Err(); scanErr != nil {
-		return nil, fmt.Errorf("scanning VL response: %w", scanErr)
+		return nil, rowsScanned, fmt.Errorf("scanning VL response: %w", scanErr)
 	}
-	return out, nil
+	return out, rowsScanned, nil
 }
 
 // splitTemplateLabels classifies the post-pipeline label set. A key that still
@@ -367,18 +422,18 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 	}
 
 	backward := !strings.EqualFold(r.FormValue("direction"), "forward")
-	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false, !backward)
-	if err != nil {
-		p.writeError(w, templateFetchErrorStatus(err), err.Error())
-		return true
-	}
-
 	limit := p.maxLines
 	if v := r.FormValue("limit"); v != "" {
 		if n, convErr := strconv.Atoi(sanitizeLimit(v)); convErr == nil && n > 0 {
 			limit = n
 		}
 	}
+	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false, !backward, limit)
+	if err != nil {
+		p.writeError(w, templateFetchErrorStatus(err), err.Error())
+		return true
+	}
+
 	sort.SliceStable(entries, func(i, j int) bool {
 		// Equal timestamps are NOT ordered here: SliceStable already preserves
 		// their input order, and returning i<j makes the comparator inconsistent
@@ -459,6 +514,10 @@ func templateFetchErrorStatus(err error) int {
 	if errors.As(err, &overBudget) {
 		return http.StatusBadRequest
 	}
+	var overCap *maxSeriesError
+	if errors.As(err, &overCap) {
+		return http.StatusBadRequest
+	}
 	var rejected *templatePushdownRejectedError
 	if errors.As(err, &rejected) && rejected.status > 0 {
 		return rejected.status
@@ -481,7 +540,7 @@ func (p *Proxy) collectTemplatePipelineSamples(
 	field, unwrapConv string,
 	start, end time.Time,
 ) (map[string]manualSeriesSamples, error) {
-	entries, err := p.fetchTemplatePipelineEntries(ctx, plan, start, end, true, false)
+	entries, err := p.fetchTemplatePipelineEntries(ctx, plan, start, end, true, false, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -494,6 +553,11 @@ func (p *Proxy) collectTemplatePipelineSamples(
 			continue
 		}
 		metric := templateMetricLabels(e.labels, spec)
+		if len(spec.GroupBy) == 0 && !spec.ByExplicit {
+			// A bare range aggregation keeps every label the pipeline produced —
+			// except the unwrapped one, which Loki removes from the identity.
+			delete(metric, field)
+		}
 		key := canonicalLabelsKey(metric)
 		current := seriesMap[key]
 		if current.Metric == nil {
@@ -661,6 +725,9 @@ func (p *Proxy) templateMetricRangeBody(r *http.Request, mp *templateMetricPlan)
 		startTS.Add(-mp.origSpec.Window), endTS)
 	if err != nil {
 		return nil, err
+	}
+	if capErr := p.seriesCapError(len(series), "template_range_metric"); capErr != nil {
+		return nil, capErr
 	}
 	// The template pipeline yields RAW log entries.
 	body := buildManualRangeMetricMatrix(mp.manualFunc, mp.quantile, series,

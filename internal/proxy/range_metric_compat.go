@@ -790,13 +790,19 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 			// Fall through on error — coalescer failure is non-fatal.
 		}
 	}
-	if series, ok := p.collectStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); ok {
+	if series, ok, capErr := p.collectStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); capErr != nil {
+		p.writeError(w, statusForRangeMetricCollectError(capErr), capErr.Error())
+		return true
+	} else if ok {
 		result := buildHitsRangeMetricMatrix(manualFunc, series, startTS, endTS, step, origSpec.Window)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(result) // nosemgrep
 		return true
 	}
-	if series, ok := p.collectParserStageStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); ok {
+	if series, ok, capErr := p.collectParserStageStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); capErr != nil {
+		p.writeError(w, statusForRangeMetricCollectError(capErr), capErr.Error())
+		return true
+	} else if ok {
 		result := buildHitsRangeMetricMatrix(manualFunc, series, startTS, endTS, step, origSpec.Window)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(result) // nosemgrep
@@ -812,6 +818,10 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 
+	if capErr := p.seriesCapError(len(series), "manual_range_metric"); capErr != nil {
+		p.writeError(w, statusForRangeMetricCollectError(capErr), capErr.Error())
+		return true
+	}
 	// collectRangeMetricSamples returns RAW log entries.
 	result := buildManualRangeMetricMatrix(manualFunc, quantile, series, startTS, endTS, step, origSpec.Window, p.resolvedMaxStatsQuerySeries(), false)
 	if spec.OuterAggAcrossSeries != "" {
@@ -859,23 +869,36 @@ func (p *Proxy) proxyManualRangeMetricInstant(w http.ResponseWriter, r *http.Req
 // collectStatsFastPathHits handles count_over_time / rate / bytes_* queries that have no
 // parser stages and an explicit groupBy — served from VL's stats_query_range endpoint.
 // Returns nil, false when the fast path is not applicable or VL returns an error.
-func (p *Proxy) collectStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool) {
+func (p *Proxy) collectStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool, error) {
 	if statsAggFunc == "" || spec.UserParserStages {
-		return nil, false
+		return nil, false, nil
 	}
 	for _, g := range spec.GroupBy {
 		if g == "_stream" {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	if len(spec.GroupBy) == 0 && !spec.ByExplicit {
-		return nil, false
+		return nil, false, nil
 	}
 	series, err := p.collectRangeMetricHits(ctx, spec.BaseQuery, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, statsAggFunc, windowStart, end, step)
 	if err != nil {
-		return nil, false
+		return nil, false, seriesCapOnly(err)
 	}
-	return series, true
+	return series, true, nil
+}
+
+// seriesCapOnly keeps a series-cap refusal and drops every other error: the
+// stats fast paths are optimisations whose other failures fall back to the raw
+// scan, but a query over the cap must not be retried as a raw scan of every
+// row — that scan is the OOM shape the cap exists to prevent, and it would
+// end in the same refusal.
+func seriesCapOnly(err error) error {
+	var overCap *maxSeriesError
+	if errors.As(err, &overCap) {
+		return overCap
+	}
+	return nil
 }
 
 // collectParserStageStatsFastPathHits handles parser-stage GroupBy count queries
@@ -884,27 +907,30 @@ func (p *Proxy) collectStatsFastPathHits(ctx context.Context, spec statsCompatSp
 // Safe only when all remaining filters after stripping are field-existence checks.
 // Returns nil, false when inapplicable, on error, or when VL returns 0 series
 // (non-indexed JSON fields still need parser stages to evaluate correctly).
-func (p *Proxy) collectParserStageStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool) {
+func (p *Proxy) collectParserStageStatsFastPathHits(ctx context.Context, spec statsCompatSpec, statsAggFunc string, windowStart, end time.Time, step time.Duration) (map[string]manualSeriesSamples, bool, error) {
 	if statsAggFunc == "" || !spec.UserParserStages || len(spec.GroupBy) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	if !strings.Contains(spec.BaseQuery, "| delete __error__") {
-		return nil, false
+		return nil, false, nil
 	}
 	for _, g := range spec.GroupBy {
 		if g == "_stream" {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	strippedBase := strings.TrimSpace(drilldownParserPipeRE.ReplaceAllString(spec.BaseQuery, ""))
 	if strippedBase == spec.BaseQuery || !allFiltersAreExistenceChecks(strippedBase) {
-		return nil, false
+		return nil, false, nil
 	}
 	series, err := p.collectRangeMetricHits(ctx, strippedBase, spec.GroupBy, spec.OrigGroupBy, spec.ByExplicit, statsAggFunc, windowStart, end, step)
-	if err != nil || len(series) == 0 {
-		return nil, false
+	if err != nil {
+		return nil, false, seriesCapOnly(err)
 	}
-	return series, true
+	if len(series) == 0 {
+		return nil, false, nil
+	}
+	return series, true, nil
 }
 
 func (p *Proxy) resolveManualMetricField(spec statsCompatSpec, origSpec originalRangeMetricSpec, manualFunc string) (string, float64, error) {
@@ -1045,7 +1071,10 @@ func (p *Proxy) collectRangeMetricHits(
 	// [[drilldown-high-card-fields-known-limit]] for the deep investigation.
 	// Keep the busiest maxSeries by total count (not the alphabetically-first
 	// maxSeries VL returns) so the chart shows signal, not the noise floor.
-	results = p.capStatsSeriesReported(results, "range_metric_hits")
+	results, err = p.capStatsSeriesReported(results, "range_metric_hits")
+	if err != nil {
+		return nil, err
+	}
 	seriesMap := make(map[string]manualSeriesSamples, len(results))
 	for _, res := range results {
 		metricObj := res.GetObject("metric")
@@ -1130,6 +1159,10 @@ func statusForRangeMetricCollectError(err error) int {
 	}
 	var tooManySeries *manualScanSeriesError
 	if errors.As(err, &tooManySeries) {
+		return http.StatusBadRequest
+	}
+	var overCap *maxSeriesError
+	if errors.As(err, &overCap) {
 		return http.StatusBadRequest
 	}
 	return http.StatusBadGateway
@@ -1699,25 +1732,44 @@ func (p *Proxy) resolvedMaxStatsQuerySeries() int {
 	return 500
 }
 
-// capStatsSeriesReported applies the series cap and SAYS SO. The cap itself is
-// deliberate — an unbounded by() over a churning field returns tens of thousands
-// of single-point series Drilldown cannot render — but until now it was applied
-// silently, so a whole-cluster query answering 500 of its 5091 series was
-// indistinguishable from a cluster that has 500. The count and the cap are
-// logged at WARN with the surface that hit it, and `-max-stats-query-series`
-// raises it per deployment.
-func (p *Proxy) capStatsSeriesReported(results []*fj.Value, surface string) []*fj.Value {
+// maxSeriesError is Loki's own answer to a query producing more series than
+// `max_query_series` allows — the message is Loki's verbatim, and it travels
+// as a 400. A capped result was served as a complete one until round 11: a
+// whole-cluster `count_over_time` answering 500 of its 5091 series, HTTP 200,
+// empty `warnings`, nothing in the log — indistinguishable from a cluster that
+// has 500 series.
+type maxSeriesError struct{ limit, matched int }
+
+func (e *maxSeriesError) Error() string {
+	return fmt.Sprintf("maximum of series (%d) reached for a single query", e.limit)
+}
+
+// seriesCapError refuses a result of `matched` series when it exceeds the cap
+// (`-max-stats-query-series`, default 500 = Loki's stock max_query_series),
+// logging the surface that hit it. nil when the result fits.
+func (p *Proxy) seriesCapError(matched int, surface string) error {
 	maxSeries := p.resolvedMaxStatsQuerySeries()
-	capped := capStatsResultsByTotalCount(results, maxSeries)
-	if len(capped) < len(results) && p != nil && p.log != nil {
-		p.log.Warn("stats series truncated",
+	if matched <= maxSeries {
+		return nil
+	}
+	if p != nil && p.log != nil {
+		p.log.Warn("stats series cap exceeded",
 			"surface", surface,
-			"returned", len(capped),
-			"matched", len(results),
+			"matched", matched,
 			"limit", maxSeries,
 			"flag", "-max-stats-query-series")
 	}
-	return capped
+	return &maxSeriesError{limit: maxSeries, matched: matched}
+}
+
+// capStatsSeriesReported refuses a stats result over the series cap instead
+// of trimming it: the trimmed result is the busiest N series, which Drilldown
+// wants, but a dashboard panel reads it as the whole population.
+func (p *Proxy) capStatsSeriesReported(results []*fj.Value, surface string) ([]*fj.Value, error) {
+	if err := p.seriesCapError(len(results), surface); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
 // capStatsResultsByTotalCount keeps only the maxSeries VL stats results with the
@@ -2179,36 +2231,53 @@ func rateCounterWindow(values []float64, windowSeconds float64) float64 {
 // per-series p95s, and pooling returns the p95 of everything, which is lower
 // (measured on the T5 panel: 1488.7 pooled vs 1720 in Loki, −13.4%).
 func outerAggregationOverSeries(originalLogql, manualFunc string) (agg string, by []string, ok bool) {
-	switch manualFunc {
-	case "quantile", "min", "max", "avg", "stddev", "stdvar", "first", "last":
-	default:
-		// count/rate/bytes are ADDITIVE: pooling every row into one series is the
-		// same number the outer sum would produce, and it is the cheaper path.
-		return "", nil, false
-	}
-	trimmed := stripOuterLabelReplace(strings.TrimSpace(originalLogql))
-	loc := outerAggregationRE.FindStringIndex(trimmed)
-	if loc == nil || loc[0] != 0 || loc[1] >= len(trimmed) {
-		return "", nil, false
-	}
-	// outerAggregationRE matches a bare keyword, and every one of them is also
-	// the prefix of a RANGE aggregation: `min_over_time(...)` starts with `min`,
-	// `count_over_time(...)` with `count`. Only a `(` (after an optional
-	// by/without clause) makes it the outer operator.
-	if !strings.HasPrefix(strings.TrimSpace(trimmed[loc[1]:]), "(") {
-		return "", nil, false
-	}
-	name := strings.TrimSpace(trimmed[loc[0]:loc[1]])
-	if i := strings.IndexAny(name, "( \t"); i > 0 {
-		name = name[:i]
-	}
+	name := outerAggregationName(originalLogql)
 	switch name {
 	case "sum", "min", "max", "avg", "count":
 	default:
 		// topk/bottomk/sort/stddev keep their existing post-processing.
 		return "", nil, false
 	}
+	if name == "sum" && isAdditiveManualFunc(manualFunc) {
+		// count/rate/bytes are ADDITIVE: pooling every row into one series is the
+		// same number the outer sum would produce, and it is the cheaper path.
+		// Any OTHER outer aggregation over them (max(rate(...))) is a reduction
+		// across the per-series values and takes the decomposition below.
+		return "", nil, false
+	}
 	return name, parseOriginalByLabels(originalLogql), true
+}
+
+// isAdditiveManualFunc reports whether the range aggregation sums per-row
+// contributions, so pooling rows across series is exact.
+func isAdditiveManualFunc(manualFunc string) bool {
+	switch manualFunc {
+	case "rate", "count_over_time", "bytes_over_time", "bytes_rate", "count", "bytes":
+		return true
+	}
+	return false
+}
+
+// outerAggregationName returns the bare outer vector aggregation keyword of
+// the LogQL (`sum`, `max`, `topk`, …) or "" when there is none.
+func outerAggregationName(originalLogql string) string {
+	trimmed := stripOuterLabelReplace(strings.TrimSpace(originalLogql))
+	loc := outerAggregationRE.FindStringIndex(trimmed)
+	if loc == nil || loc[0] != 0 || loc[1] >= len(trimmed) {
+		return ""
+	}
+	// outerAggregationRE matches a bare keyword, and every one of them is also
+	// the prefix of a RANGE aggregation: `min_over_time(...)` starts with `min`,
+	// `count_over_time(...)` with `count`. Only a `(` (after an optional
+	// by/without clause) makes it the outer operator.
+	if !strings.HasPrefix(strings.TrimSpace(trimmed[loc[1]:]), "(") {
+		return ""
+	}
+	name := strings.TrimSpace(trimmed[loc[0]:loc[1]])
+	if i := strings.IndexAny(name, "( \t"); i > 0 {
+		name = name[:i]
+	}
+	return name
 }
 
 // applyLokiSeriesDecomposition makes the manual path evaluate the range
@@ -2221,8 +2290,14 @@ func applyLokiSeriesDecomposition(spec *statsCompatSpec, originalLogql, manualFu
 	agg, by, ok := outerAggregationOverSeries(originalLogql, manualFunc)
 	if !ok {
 		// A bare outer aggregation without by() collapses all streams into one
-		// empty-label series in Loki, and pooling gets there directly.
-		if len(spec.GroupBy) == 0 && !spec.ByExplicit && hasOuterAggregationWithoutBy(originalLogql) {
+		// empty-label series in Loki, and pooling gets there directly. The
+		// grouping on the translated LogsQL is then the translator's default
+		// inner grouping (`_stream, level`), not anything the user asked for —
+		// keeping it made `sum(rate({ns}[4h30m]))` answer seven per-pod series
+		// with full labels instead of `{}` (round 11).
+		if !spec.ByExplicit && hasOuterAggregationWithoutBy(originalLogql) &&
+			(len(spec.GroupBy) == 0 || (outerAggregationName(originalLogql) == "sum" && isAdditiveManualFunc(manualFunc))) {
+			spec.GroupBy, spec.OrigGroupBy = nil, nil
 			spec.ByExplicit = true
 		}
 		return
