@@ -769,6 +769,15 @@ func (p *Proxy) templateMetricInstantBody(r *http.Request, mp *templateMetricPla
 	if err != nil {
 		return nil, err
 	}
+	// Same cap as the range body: buildManualRangeMetricVector trims nothing by
+	// itself, so an instant template metric over the cap was the one path that
+	// still answered every series.
+	if capErr := p.seriesCapError(len(series), "template_instant_metric"); capErr != nil && !isGrafanaDrilldownRequest(r) {
+		return nil, capErr
+	} else if capErr != nil {
+		mp.partialWarning = capErr.Error()
+		series = capSeriesByTotalCount(series, p.resolvedMaxStatsQuerySeries())
+	}
 	// The template pipeline yields RAW log entries.
 	body := buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window, false)
 	if mp.spec.OuterAggAcrossSeries != "" {

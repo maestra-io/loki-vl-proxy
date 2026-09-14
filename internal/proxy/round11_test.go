@@ -409,3 +409,40 @@ func TestTemplateLogPath_MsgFieldAliasReachesLineFormat(t *testing.T) {
 		t.Fatalf("line_format did not see .message: %s", rec.Body.String())
 	}
 }
+
+// CodeRabbit on PR 22: the INSTANT template metric path answered every series
+// while the range path applied the cap.
+func TestSeriesCap_InstantTemplateMetric(t *testing.T) {
+	vl, _ := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		for i := 0; i < 501; i++ {
+			fmt.Fprintf(w, `{"_time":"2023-11-14T22:13:%02dZ","_msg":"{\"x\":\"v%d\"}","_stream":"{app=\"a\"}","app":"a"}`+"\n", i%60, i)
+		}
+	})
+	query := url.QueryEscape(`sum by (x) (count_over_time({app="a"} | json | line_format "{{.x}}" [1h]))`)
+	target := "/loki/api/v1/query?query=" + query + "&time=1700000100"
+
+	p := newGapTestProxy(t, vl.URL)
+	rec := httptest.NewRecorder()
+	p.handleQuery(rec, httptest.NewRequest(http.MethodGet, target, nil))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "maximum of series (500)") {
+		t.Fatalf("501 series over a cap of 500 must be Loki's 400, got %d: %.200s", rec.Code, rec.Body.String())
+	}
+
+	p = newGapTestProxy(t, vl.URL)
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("X-Query-Tags", "Source=grafana-lokiexplore-app")
+	rec = httptest.NewRecorder()
+	p.handleQuery(rec, req)
+	if rec.Code != http.StatusOK || countLokiMatrixSeries(rec.Body.Bytes()) != 500 || !strings.Contains(rec.Header().Get("Warning"), "maximum of series") {
+		t.Fatalf("drilldown: want 200, 500 series and a Warning, got %d (%d series, Warning=%q)", rec.Code, countLokiMatrixSeries(rec.Body.Bytes()), rec.Header().Get("Warning"))
+	}
+
+	p = newGapTestProxy(t, vl.URL)
+	p.maxStatsQuerySeries = 1000
+	rec = httptest.NewRecorder()
+	p.handleQuery(rec, httptest.NewRequest(http.MethodGet, target, nil))
+	if rec.Code != http.StatusOK || countLokiMatrixSeries(rec.Body.Bytes()) != 501 {
+		t.Fatalf("with the cap raised all 501 series must come back, got %d (%d series)", rec.Code, countLokiMatrixSeries(rec.Body.Bytes()))
+	}
+}
