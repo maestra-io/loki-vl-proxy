@@ -68,6 +68,34 @@ type MappingOptions struct {
 	// `detected_level` is Loki's inferred label; `level` is a stored one, and
 	// filling it in from the message invented series the store does not have.
 	InferLevelFromText bool
+
+	// afterParser is set on the per-stage copy the pipeline loop hands out once
+	// a parser stage (`| json`, `| logfmt`, …) precedes the stage: the label
+	// filters that follow name PARSED fields, whose Loki spelling flattens
+	// nested keys with `_` where VictoriaLogs uses `.`.
+	afterParser bool
+}
+
+// forStage returns the options for one pipeline stage. The receiver is shared
+// by every stage of the query, so the per-stage bit lives on a copy.
+func (m *MappingOptions) forStage(afterParser bool) *MappingOptions {
+	if !afterParser || m == nil {
+		return m
+	}
+	c := *m
+	c.afterParser = true
+	return &c
+}
+
+// dottedAliasRE matches the names the dotted alias applies to: plain
+// identifier segments joined by single underscores. `__error__`, `_msg` and
+// `a__b` are not nested-key flattenings.
+var dottedAliasRE = regexp.MustCompile(`^[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+$`)
+
+// wantsDottedAlias reports whether a label filter on label, after a parser
+// stage, should also read the dotted VictoriaLogs spelling.
+func (m *MappingOptions) wantsDottedAlias(label string) bool {
+	return m != nil && m.afterParser && dottedAliasRE.MatchString(label)
 }
 
 func (m *MappingOptions) expand(lokiLabel string) []string {
@@ -688,6 +716,50 @@ func (m *MappingOptions) isMsgFieldAlias(label string) bool {
 // msgAliasFieldFilter builds the filter for a label the collector may have
 // moved into _msg: the field when it is present, `_msg` when it is not. The
 // negated operators are the negation of that expression.
+// aliasedFieldFilter builds the filter for a label that may live under
+// another name in VictoriaLogs: a msg-field alias reads `_msg` when the field
+// is absent; after a parser an UNMAPPED underscore name is also read under the
+// dotted spelling — Loki's `| json` flattens nested keys with `_`, unpack_json
+// with `.` (round 12: `ExceptionDetails_StackTrace` is
+// `ExceptionDetails.StackTrace` in VictoriaLogs; 53 dashboard filters use the
+// Loki spelling). ponytail: the all-dots form only; a nested key that itself
+// carries an underscore is not disambiguated.
+func (m *MappingOptions) aliasedFieldFilter(label, origLabel string, op logsql.FieldOp, value string, negate bool) (string, bool) {
+	if value != "" && m.isMsgFieldAlias(label) {
+		return msgAliasFieldFilter(label, op, value, negate), true
+	}
+	if label != origLabel || !m.wantsDottedAlias(label) {
+		return "", false
+	}
+	dotted := `"` + strings.ReplaceAll(label, "_", ".") + `"`
+	if value != "" {
+		return dottedAliasFieldFilter(label, dotted, op, value, negate), true
+	}
+	if op != logsql.FieldOpExact {
+		return "", false
+	}
+	// `x!=""` is "present and non-empty" under either spelling; `x=""` is
+	// "absent or empty" under BOTH (VictoriaLogs' `x:=""` matches an absent
+	// field, measured on v1.52.0).
+	if negate {
+		return "(" + label + `:!"" OR ` + dotted + `:!"")`, true
+	}
+	return "(" + label + `:="" AND ` + dotted + `:="")`, true
+}
+
+// dottedAliasFieldFilter reads a parsed field under both its Loki spelling
+// (`a_b`, as `| json` flattens nested keys) and its VictoriaLogs spelling
+// (`"a.b"`, as unpack_json does). The negated operators negate the whole
+// disjunction, as the msg alias does.
+func dottedAliasFieldFilter(field, dotted string, op logsql.FieldOp, value string, negate bool) string {
+	positive := "(" + buildFieldFilterStr(field, op, value, false) +
+		" OR " + buildFieldFilterStr(dotted, op, value, false) + ")"
+	if negate {
+		return "NOT " + positive
+	}
+	return positive
+}
+
 func msgAliasFieldFilter(field string, op logsql.FieldOp, value string, negate bool) string {
 	positive := "(" + buildFieldFilterStr(field, op, value, false) +
 		" OR (-" + field + ":* AND " + buildFieldFilterStr("_msg", op, value, false) + "))"

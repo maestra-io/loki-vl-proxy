@@ -1452,7 +1452,7 @@ func (p *Proxy) buildParsedGroupByCacheKey(streamStr, levelStr string, v *fj.Val
 		if isVLInternalField(key) || key == "_stream_id" || key == "_stream" {
 			continue
 		}
-		fv := v.Get(key)
+		fv := parsedGroupByFieldFJ(v, key)
 		if fv == nil {
 			continue
 		}
@@ -1547,7 +1547,7 @@ func addGroupByParsedLabelsFJ(metricLabels map[string]string, v *fj.Value, group
 		if _, exists := metricLabels[outKey]; exists {
 			continue
 		}
-		fv := v.Get(key)
+		fv := parsedGroupByFieldFJ(v, key)
 		if fv == nil {
 			continue
 		}
@@ -1560,6 +1560,20 @@ func addGroupByParsedLabelsFJ(metricLabels map[string]string, v *fj.Value, group
 			metricLabels[outKey] = value
 		}
 	}
+}
+
+// parsedGroupByFieldFJ reads a by() field off a VL row. A nested JSON key is
+// `a_b` to Loki's `| json` and `a.b` to unpack_json, so an underscore name the
+// row lacks is retried under its dotted spelling (round 12, the manual path's
+// half of `sum by (ExceptionDetails_Topic)`).
+func parsedGroupByFieldFJ(v *fj.Value, key string) *fj.Value {
+	if fv := v.Get(key); fv != nil {
+		return fv
+	}
+	if dottedAliasRE.MatchString(key) {
+		return v.Get(strings.ReplaceAll(key, "_", "."))
+	}
+	return nil
 }
 
 // logqlUsesParserStage reports whether the CLIENT's LogQL carries a parser

@@ -2420,10 +2420,10 @@ func (p *Proxy) translateStatsResponseLabelsWithContext(ctx context.Context, bod
 				delete(syntheticLabels, "detected_level")
 				delete(translated, "detected_level")
 			}
-			// A level grouping dimension VL could not fill comes back as "".
+			// A grouping dimension VL could not fill comes back as "".
 			// Loki emits no label at all in that case.
-			dropEmptyDerivedLevelLabels(syntheticLabels)
-			dropEmptyDerivedLevelLabels(translated)
+			dropEmptyLabels(syntheticLabels)
+			dropEmptyLabels(translated)
 			// Only synthesize service_name for raw stream metrics (hadStream=true).
 			// For aggregated results like "sum by (container)", the metric should only
 			// contain the by() labels — adding service_name derived from container would

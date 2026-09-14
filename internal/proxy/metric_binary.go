@@ -2232,6 +2232,16 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	if !ok || spec.Func != "count" || len(spec.GroupBy) != 1 || isRateMathPipeline(logsqlQuery) {
 		return nil
 	}
+	// Same scope as the windowed-/hits path above: this is a top-N SELECTION
+	// (Phase 1 keeps maxDrilldownPhase2Values field values), right for a
+	// Drilldown page and for a Grafana panel on a *_id field, wrong for an
+	// exact aggregation. Round 12: a whole-cluster `sum by (pod)
+	// (count_over_time({namespace=~".+"}[1h]))` from a plain client answered
+	// 183 of Loki's 939 pods, HTTP 200, no warning — the direct path serves
+	// every series up to `-max-stats-query-series` and refuses honestly past it.
+	if !isGrafanaDrilldownRequest(r) && (!isGrafanaSourcedRequest(r) || !isLikelyHighCardinalityField(spec.GroupBy[0])) {
+		return nil
+	}
 	start := freezeRelativeRangeBound(r.FormValue("start"))
 	end := freezeRelativeRangeBound(r.FormValue("end"))
 	startNs, ok1 := parseLokiTimeToUnixNano(start)
@@ -2524,6 +2534,13 @@ func (p *Proxy) addUnderscorefallbackByLabels(logsqlQuery string, origGroupBy []
 			strings.ReplaceAll(vlLabel, ".", "_") == orig {
 			extras = append(extras, orig)
 		}
+		// The reverse case for a PARSED field: Loki's `| json` spells a nested
+		// key `a_b`, unpack_json spells it `a.b`; an unmapped underscore name
+		// after a parser groups by both, and the response coalesces them
+		// (ToLoki sanitises the dot back to the underscore).
+		if vlLabel == orig && afterParserQuery(logsqlQuery) && dottedAliasRE.MatchString(orig) {
+			extras = append(extras, quoteLogsQLIdent(strings.ReplaceAll(orig, "_", ".")))
+		}
 	}
 	if len(extras) == 0 {
 		return logsqlQuery
@@ -2538,6 +2555,16 @@ func (p *Proxy) addUnderscorefallbackByLabels(logsqlQuery string, origGroupBy []
 	}
 	insertAt := byIdx + closeIdx
 	return logsqlQuery[:insertAt] + ", " + strings.Join(extras, ", ") + logsqlQuery[insertAt:]
+}
+
+// dottedAliasRE matches the names the dotted alias applies to (the
+// translator's rule): identifier segments joined by single underscores.
+var dottedAliasRE = regexp.MustCompile(`^[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+$`)
+
+// afterParserQuery reports whether the translated query carries a parser stage,
+// i.e. whether its grouping labels may name parsed (dotted) fields.
+func afterParserQuery(logsqlQuery string) bool {
+	return strings.Contains(logsqlQuery, "| unpack_json") || strings.Contains(logsqlQuery, "| unpack_logfmt")
 }
 
 // allRangeWindowsEqual returns (window, true) when every range vector in logql
@@ -3052,6 +3079,7 @@ func writeFilteredStatsQRSeriesFJ(buf *bytes.Buffer, seriesArr []*fj.Value, keep
 type trimTranslateResult struct {
 	metric   map[string]string // nil = metric unchanged
 	valsTrim bool              // at least one values point filtered by keep
+	drop     bool              // every values point filtered by keep: no series
 }
 
 // trimAndTranslateStatsQRFJ performs time-window filtering and metric-label
@@ -3127,18 +3155,28 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 		for ii, item := range slot.items {
 			res := &slotResults[si][ii]
 
-			// Pass 1: check whether any values points fall outside keep.
+			// Pass 1: check whether any values points fall outside keep. A
+			// series whose EVERY point is outside (VictoriaLogs also returns the
+			// bucket starting AT `end`, which relabels to one step past it) is
+			// dropped whole: Loki has no such series, and `"values":[]` is a
+			// phantom key (round 12: 44 of 183, 287 of 1234).
 			if keep != nil {
 				if values := item.Get("values"); values != nil {
 					pts, _ := values.Array()
+					kept := 0
 					for _, pt := range pts {
 						ptArr, _ := pt.Array()
-						if len(ptArr) > 0 && !keep(statsQRFJPointNano(ptArr[0])) {
+						if len(ptArr) == 0 {
+							continue
+						}
+						if keep(statsQRFJPointNano(ptArr[0])) {
+							kept++
+						} else {
 							res.valsTrim = true
 							needsRebuild = true
-							break
 						}
 					}
+					res.drop = res.valsTrim && kept == 0
 				}
 			}
 
@@ -3208,8 +3246,8 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 				delete(syntheticLabels, "detected_level")
 				delete(translated, "detected_level")
 			}
-			dropEmptyDerivedLevelLabels(syntheticLabels)
-			dropEmptyDerivedLevelLabels(translated)
+			dropEmptyLabels(syntheticLabels)
+			dropEmptyLabels(translated)
 			if hadStream {
 				ensureSyntheticServiceName(syntheticLabels)
 				if !serviceSignal && strings.TrimSpace(syntheticLabels["service_name"]) == unknownServiceName {
@@ -3326,11 +3364,16 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 // in a single write pass.
 func writeTrimmedTranslatedStatsFJ(buf *bytes.Buffer, items []*fj.Value, results []trimTranslateResult, keep func(int64) bool, scratch *[]byte) {
 	buf.WriteByte('[')
+	first := true
 	for i, item := range items {
-		if i > 0 {
+		res := results[i]
+		if res.drop {
+			continue
+		}
+		if !first {
 			buf.WriteByte(',')
 		}
-		res := results[i]
+		first = false
 		if res.metric != nil || res.valsTrim {
 			buf.WriteString(`{"metric":`)
 			if res.metric != nil {
