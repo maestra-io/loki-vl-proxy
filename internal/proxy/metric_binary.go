@@ -394,6 +394,7 @@ func isLikelyHighCardinalityField(name string) bool {
 	// Suffix patterns — anything ending in _id/.id/_uuid/_token/_hash/_key is
 	// likely to carry a unique-per-request value.
 	return strings.HasSuffix(lower, "_id") ||
+		strings.HasSuffix(lower, "_uid") ||
 		strings.HasSuffix(lower, ".id") ||
 		strings.HasSuffix(lower, "_uuid") ||
 		strings.HasSuffix(lower, ".uuid") ||
@@ -2562,9 +2563,30 @@ func (p *Proxy) addUnderscorefallbackByLabels(logsqlQuery string, origGroupBy []
 var dottedAliasRE = regexp.MustCompile(`^[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+$`)
 
 // afterParserQuery reports whether the translated query carries a parser stage,
-// i.e. whether its grouping labels may name parsed (dotted) fields.
+// i.e. whether its grouping labels may name parsed (dotted) fields. Only a
+// stage outside quotes counts: a literal filter for the text `| unpack_json`
+// is not a parser.
 func afterParserQuery(logsqlQuery string) bool {
-	return strings.Contains(logsqlQuery, "| unpack_json") || strings.Contains(logsqlQuery, "| unpack_logfmt")
+	inQuote := byte(0)
+	for i := 0; i < len(logsqlQuery); i++ {
+		ch := logsqlQuery[i]
+		switch {
+		case inQuote != 0:
+			if ch == '\\' && inQuote == '"' {
+				i++
+			} else if ch == inQuote {
+				inQuote = 0
+			}
+		case ch == '"' || ch == '`':
+			inQuote = ch
+		case ch == '|':
+			rest := logsqlQuery[i:]
+			if strings.HasPrefix(rest, "| unpack_json") || strings.HasPrefix(rest, "| unpack_logfmt") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // allRangeWindowsEqual returns (window, true) when every range vector in logql

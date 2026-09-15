@@ -380,6 +380,11 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 		for field := range bucket {
 			candidate = field
 		}
+		// A chain learned earlier is stale once one field owns the alias:
+		// ToVLFields reads learnedChains first.
+		if _, chained := lt.learnedChains[alias]; chained {
+			lt.forgetLearnedAlias(alias)
+		}
 		if existing, ok := lt.learnedLokiToVL[alias]; ok && existing != candidate {
 			lt.learnedAmbiguous[alias] = struct{}{}
 			lt.forgetLearnedAlias(alias)

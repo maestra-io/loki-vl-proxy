@@ -701,14 +701,15 @@ type patternMatcher struct {
 var patternCache compileCache[*patternMatcher]
 
 // compilePattern parses a Loki pattern expression. Loki rejects an expression
-// with no capture and one with two adjacent captures.
+// with no NAMED capture, one with two adjacent captures, and a duplicate name.
 func compilePattern(pat string) (*patternMatcher, error) {
 	if m, ok := patternCache.get(pat); ok {
 		return m, nil
 	}
 	var parts []patternPart
 	last := 0
-	captures := 0
+	named := 0
+	seen := map[string]struct{}{}
 	for _, loc := range patternCaptureRE.FindAllStringSubmatchIndex(pat, -1) {
 		if lit := pat[last:loc[0]]; lit != "" {
 			parts = append(parts, patternPart{literal: lit})
@@ -718,15 +719,20 @@ func compilePattern(pat string) (*patternMatcher, error) {
 		name := pat[loc[2]:loc[3]]
 		if name == "_" {
 			name = ""
+		} else {
+			if _, dup := seen[name]; dup {
+				return nil, fmt.Errorf("invalid pattern %q: duplicate capture name (%s)", pat, name)
+			}
+			seen[name] = struct{}{}
+			named++
 		}
 		parts = append(parts, patternPart{capture: name, isCap: true})
-		captures++
 		last = loc[1]
 	}
 	if lit := pat[last:]; lit != "" {
 		parts = append(parts, patternPart{literal: lit})
 	}
-	if captures == 0 {
+	if named == 0 {
 		return nil, fmt.Errorf("invalid pattern %q: at least one capture is required", pat)
 	}
 	m := &patternMatcher{parts: parts}

@@ -65,6 +65,18 @@ func (o *offsetShiftWriter) flush() {
 	_, _ = o.dst.Write(body)
 }
 
+// clientTimeCopy returns a copy of body with its sample timestamps in the
+// CLIENT's coordinates. An offset query is answered from a window moved back
+// by offset and the writer shifts it on flush; a cache hit is written before
+// that writer exists, so the cached copy has to be shifted already.
+func clientTimeCopy(body []byte, offset time.Duration) []byte {
+	out := append([]byte(nil), body...)
+	if offset != 0 {
+		out = shiftMetricTimestamps(out, offset)
+	}
+	return out
+}
+
 // shiftMetricTimestamps adds offset to every sample timestamp of a Loki
 // matrix or vector response. Anything else (streams, errors) passes through.
 func shiftMetricTimestamps(body []byte, offset time.Duration) []byte {

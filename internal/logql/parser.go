@@ -599,6 +599,11 @@ func (p *parser) parsePipeBody() (Stage, error) {
 	if p.cur.Typ == TokIdent {
 		return nil, fmt.Errorf("logql: parse error: unexpected identifier %q after %q in pipeline stage", p.cur.Val, kw)
 	}
+	// `| ip("…")`: a function call is the OPERAND of a line or label filter,
+	// never a stage of its own (Loki: "syntax error: unexpected IP").
+	if p.cur.Typ == TokLParen {
+		return nil, fmt.Errorf("logql: parse error: unexpected %s", kw)
+	}
 	raw := kw + p.consumeRestOfStage()
 	return &LabelFilterStage{Raw: raw}, nil
 }

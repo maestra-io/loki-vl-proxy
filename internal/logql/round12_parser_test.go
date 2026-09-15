@@ -38,3 +38,25 @@ func TestParse_ParenthesisedLabelFilterStage(t *testing.T) {
 		}
 	}
 }
+
+// `| ip("…")` is an OPERAND of a line or label filter, never a stage of its
+// own: Loki answers "syntax error: unexpected IP". Round 12 taught the stage
+// scanner to keep its own parentheses, which turned this into a silent 200.
+func TestParse_BareIPCallStageIsRejected(t *testing.T) {
+	for _, q := range []string{
+		`{app="api-gateway"} | json | ip("not-a-valid-cidr")`,
+		`{app="api-gateway"} | ip("10.0.0.0/8")`,
+	} {
+		if _, err := Parse(q); err == nil {
+			t.Errorf("%s: must not parse", q)
+		}
+	}
+	for _, q := range []string{
+		`{app="api-gateway"} | json | addr = ip("10.0.0.0/8")`,
+		`{app="api-gateway"} |= ip("10.0.0.0/8")`,
+	} {
+		if _, err := Parse(q); err != nil {
+			t.Errorf("%s: %v", q, err)
+		}
+	}
+}

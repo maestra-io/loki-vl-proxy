@@ -2209,6 +2209,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// so time-shifting is not applied — results may differ from Loki for offset
 	// values but the proxy returns 200 rather than incorrectly rejecting the query.
 	// Expressions with multiple *different* offsets still return 400 (same as Loki).
+	var responseOffset time.Duration
 	{
 		offsetDur, strippedQuery, offsetErr := extractLogQLOffset(logqlQuery)
 		if offsetErr != nil {
@@ -2241,6 +2242,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 				shifted := newOffsetShiftWriter(w, offsetDur)
 				w = shifted
 				defer shifted.flush()
+				responseOffset = offsetDur
 			}
 		}
 	}
@@ -2389,12 +2391,12 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(cacheOut)
 		}
 		if cacheable && sc.code == http.StatusOK {
-			p.setLocalReadCacheWithTTL(cacheKey, append([]byte(nil), cacheOut...), 5*time.Minute)
+			p.setLocalReadCacheWithTTL(cacheKey, clientTimeCopy(cacheOut, responseOffset), 5*time.Minute)
 		}
 	} else if cacheTap != nil {
 		if cacheable && sc.code == http.StatusOK {
 			if body := cacheTap.CapturedBody(); len(body) > 0 {
-				p.setLocalReadCacheWithTTL(cacheKey, append([]byte(nil), body...), 5*time.Minute)
+				p.setLocalReadCacheWithTTL(cacheKey, clientTimeCopy(body, responseOffset), 5*time.Minute)
 			}
 		}
 		cacheTap.Release()

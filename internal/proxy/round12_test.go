@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -312,6 +313,15 @@ func TestOffset_ReportsAtClientTimestamps(t *testing.T) {
 			t.Fatalf("offset point %d outside the client's [%d, %d]", offset[i], start, end)
 		}
 	}
+	// The local cache stores the CLIENT-time body: a hit is written before
+	// the shifting writer exists.
+	before := len(seen())
+	if again := timestamps(`sum(count_over_time({a="b"}[1h] offset 1h))`, start, end); !reflect.DeepEqual(again, offset) {
+		t.Fatalf("cached offset answer %v, first answer %v", again, offset)
+	}
+	if len(seen()) != before {
+		t.Fatalf("second offset query reached VL (%d calls), expected a cache hit", len(seen())-before)
+	}
 	shiftedWindow := false
 	for _, q := range seen() {
 		shiftedWindow = shiftedWindow || strings.Contains(q, "stats_query_range")
@@ -410,5 +420,23 @@ func TestLearnedChain_CollidingLeafAliasesCoalesce(t *testing.T) {
 		if !strings.Contains(logsql, want) {
 			t.Fatalf("LogsQL %q\nmust contain %s", logsql, want)
 		}
+	}
+}
+
+// A chain learned from one inventory is stale once a later inventory holds a
+// single field for the alias: ToVLFields reads learnedChains first.
+func TestLearnedChain_ForgottenWhenAliasBecomesSingleton(t *testing.T) {
+	lt := NewLabelTranslator(LabelStyleUnderscores, nil)
+	const alias = "airflow_spark_app_name"
+	lt.LearnFieldAliases([]string{"kubernetes.pod_labels.airflow.spark-app-name", "kubernetes.pod_labels.airflow_spark_app_name"})
+	if got := lt.ToVLFields(alias); len(got) != 2 {
+		t.Fatalf("chain not learned: %v", got)
+	}
+	lt.LearnFieldAliases([]string{"kubernetes.pod_labels.airflow_spark_app_name"})
+	if got := lt.ToVLFields(alias); got != nil {
+		t.Fatalf("stale chain survived the singleton inventory: %v", got)
+	}
+	if got := lt.ToVL(alias); got != "kubernetes.pod_labels.airflow_spark_app_name" {
+		t.Fatalf("ToVL = %q", got)
 	}
 }

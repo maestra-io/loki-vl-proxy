@@ -45,7 +45,7 @@ func TestPattern_LokiPartialMatchSemantics(t *testing.T) {
 			t.Errorf("pattern %q line %q: got %v want %v", tc.pattern, tc.line, got, tc.want)
 		}
 	}
-	for _, bad := range []string{"no captures", "<a><b>"} {
+	for _, bad := range []string{"no captures", "<a><b>", "<_> only", "<f> x <f>"} {
 		if _, err := compilePattern(bad); err == nil {
 			t.Errorf("%q must be rejected as Loki rejects it", bad)
 		}
