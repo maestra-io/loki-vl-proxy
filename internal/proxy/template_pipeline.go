@@ -49,6 +49,14 @@ type templatePlan struct {
 	// suffix of pure transforms yields one entry per raw row, so a log query's
 	// backend limit can be the request's own limit.
 	suffixDropsRows bool
+	// broadParser says a parser stage extracts EVERY key (`| json`, `| logfmt`,
+	// `| unpack` without a field list), so a bare range aggregation's series
+	// identity legitimately carries the row's body fields, as Loki's does.
+	broadParser bool
+	// extractedNames are the labels the pipeline's parsers extract BY NAME
+	// (`| json message="message"`), which Loki adds to the identity while the
+	// collector-unpacked siblings stay out of it.
+	extractedNames []string
 }
 
 // templatePlanFor builds a plan when logqlQuery's log pipeline contains a
@@ -70,6 +78,7 @@ func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templa
 	if err != nil {
 		return nil, err
 	}
+	pipeline.LineFilterFields = p.lineFilterFields
 
 	p.metrics.RecordTemplatePipelineQuery()
 
@@ -89,12 +98,35 @@ func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templa
 	if err != nil {
 		baseLogsQL = fallbackLogsQL
 	}
-	return &templatePlan{
+	plan := &templatePlan{
 		pipeline:        pipeline,
 		baseLogsQL:      baseLogsQL,
 		fallbackLogsQL:  fallbackLogsQL,
 		suffixDropsRows: pipelineSuffixDropsRows(lq.Pipeline),
-	}, nil
+	}
+	plan.broadParser, plan.extractedNames = pipelineParserShape(lq.Pipeline)
+	return plan, nil
+}
+
+// pipelineParserShape reports whether any parser stage extracts every key
+// (broad) and lists the labels the parsers name explicitly.
+func pipelineParserShape(stages []logqlpkg.Stage) (broad bool, names []string) {
+	for _, s := range stages {
+		st, ok := s.(*logqlpkg.ParserStage)
+		if !ok {
+			continue
+		}
+		switch st.Type {
+		case logqlpkg.ParserJSON, logqlpkg.ParserLogfmt, logqlpkg.ParserUnpack:
+			if len(st.Params) == 0 {
+				broad = true
+			}
+			for _, prm := range st.Params {
+				names = append(names, logqlpkg.SanitizeLabel(prm.Name))
+			}
+		}
+	}
+	return broad, names
 }
 
 // pipelineSuffixDropsRows reports whether a stage after the pushed-down
@@ -565,11 +597,14 @@ func (p *Proxy) collectTemplatePipelineSamples(
 		if !ok {
 			continue
 		}
-		metric := templateMetricLabels(e.labels, spec)
+		var metric map[string]string
 		if len(spec.GroupBy) == 0 && !spec.ByExplicit {
-			// A bare range aggregation keeps every label the pipeline produced —
-			// except the unwrapped one, which Loki removes from the identity.
+			// A bare range aggregation keeps the labels Loki's pipeline would
+			// have produced — minus the unwrapped one, which Loki removes.
+			metric = bareTemplateIdentity(e, plan)
 			delete(metric, field)
+		} else {
+			metric = templateMetricLabels(e.labels, spec)
 		}
 		key := canonicalLabelsKey(metric)
 		current := seriesMap[key]
@@ -584,6 +619,51 @@ func (p *Proxy) collectTemplatePipelineSamples(
 		seriesMap[key] = series
 	}
 	return seriesMap, nil
+}
+
+// bareTemplateIdentity is the series identity of a bare range aggregation
+// (no by/without): the stream labels, the level pair, and what the LogQL
+// pipeline itself produced — new or rewritten labels (regexp/pattern captures,
+// label_format) plus the fields a parser names explicitly. The row's OTHER
+// collector-unpacked fields are Loki's `| json` output only when the query
+// carries a broad parser; otherwise they are invisible to Loki and must not
+// key the series. Round 12, class C/G: `| json message="message" | … | drop
+// message | regexp … | unwrap duration_ms` kept `Message` (the whole line) on
+// every row, so each row was its own series, the per-series quantile was the
+// sample itself and `max(quantile_over_time(0.5, …))` returned the maximum
+// (p50 == p95 == 1485 against Loki's 1204.5 / 1470.25).
+func bareTemplateIdentity(e *templateEntry, plan *templatePlan) map[string]string {
+	if plan == nil || plan.broadParser {
+		out := make(map[string]string, len(e.labels))
+		for k, v := range e.labels {
+			if !strings.HasPrefix(k, "__") && v != "" {
+				out[k] = v
+			}
+		}
+		return out
+	}
+	out := make(map[string]string, len(e.stream)+len(e.parsed)+2)
+	for k, v := range e.stream {
+		if v != "" {
+			out[k] = v
+		}
+	}
+	for _, k := range []string{"level", "detected_level"} {
+		if v := e.labels[k]; v != "" {
+			out[k] = v
+		}
+	}
+	for k, v := range e.parsed {
+		if !strings.HasPrefix(k, "__") && v != "" {
+			out[k] = v
+		}
+	}
+	for _, k := range plan.extractedNames {
+		if v := e.labels[k]; v != "" {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // templateSampleValue mirrors extractManualSampleValueFJ over a post-pipeline entry.

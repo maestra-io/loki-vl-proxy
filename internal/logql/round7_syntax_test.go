@@ -64,10 +64,10 @@ func TestMatchLineFilter_OrList(t *testing.T) {
 		{"has beta here", true, false},
 		{"has neither", false, true},
 	} {
-		if got := matchLineFilter(contains, tc.line); got != tc.wantIn {
+		if got := matchLineFilter(contains, tc.line, nil); got != tc.wantIn {
 			t.Errorf("|= on %q = %v, want %v", tc.line, got, tc.wantIn)
 		}
-		if got := matchLineFilter(excludes, tc.line); got != tc.wantOut {
+		if got := matchLineFilter(excludes, tc.line, nil); got != tc.wantOut {
 			t.Errorf("!= on %q = %v, want %v", tc.line, got, tc.wantOut)
 		}
 	}

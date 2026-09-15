@@ -27,6 +27,13 @@ type Pipeline struct {
 	tmpls  map[any]*Template
 	buf    strings.Builder
 
+	// LineFilterFields names the labels a LINE filter reads besides the line
+	// itself — the proxy's -line-filter-fields, which the pushed-down LogsQL
+	// already honours. Without the same list here, a row VictoriaLogs matched in
+	// `Scopes` is dropped by the re-run of the filter on `_msg` alone. Names are
+	// VictoriaLogs spellings; a trailing `*` is a prefix wildcard.
+	LineFilterFields []string
+
 	// base is the label set the entry arrived with — its stream labels and
 	// structured metadata. LogQL gives those priority over anything a parser
 	// extracts: a `| json` that finds a `namespace` in the body does NOT
@@ -187,8 +194,13 @@ func NewPipeline(stages []Stage) (*Pipeline, error) {
 				return nil, err
 			}
 		case *ParserStage:
-			if st.Type == ParserRegexp || st.Type == ParserPattern {
+			switch st.Type {
+			case ParserRegexp:
 				if _, err := compileExtractor(st); err != nil {
+					return nil, err
+				}
+			case ParserPattern:
+				if _, err := compilePattern(st.Param); err != nil {
 					return nil, err
 				}
 			}
@@ -247,7 +259,7 @@ func (p *Pipeline) Process(e *Entry) bool {
 func (p *Pipeline) apply(s Stage, e *Entry) bool { //nolint:gocyclo // one branch per LogQL stage kind
 	switch st := s.(type) {
 	case *LineFilterStage:
-		return matchLineFilter(st, e.Line)
+		return matchLineFilter(st, e.Line, p.lineFilterTexts(e))
 
 	case *ParserStage:
 		p.applyParser(st, e)
@@ -335,7 +347,13 @@ func (p *Pipeline) applyParser(st *ParserStage, e *Entry) {
 		parseLogfmtInto(e, st.Params, p.parsed)
 	case ParserUnpack:
 		parseUnpackInto(e, p.parsed)
-	case ParserRegexp, ParserPattern:
+	case ParserPattern:
+		m, err := compilePattern(st.Param)
+		if err != nil {
+			return
+		}
+		m.match(e.Line, p.parsed)
+	case ParserRegexp:
 		re, err := compileExtractor(st)
 		if err != nil || re == nil {
 			return
@@ -642,16 +660,14 @@ func (c *compileCache[T]) put(key string, v T) {
 
 var extractorCache compileCache[*regexp.Regexp]
 
-// compileExtractor turns a regexp or pattern stage into a named-group regexp.
+// compileExtractor turns a regexp stage into a named-group regexp (a pattern
+// stage goes through compilePattern: Loki's pattern is not a regexp).
 func compileExtractor(st *ParserStage) (*regexp.Regexp, error) {
 	key := strconv.Itoa(int(st.Type)) + "\x00" + st.Param
 	if re, ok := extractorCache.get(key); ok {
 		return re, nil
 	}
 	src := st.Param
-	if st.Type == ParserPattern {
-		src = patternToRegexp(st.Param)
-	}
 	re, err := regexp.Compile(src)
 	if err != nil {
 		return nil, fmt.Errorf("invalid %s expression %q: %w", st.String(), st.Param, err)
@@ -662,23 +678,98 @@ func compileExtractor(st *ParserStage) (*regexp.Regexp, error) {
 
 var patternCaptureRE = regexp.MustCompile(`<([a-zA-Z_][a-zA-Z0-9_]*|_)>`)
 
-// patternToRegexp converts Loki's `| pattern "<ip> - <_> [<ts>]"` to a regexp.
-func patternToRegexp(pat string) string {
-	var b strings.Builder
+// patternPart is one element of a compiled `| pattern`: a literal, or a
+// capture (name "" for `<_>`).
+type patternPart struct {
+	literal string
+	capture string
+	isCap   bool
+}
+
+// patternMatcher reproduces Loki's pattern parser (pkg/logql/log/pattern),
+// which is NOT a regexp: it walks the expression left to right, each capture
+// runs up to the FIRST occurrence of the literal that follows it, and a
+// mismatch stops the walk KEEPING the captures filled so far — a capture whose
+// following literal is absent takes the rest of the line. Round 12, class E:
+// `Launch Task 'X' #81799` against `<task>;<_>;<project>;<_>` is
+// `task="Launch Task 'X' #81799"` and no `project` in Loki (15 series), while
+// the regexp conversion `^(?P<task>.*?);…$` matched nothing (2 series).
+type patternMatcher struct {
+	parts []patternPart
+}
+
+var patternCache compileCache[*patternMatcher]
+
+// compilePattern parses a Loki pattern expression. Loki rejects an expression
+// with no capture and one with two adjacent captures.
+func compilePattern(pat string) (*patternMatcher, error) {
+	if m, ok := patternCache.get(pat); ok {
+		return m, nil
+	}
+	var parts []patternPart
 	last := 0
+	captures := 0
 	for _, loc := range patternCaptureRE.FindAllStringSubmatchIndex(pat, -1) {
-		b.WriteString(regexp.QuoteMeta(pat[last:loc[0]]))
+		if lit := pat[last:loc[0]]; lit != "" {
+			parts = append(parts, patternPart{literal: lit})
+		} else if len(parts) > 0 && parts[len(parts)-1].isCap {
+			return nil, fmt.Errorf("invalid pattern %q: consecutive captures are not allowed", pat)
+		}
 		name := pat[loc[2]:loc[3]]
 		if name == "_" {
-			b.WriteString(`(?:.*?)`)
-		} else {
-			b.WriteString(`(?P<` + name + `>.*?)`)
+			name = ""
 		}
+		parts = append(parts, patternPart{capture: name, isCap: true})
+		captures++
 		last = loc[1]
 	}
-	b.WriteString(regexp.QuoteMeta(pat[last:]))
-	return "^" + b.String() + "$"
+	if lit := pat[last:]; lit != "" {
+		parts = append(parts, patternPart{literal: lit})
+	}
+	if captures == 0 {
+		return nil, fmt.Errorf("invalid pattern %q: at least one capture is required", pat)
+	}
+	m := &patternMatcher{parts: parts}
+	patternCache.put(pat, m)
+	return m, nil
 }
+
+// match fills out with the captures Loki's matcher would produce for in.
+func (m *patternMatcher) match(in string, out map[string]string) {
+	parts := m.parts
+	if len(parts) > 0 && !parts[0].isCap {
+		if !strings.HasPrefix(in, parts[0].literal) {
+			return
+		}
+		in = in[len(parts[0].literal):]
+		parts = parts[1:]
+	}
+	for len(parts) > 0 {
+		capt := parts[0]
+		if len(parts) == 1 {
+			if capt.capture != "" {
+				out[capt.capture] = in
+			}
+			return
+		}
+		lit := parts[1].literal
+		i := strings.Index(in, lit)
+		if i < 0 {
+			if capt.capture != "" {
+				out[capt.capture] = in
+			}
+			return
+		}
+		if capt.capture != "" {
+			out[capt.capture] = in[:i]
+		}
+		in = in[i+len(lit):]
+		parts = parts[2:]
+	}
+}
+
+// SanitizeLabel maps a field name to a Prometheus-legal label name, as Loki does.
+func SanitizeLabel(s string) string { return sanitizeLabel(s) }
 
 // sanitizeLabel maps a field name to a Prometheus-legal label name, as Loki does.
 func sanitizeLabel(s string) string {
@@ -713,13 +804,49 @@ func sanitizeLabel(s string) string {
 
 var lineFilterCache compileCache[*regexp.Regexp]
 
-func matchLineFilter(st *LineFilterStage, line string) bool {
+// lineFilterTexts returns the label values a line filter reads in addition to
+// the line: every label named by LineFilterFields, under the VictoriaLogs
+// spelling or its sanitised Loki spelling (`State.Foo` arrives as `State_Foo`).
+func (p *Pipeline) lineFilterTexts(e *Entry) []string {
+	if len(p.LineFilterFields) == 0 {
+		return nil
+	}
+	var out []string
+	for _, f := range p.LineFilterFields {
+		if f == "_msg" {
+			continue
+		}
+		if prefix, ok := strings.CutSuffix(f, "*"); ok {
+			sanitised := sanitizeLabel(prefix)
+			for k, v := range e.Labels {
+				if strings.HasPrefix(k, prefix) || strings.HasPrefix(k, sanitised) {
+					out = append(out, v)
+				}
+			}
+			continue
+		}
+		if v, ok := e.Labels[f]; ok {
+			out = append(out, v)
+		} else if v, ok := e.Labels[sanitizeLabel(f)]; ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// matchLineFilter evaluates a line filter against the line and, when the
+// proxy is configured to read other fields too (extra), against each of them:
+// a positive filter matches when ANY text matches, a negative one when NONE do.
+func matchLineFilter(st *LineFilterStage, line string, extra []string) bool {
+	texts := append([]string{line}, extra...)
 	// An OR-list shares one operator: a positive filter keeps a line matching ANY
 	// alternative, a negative one drops a line matching any of them.
 	anyContains := func() bool {
 		for _, v := range st.Values() {
-			if strings.Contains(line, v) {
-				return true
+			for _, text := range texts {
+				if strings.Contains(text, v) {
+					return true
+				}
 			}
 		}
 		return false
@@ -735,8 +862,10 @@ func matchLineFilter(st *LineFilterStage, line string) bool {
 				}
 				lineFilterCache.put(v, re)
 			}
-			if re.MatchString(line) {
-				return true
+			for _, text := range texts {
+				if re.MatchString(text) {
+					return true
+				}
 			}
 		}
 		return false

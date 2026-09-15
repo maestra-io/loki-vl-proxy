@@ -3661,6 +3661,7 @@ func (p *Proxy) proxyStatsQuery(w http.ResponseWriter, r *http.Request, logsqlQu
 	}
 
 	body = p.translateStatsResponseLabelsWithContext(r.Context(), body, r.FormValue("query"))
+	body = dropEmptyAggregateInstantVector(body, originalLogql)
 	body = wrapAsLokiResponse(body, "vector")
 	if topK, topKDesc, hasTopK := parseTopKWrapper(r.FormValue("query")); hasTopK {
 		body = applyTopKToVector(body, topK, topKDesc)
@@ -4398,4 +4399,44 @@ func abs64(f float64) float64 {
 		return -f
 	}
 	return f
+}
+
+// dropEmptyAggregateInstantVector turns VictoriaLogs' answer for a bare
+// aggregation over NO rows into Loki's. `| stats count()` on an empty match is
+// one label-less row worth 0, `sum()`/`avg()` give NaN and `min()`/`max()`/
+// `quantile()` an empty string (measured on v1.52.0); Loki returns an empty
+// vector for every one of them (round 12, class B: eight instant panels drew
+// `{} 0` where Loki drew nothing). A count-family function cannot legitimately
+// answer 0 over rows — zero rows IS the empty vector — while an unwrap function
+// can (`sum_over_time` of zeros), so for those only the no-row markers go.
+func dropEmptyAggregateInstantVector(body []byte, originalLogql string) []byte {
+	if !hasOuterAggregationWithoutBy(originalLogql) {
+		return body
+	}
+	var resp struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string             `json:"resultType"`
+			Result     []lokiVectorResult `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Data.ResultType != "vector" || len(resp.Data.Result) != 1 {
+		return body
+	}
+	only := resp.Data.Result[0]
+	if len(only.Metric) != 0 || len(only.Value) != 2 {
+		return body
+	}
+	raw, _ := only.Value[1].(string)
+	countFamily := false
+	if spec, ok := parseOriginalRangeMetricSpec(originalLogql); ok {
+		countFamily = isAdditiveManualFunc(spec.Func)
+	}
+	switch {
+	case raw == "" || raw == "NaN":
+	case raw == "0" && countFamily:
+	default:
+		return body
+	}
+	return []byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`)
 }

@@ -101,3 +101,36 @@ func TestTranslate_UnderscoreFieldAfterParserReadsDottedToo(t *testing.T) {
 		t.Fatalf("nil mapping must keep upstream output: %s", off)
 	}
 }
+
+// Round 12, class A: Loki matches a line filter against the whole stored
+// line; the collector split that line into fields, so with LineFilterFields
+// every value fans out over `_msg` and the configured fields. A trailing `*`
+// is VictoriaLogs' field-name wildcard and stays unquoted.
+func TestTranslate_LineFilterFieldsFanOut(t *testing.T) {
+	m := &MappingOptions{LineFilterFields: []string{"_msg", "Scopes", "Exception", "State.*"}}
+	cases := map[string]string{
+		`{a="b"} |= "needle"`:           `(~"needle" OR Scopes:~"needle" OR Exception:~"needle" OR State.*:~"needle")`,
+		`{a="b"} != "needle"`:           `NOT (~"needle" OR Scopes:~"needle" OR Exception:~"needle" OR State.*:~"needle")`,
+		`{a="b"} |~ "(?i)abc-1"`:        `(~"(?i)abc-1" OR Scopes:~"(?i)abc-1" OR Exception:~"(?i)abc-1" OR State.*:~"(?i)abc-1")`,
+		`{a="b"} !~ "x"`:                `NOT (~"x" OR Scopes:~"x" OR Exception:~"x" OR State.*:~"x")`,
+		`{a="b"} |= "a" or "b"`:         `(~"a" OR Scopes:~"a" OR Exception:~"a" OR State.*:~"a" OR ~"b" OR Scopes:~"b" OR Exception:~"b" OR State.*:~"b")`,
+		`{a="b"} |= "manifests."`:       `Scopes:~"manifests\\."`,
+		`{a="b"} |= "x" | json | y="1"`: `(~"x" OR Scopes:~"x" OR Exception:~"x" OR State.*:~"x") | unpack_json | filter y:="1"`,
+	}
+	for q, want := range cases {
+		got, err := TranslateLogQLWithMapping(q, nil, nil, logsql.Capabilities{}, m)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if !strings.Contains(got, want) {
+			t.Errorf("%s\n got  %s\n want it to contain %s", q, got, want)
+		}
+	}
+	// `_msg` alone (the default) and nil keep the upstream translation.
+	for _, opts := range []*MappingOptions{nil, {LineFilterFields: []string{"_msg"}}} {
+		got, _ := TranslateLogQLWithMapping(`{a="b"} |= "needle"`, nil, nil, logsql.Capabilities{}, opts)
+		if !strings.Contains(got, `~"needle"`) || strings.Contains(got, "OR") {
+			t.Errorf("default must stay _msg-only, got %s", got)
+		}
+	}
+}

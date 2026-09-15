@@ -241,6 +241,7 @@ extraArgs:
   # derived-level-group-by: "true"   # materialise `level` server-side so `sum by (level)` groups (costs a full _msg unpack)
   # Log line source: "" (default) re-encodes the whole VL record as JSON; "_msg" returns the original message
   # line-field: "_msg"
+  # line-filter-fields: "_msg"        # fields a line filter (|=, !=, |~, !~) reads; list split-out JSON keys, e.g. "_msg,Scopes,Exception,Category,State.*"
   # Derived fields (trace linking)
   # derived-fields: '[{"name":"traceID","matcherRegex":"trace_id=([a-f0-9]+)","url":"http://tempo/trace/${__value.raw}"}]'
   # stream-response: "true"  # chunked transfer encoding for large results

@@ -166,12 +166,22 @@ func TestLearnedAliasRoundTripsBothWays(t *testing.T) {
 	if got := lt.ToLoki("k8s.namespace.name"); got != "k8s_namespace_name" {
 		t.Errorf("ToLoki(k8s.namespace.name) = %q", got)
 	}
-	// A collision on the leaf must drop BOTH directions, not leave the response
-	// side answering for a mapping the query side has disowned.
+	// A collision on the leaf between two Kubernetes label maps is the label
+	// Loki's discovery merges onto one name: a fallback chain, pod label first,
+	// answering under the leaf in BOTH directions (round 12, class F).
 	lt2 := NewLabelTranslator(LabelStyleUnderscores, nil)
 	lt2.LearnFieldAliases([]string{vlField, "kubernetes.namespace_labels.strimzi.io/cluster"})
-	if got := lt2.ToLoki(vlField); got != "kubernetes_pod_labels_strimzi_io_cluster" {
-		t.Errorf("ambiguous leaf must not keep a reverse alias, got %q", got)
+	if got := lt2.ToVLFields("strimzi_io_cluster"); len(got) != 2 || got[0] != vlField || got[1] != "kubernetes.namespace_labels.strimzi.io/cluster" {
+		t.Errorf("colliding leaf must become a chain, got %v", got)
+	}
+	if got := lt2.ToLoki(vlField); got != "strimzi_io_cluster" {
+		t.Errorf("chain member must answer under the leaf, got %q", got)
+	}
+	if got := lt2.ToLoki("kubernetes.namespace_labels.strimzi.io/cluster"); got != "strimzi_io_cluster" {
+		t.Errorf("chain member must answer under the leaf, got %q", got)
+	}
+	if lt2.NeedsAliasDiscovery("strimzi_io_cluster") {
+		t.Error("a learned chain is resolved")
 	}
 }
 

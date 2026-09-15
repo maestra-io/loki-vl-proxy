@@ -2776,12 +2776,13 @@ func (p *Proxy) buildMappingOptions(logql string) *translator.MappingOptions {
 	}
 	lt := p.labelTranslator
 	hasChains := lt.HasFallbackChains()
-	if !hasChains && len(p.computedLabels) == 0 && len(p.derivedLevelFields) == 0 {
+	if !hasChains && len(p.computedLabels) == 0 && len(p.derivedLevelFields) == 0 && len(p.lineFilterFields) == 0 {
 		return nil
 	}
 	opts := &translator.MappingOptions{
 		DerivedLevelFields: p.derivedLevelFields,
 		MsgFieldAliases:    p.msgFieldAliases,
+		LineFilterFields:   p.lineFilterFields,
 		MaterializeLevel:   p.derivedLevelGroupBy && logqlGroupsByLevel(logql),
 		// Only `detected_level` licenses inferring a level from the line text.
 		InferLevelFromText: p.derivedLevelGroupBy && logqlGroupsByDetectedLevel(logql),

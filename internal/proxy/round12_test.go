@@ -180,3 +180,235 @@ func TestStatsRange_UnderscoreGroupingAfterParserGroupsByDottedToo(t *testing.T)
 		t.Fatalf("instant manual path: HTTP %d metrics %v (%.300s)", rec.Code, got, rec.Body.String())
 	}
 }
+
+// Round 12, class A, through the proxy: the pushed-down LogsQL reads the
+// configured fields, and the template path's re-run of the filter keeps a row
+// that VictoriaLogs matched in one of them.
+func TestLineFilterFields_PushdownAndTemplatePath(t *testing.T) {
+	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, r *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, `{"_time":"2023-11-14T22:13:30Z","_msg":"plain","_stream":"{app=\"a\"}","app":"a","Scopes":"[needle]"}`+"\n")
+		fmt.Fprint(w, `{"_time":"2023-11-14T22:13:31Z","_msg":"plain","_stream":"{app=\"a\"}","app":"a","State.Foo":"needle"}`+"\n")
+		fmt.Fprint(w, `{"_time":"2023-11-14T22:13:32Z","_msg":"plain","_stream":"{app=\"a\"}","app":"a","Category":"needle"}`+"\n")
+	})
+	p, err := New(Config{BackendURL: vl.URL, Cache: cache.New(60, 100), LogLevel: "error", LineFilterFields: []string{"_msg", "Scopes", "State.*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
+		url.QueryEscape(`{app="a"} |= "needle" | json | line_format "{{ or .x __line__ }}"`)+"&start=1700000000&end=1700000100&limit=10", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	want := `(~"needle" OR Scopes:~"needle" OR State.*:~"needle")`
+	pushed := false
+	for _, q := range seen() {
+		pushed = pushed || strings.Contains(q, want)
+	}
+	if !pushed {
+		t.Fatalf("pushdown must fan the filter out over the configured fields: %v", seen())
+	}
+	v, err := fj.ParseBytes(rec.Body.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := 0
+	for _, s := range v.GetArray("data", "result") {
+		lines += len(s.GetArray("values"))
+	}
+	if lines != 2 {
+		t.Fatalf("the template path must keep the Scopes and State.Foo rows and drop the Category row, got %d lines: %s", lines, rec.Body.String())
+	}
+}
+
+// Round 12, class B: a bare aggregation over no rows is an EMPTY vector in
+// Loki; VictoriaLogs answers `{} 0` for count(), NaN for sum()/avg() and ""
+// for min()/max()/quantile(). `or vector(0)` still yields its constant.
+func TestInstant_EmptyAggregateIsEmptyVector(t *testing.T) {
+	value := "0"
+	vl, _ := newRecordingVL(t, func(w http.ResponseWriter, r *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"count(*)"},"value":[1700007200,%q]}]}}`, value)
+	})
+	p := newGapTestProxy(t, vl.URL)
+	run := func(logql string) string {
+		rec := httptest.NewRecorder()
+		p.handleQuery(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query="+url.QueryEscape(logql)+"&time=1700007200", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: HTTP %d: %s", logql, rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+	if got := run(`sum(count_over_time({a="b"}[1h]))`); !strings.Contains(got, `"result":[]`) {
+		t.Fatalf("count over no rows must be an empty vector, got %s", got)
+	}
+	if got := run(`sum(rate({a="b"}[1h]))`); !strings.Contains(got, `"result":[]`) {
+		t.Fatalf("rate over no rows must be an empty vector, got %s", got)
+	}
+	if got := run(`sum(count_over_time({a="b"}[1h])) or vector(0)`); !strings.Contains(got, `"value":[1700007200,"0"]`) {
+		t.Fatalf("or vector(0) must still answer its constant, got %s", got)
+	}
+	value = "NaN"
+	if got := run(`sum(sum_over_time({a="b"} | unwrap x [1h]))`); !strings.Contains(got, `"result":[]`) {
+		t.Fatalf("NaN over no rows must be an empty vector, got %s", got)
+	}
+	value = "0"
+	if got := run(`sum(sum_over_time({a="b"} | unwrap x [1h]))`); !strings.Contains(got, `"value":[1700007200,"0"]`) {
+		t.Fatalf("a sum of zeros over rows is a real 0, got %s", got)
+	}
+	value = "7"
+	if got := run(`sum(count_over_time({a="b"}[1h]))`); !strings.Contains(got, `"value":[1700007200,"7"]`) {
+		t.Fatalf("a real count must survive, got %s", got)
+	}
+}
+
+// Round 12, class D: `[5m] offset 1h` at time t evaluates (t-1h-5m, t-1h] and
+// is REPORTED at t. The proxy shifts the window before dispatch; the answer
+// has to come back on the client's timestamps, not the shifted ones.
+func TestOffset_ReportsAtClientTimestamps(t *testing.T) {
+	// Step-grid-aligned bounds (Loki truncates a metric range query to the
+	// step grid; 1700006400 is a multiple of 3600).
+	const start, end, step = int64(1700006400), int64(1700013600), int64(3600)
+	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, r *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/stats_query") {
+			fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1700006400,"5"]}]}}`)
+			return
+		}
+		fmt.Fprint(w, statsMatrixBody([]string{`{}`}, start-2*step, start-step, start, start+step))
+	})
+	p := newGapTestProxy(t, vl.URL)
+
+	timestamps := func(logql string, s, e int64) []int64 {
+		rec := httptest.NewRecorder()
+		p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+url.QueryEscape(logql)+
+			fmt.Sprintf("&start=%d&end=%d&step=%d", s, e, step), nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: HTTP %d: %s", logql, rec.Code, rec.Body.String())
+		}
+		v, err := fj.ParseBytes(rec.Body.Bytes())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []int64
+		for _, s := range v.GetArray("data", "result") {
+			for _, pt := range s.GetArray("values") {
+				out = append(out, int64(pt.GetFloat64("0")))
+			}
+		}
+		return out
+	}
+	plain := timestamps(`sum(count_over_time({a="b"}[1h]))`, start-step, end-step)
+	offset := timestamps(`sum(count_over_time({a="b"}[1h] offset 1h))`, start, end)
+	if len(plain) == 0 || len(plain) != len(offset) {
+		t.Fatalf("plain %v offset %v", plain, offset)
+	}
+	for i := range plain {
+		if offset[i] != plain[i]+step {
+			t.Fatalf("offset must report at t (plain window + 1h): plain %v offset %v", plain, offset)
+		}
+		if offset[i] < start || offset[i] > end {
+			t.Fatalf("offset point %d outside the client's [%d, %d]", offset[i], start, end)
+		}
+	}
+	shiftedWindow := false
+	for _, q := range seen() {
+		shiftedWindow = shiftedWindow || strings.Contains(q, "stats_query_range")
+	}
+	if !shiftedWindow {
+		t.Fatalf("no stats_query_range issued: %v", seen())
+	}
+
+	rec := httptest.NewRecorder()
+	p.handleQuery(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query="+
+		url.QueryEscape(`sum(count_over_time({a="b"}[1h] offset 1h))`)+"&time=1700010000", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"value":[1700010000,"5"]`) {
+		t.Fatalf("instant: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Round 12, class C: a bare range aggregation over the template path keyed
+// its series on every collector-unpacked field of the row (`Message`, the
+// whole line, included), so each row was its own series, a per-series
+// quantile was the sample itself and `max(quantile_over_time(0.5, …))` was the
+// maximum. The identity is the stream labels plus what the LogQL pipeline
+// produced: named parser fields, captures, label_format — minus drop/unwrap.
+func TestBareRangeOverTemplate_IdentityIsWhatLokiProduces(t *testing.T) {
+	vl, _ := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		for i, v := range []int{10, 20, 30} {
+			fmt.Fprintf(w, `{"_time":"2023-11-14T22:13:%02dZ","_msg":"response sent duration_ms=%d","Message":"response sent duration_ms=%d","Category":"c%d","kubernetes.pod_labels.tier":"t","_stream":"{app=\"a\"}","app":"a"}`+"\n", 30+i, v, v, i)
+		}
+	})
+	p := newGapTestProxy(t, vl.URL)
+	q := `quantile_over_time(0.5, {app="a"} | json message="message" | line_format "{{ or .message __line__ }}" | drop message | regexp "duration_ms=(?P<duration_ms>\d+)" | unwrap duration_ms [1m])`
+	for _, tc := range []struct{ logql, want string }{
+		{q, `{"metric":{"app":"a"},"value":[1700000060,"20"]}`},
+		{"max(" + q + ")", `{"metric":{},"value":[1700000060,"20"]}`},
+	} {
+		rec := httptest.NewRecorder()
+		p.handleQuery(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query="+url.QueryEscape(tc.logql)+"&time=1700000060", nil))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), tc.want) {
+			t.Fatalf("%s: HTTP %d %s\nwant %s", tc.logql, rec.Code, rec.Body.String(), tc.want)
+		}
+	}
+	// A broad parser keeps the body fields, as Loki's `| json` would.
+	rec := httptest.NewRecorder()
+	p.handleQuery(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query="+
+		url.QueryEscape(`quantile_over_time(0.5, {app="a"} | json | line_format "{{ or .message __line__ }}" | regexp "duration_ms=(?P<duration_ms>\d+)" | unwrap duration_ms [1m])`)+"&time=1700000060", nil))
+	if rec.Code != http.StatusOK || countLokiVectorSeries(rec.Body.Bytes()) != 3 {
+		t.Fatalf("broad parser: HTTP %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func countLokiVectorSeries(body []byte) int {
+	v, err := fj.ParseBytes(body)
+	if err != nil {
+		return -1
+	}
+	return len(v.GetArray("data", "result"))
+}
+
+// Round 12, class F: two Kubernetes pod labels that sanitise to the same Loki
+// name (`airflow.spark-app-name` and `airflow_spark_app_name`) are ONE label
+// to Loki's discovery. The inventory used to mark the alias ambiguous and the
+// grouping went to a field that does not exist (one empty series for Loki's
+// five); it is now a learned fallback chain, coalesced for the grouping.
+func TestLearnedChain_CollidingLeafAliasesCoalesce(t *testing.T) {
+	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, r *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/field_names"):
+			fmt.Fprint(w, `{"values":[{"value":"_msg","hits":9},{"value":"kubernetes.pod_labels.airflow.spark-app-name","hits":3},{"value":"kubernetes.pod_labels.airflow_spark_app_name","hits":2}]}`)
+		default:
+			fmt.Fprint(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"airflow_spark_app_name":"build-site-metrics"},"value":[1700007200,"36"]}]}}`)
+		}
+	})
+	p, err := New(Config{BackendURL: vl.URL, Cache: cache.New(60, 100), LogLevel: "error", LabelStyle: LabelStyleUnderscores})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	p.handleQuery(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query="+
+		url.QueryEscape(`sum by (airflow_spark_app_name) (count_over_time({airflow_spark_app_name=~"build.*"}[1h]))`)+"&time=1700007200", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `{"airflow_spark_app_name":"build-site-metrics"}`) {
+		t.Fatalf("HTTP %d %s", rec.Code, rec.Body.String())
+	}
+	var logsql string
+	for _, q := range seen() {
+		if strings.Contains(q, "stats_query ") {
+			logsql = q
+		}
+	}
+	for _, want := range []string{
+		`("kubernetes.pod_labels.airflow.spark-app-name":~"^(?:build.*)$" OR "kubernetes.pod_labels.airflow_spark_app_name":~"^(?:build.*)$")`,
+		`| format if ("kubernetes.pod_labels.airflow_spark_app_name":*) "<kubernetes.pod_labels.airflow_spark_app_name>" as airflow_spark_app_name`,
+		`| format if ("kubernetes.pod_labels.airflow.spark-app-name":*) "<kubernetes.pod_labels.airflow.spark-app-name>" as airflow_spark_app_name`,
+		`| stats by (airflow_spark_app_name) count()`,
+	} {
+		if !strings.Contains(logsql, want) {
+			t.Fatalf("LogsQL %q\nmust contain %s", logsql, want)
+		}
+	}
+}

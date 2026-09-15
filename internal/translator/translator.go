@@ -830,7 +830,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Substring match: |= "text" → ~"text"; `|= "a" or "b"` → (~"a" OR ~"b")
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, false, true))
+			parts = append(parts, lineFilterAlternation(values, false, true, mapping.lineFilterFields()))
 			remaining = rest
 			continue
 		}
@@ -838,7 +838,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Negative substring: != "text" → NOT ~"text"; an OR-list is negated whole
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, true, true))
+			parts = append(parts, lineFilterAlternation(values, true, true, mapping.lineFilterFields()))
 			remaining = rest
 			continue
 		}
@@ -846,7 +846,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Regexp match: |~ "regexp" → ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, false, false))
+			parts = append(parts, lineFilterAlternation(values, false, false, mapping.lineFilterFields()))
 			remaining = rest
 			continue
 		}
@@ -854,7 +854,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Negative regexp: !~ "regexp" → NOT ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, true, false))
+			parts = append(parts, lineFilterAlternation(values, true, false, mapping.lineFilterFields()))
 			remaining = rest
 			continue
 		}
@@ -2953,24 +2953,42 @@ func extractLineFilterValues(s string) ([]string, string) {
 // matched `manifestsX` (34 rows where Loki returned 0), `|= "a+b"` matched
 // nothing, and `|= "\x1b"` matched every line. Only `|~`/`!~` carry a pattern
 // the user wrote as one.
-func lineFilterAlternation(values []string, negated, literal bool) string {
-	joined := ""
-	for i, v := range values {
-		if i > 0 {
-			joined += " OR "
-		}
+//
+// `fields` names the VictoriaLogs fields the filter reads BESIDES `_msg`
+// (MappingOptions.LineFilterFields). Loki matches the whole stored line, and
+// the collector here split that line into fields, so each value fans out to
+// `(~v OR Scopes:~v OR State.*:~v)`; a negative filter negates the whole
+// disjunction, as Loki's `!=` excludes a line matching anywhere.
+func lineFilterAlternation(values []string, negated, literal bool, fields []string) string {
+	var alternatives []string
+	for _, v := range values {
 		if literal {
 			v = quoteLineFilterLiteral(v)
 		}
-		joined += "~" + v
+		alternatives = append(alternatives, "~"+v)
+		for _, f := range fields {
+			alternatives = append(alternatives, lineFilterFieldName(f)+":~"+v)
+		}
 	}
-	if len(values) > 1 {
+	joined := strings.Join(alternatives, " OR ")
+	if len(alternatives) > 1 {
 		joined = "(" + joined + ")"
 	}
 	if negated {
 		return "NOT " + joined
 	}
 	return joined
+}
+
+// lineFilterFieldName renders a configured line-filter field for LogsQL. A
+// trailing `*` is VictoriaLogs' field-name wildcard and must stay unquoted
+// (`State.*:~"x"` matches every `State.…` field, measured on v1.52.0); any
+// other name is quoted when it needs to be.
+func lineFilterFieldName(field string) string {
+	if strings.HasSuffix(field, "*") {
+		return field
+	}
+	return quoteVLField(field)
 }
 
 // quoteLineFilterLiteral turns an already-quoted LogQL literal into a quoted

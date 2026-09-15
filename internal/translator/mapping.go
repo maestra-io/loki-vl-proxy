@@ -49,6 +49,16 @@ type MappingOptions struct {
 	// (round 11: `| json | message=~".* ERROR .*"` answered 0 against Loki's 125).
 	MsgFieldAliases []string
 
+	// LineFilterFields lists the VictoriaLogs fields a LINE filter reads.
+	// Loki matches `|=`/`|~` against the whole stored line; the collector here
+	// splits the JSON wrapper into fields and keeps only the message in `_msg`,
+	// so a bare `~"re"` misses text that lives in `Scopes`, `Exception` or
+	// `Category` (round 12: the CDP DB Migrator dashboard's `|~ "(?i)<uuid>"`
+	// found 0 of Loki's 36 rows — the id sits in Scopes). A trailing `*` is a
+	// VictoriaLogs field-name wildcard (`State.*`). Empty or `_msg` alone keeps
+	// the upstream `_msg`-only translation.
+	LineFilterFields []string
+
 	// DerivedLevelFields lists the VL fields that may carry a raw log level once
 	// _msg has been unpacked. Empty disables level derivation.
 	DerivedLevelFields []string
@@ -687,6 +697,23 @@ func hasPipeStage(parts []string, name string) bool {
 		}
 	}
 	return false
+}
+
+// lineFilterFields returns the fields a line filter must read besides `_msg`,
+// or nil when `_msg` alone is configured.
+func (m *MappingOptions) lineFilterFields() []string {
+	if m == nil {
+		return nil
+	}
+	var out []string
+	for _, f := range m.LineFilterFields {
+		f = strings.TrimSpace(f)
+		if f == "" || f == "_msg" {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 // hasExactStage reports whether an identical pipe stage was already emitted.
