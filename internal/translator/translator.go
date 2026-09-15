@@ -830,7 +830,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Substring match: |= "text" → ~"text"; `|= "a" or "b"` → (~"a" OR ~"b")
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, false, true))
+			parts = append(parts, lineFilterAlternation(values, false, true, mapping.lineFilterFields()))
 			remaining = rest
 			continue
 		}
@@ -838,7 +838,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Negative substring: != "text" → NOT ~"text"; an OR-list is negated whole
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, true, true))
+			parts = append(parts, lineFilterAlternation(values, true, true, mapping.lineFilterFields()))
 			remaining = rest
 			continue
 		}
@@ -846,7 +846,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Regexp match: |~ "regexp" → ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, false, false))
+			parts = append(parts, lineFilterAlternation(values, false, false, mapping.lineFilterFields()))
 			remaining = rest
 			continue
 		}
@@ -854,7 +854,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			// Negative regexp: !~ "regexp" → NOT ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
-			parts = append(parts, lineFilterAlternation(values, true, false))
+			parts = append(parts, lineFilterAlternation(values, true, false, mapping.lineFilterFields()))
 			remaining = rest
 			continue
 		}
@@ -925,7 +925,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			stage = rewriteJSONAliasedFilter(stage, jsonAliases)
 		}
 
-		translated := translatePipelineStageM(stage, labelFn, caps, mapping)
+		translated := translatePipelineStageM(stage, labelFn, caps, mapping.forStage(afterParser))
 		if strings.HasPrefix(translated, errUnknownParser) {
 			parserName := strings.TrimPrefix(translated, errUnknownParser)
 			return "", fmt.Errorf("unknown pipeline stage %q — not a valid LogQL parser or label filter", parserName)
@@ -1211,6 +1211,17 @@ func isNoopPatternExpression(expr string) bool {
 // The fix lives in translatePipelineStage's assembly logic (the `wrap with
 // "| "` branch added alongside the `wrap with "| filter "` branch), not here.
 func translateLabelFilter(stage string, labelFn LabelTranslateFunc, caps logsql.Capabilities, mapping *MappingOptions) string {
+	// `| (a="1" or b="2")`: Loki accepts a parenthesised label-filter
+	// expression as a stage; the pair encloses the whole stage, so translate
+	// what is inside and keep the grouping (round 12: it reached VictoriaLogs
+	// as `(a:="1\" or b=\"2\")"`, a 400).
+	if inner, ok := stripOuterParens(stage); ok {
+		translated := translateLabelFilter(inner, labelFn, caps, mapping)
+		if _, wrapped := stripOuterParens(translated); wrapped {
+			return translated
+		}
+		return "(" + translated + ")"
+	}
 	if chained, ok := translateLogicalLabelFilterChain(stage, labelFn, caps, mapping); ok {
 		return chained
 	}
@@ -1235,6 +1246,11 @@ func translateLogicalLabelFilterChain(stage string, labelFn LabelTranslateFunc, 
 
 	translated := make([]string, 0, len(parts))
 	for _, part := range parts {
+		// A parenthesised part is a nested chain: `(a="1" or b="2") and c="3"`.
+		if _, grouped := stripOuterParens(part); grouped {
+			translated = append(translated, translateLabelFilter(part, labelFn, caps, mapping))
+			continue
+		}
 		item, ok := translateSingleLabelFilterM(part, labelFn, caps, mapping)
 		if !ok {
 			return "", false
@@ -1333,6 +1349,66 @@ func splitLogicalStage(stage string) ([]string, []string, bool) {
 	return parts, ops, len(parts) > 1
 }
 
+// stripOuterParens returns the text inside a parenthesis pair that encloses
+// the WHOLE stage — `(a="1" or b="2")` yields `a="1" or b="2"`, while
+// `(a="1") or (b="2")` is left alone. Quoted spans are skipped.
+func stripOuterParens(stage string) (string, bool) {
+	stage = strings.TrimSpace(stage)
+	if len(stage) < 2 || stage[0] != '(' || stage[len(stage)-1] != ')' {
+		return "", false
+	}
+	depth := 0
+	var inQuote byte
+	for i := 0; i < len(stage); i++ {
+		ch := stage[i]
+		if inQuote != 0 {
+			switch ch {
+			case '\\':
+				i++
+			case inQuote:
+				inQuote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '"', '`':
+			inQuote = ch
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 && i != len(stage)-1 {
+				return "", false
+			}
+		}
+	}
+	if depth != 0 {
+		return "", false
+	}
+	return strings.TrimSpace(stage[1 : len(stage)-1]), true
+}
+
+// unquoteLogQLValue resolves a LogQL string literal to the string it denotes:
+// a double-quoted literal has Go escapes (`"\\d"` is `\d`, `"a\"b"` is `a"b`),
+// a backtick literal is verbatim, and an unquoted token (a number, `ip(...)`)
+// is returned as is. A double-quoted literal Go cannot unquote keeps its
+// inner text, so a malformed escape degrades to the old trim behaviour.
+func unquoteLogQLValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		switch {
+		case value[0] == '"' && value[len(value)-1] == '"':
+			if unquoted, err := strconv.Unquote(value); err == nil {
+				return unquoted
+			}
+			return value[1 : len(value)-1]
+		case value[0] == '`' && value[len(value)-1] == '`':
+			return value[1 : len(value)-1]
+		}
+	}
+	return value
+}
+
 // logqlSingleFilterOp maps a LogQL operator string to a FieldOp constant and
 // whether the operator implies negation. Operators are listed in order of
 // decreasing specificity so that "!~" is matched before "!" and "=" etc.
@@ -1390,7 +1466,13 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			// Same anchoring as the stream selector: `| label =~ "re"` is a
 			// label matcher, so Loki requires a full-value match. ip("cidr") is
 			// not a regexp and keeps its own translation below.
-			rawValue := strings.Trim(value, "\"`")
+			// The literal is UNQUOTED here, once: `"\\d{4}"` in the LogQL text is
+			// the regexp `\d{4}`, and every emitter below quotes it again for
+			// LogsQL. Stripping the quotes instead kept the LogQL escapes and
+			// the re-quote doubled them (round 12: `message=~"\\d{4}-…"` reached
+			// VictoriaLogs as `\\\\d`, a literal backslash, and matched nothing).
+			rawValue := unquoteLogQLValue(value)
+			value = rawValue
 			if entry.entry.isRe && !strings.HasPrefix(rawValue, `ip("`) {
 				value = logsql.AnchorLabelMatcherRegex(rawValue)
 			}
@@ -1403,23 +1485,21 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 				}
 			}
 			if chain := mapping.expand(label); len(chain) > 0 {
-				v := strings.Trim(value, "\"`")
-				if v == "" && !entry.entry.isComp && !entry.entry.isRe {
+				if value == "" && !entry.entry.isComp && !entry.entry.isRe {
 					return chainEmptyFilter(chain, entry.entry.negate), true
 				}
-				return chainFilter(chain, entry.entry.vlOp, v, entry.entry.negate), true
+				return chainFilter(chain, entry.entry.vlOp, value, entry.entry.negate), true
 			}
 			if label == "detected_level" {
 				label = "level"
 			}
+			origLabel := label
 			if labelFn != nil {
 				label = sanitizeFieldIdentifier(labelFn(label))
 				if label == "" {
 					return "", false
 				}
 			}
-
-			value = strings.Trim(value, "\"`")
 
 			// ip() CIDR filter: label = ip("cidr") or label != ip("cidr")
 			if strings.HasPrefix(value, `ip("`) && strings.HasSuffix(value, `")`) {
@@ -1443,8 +1523,8 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 				// Comparison filters (>, >=, <, <=) do not quote the value.
 				return buildFieldFilterStr(label, entry.entry.vlOp, value, entry.entry.negate), true
 			}
-			if value != "" && mapping.isMsgFieldAlias(label) {
-				return msgAliasFieldFilter(label, entry.entry.vlOp, value, entry.entry.negate), true
+			if aliased, ok := mapping.aliasedFieldFilter(label, origLabel, entry.entry.vlOp, value, entry.entry.negate); ok {
+				return aliased, true
 			}
 
 			if value == "" {
@@ -2873,24 +2953,42 @@ func extractLineFilterValues(s string) ([]string, string) {
 // matched `manifestsX` (34 rows where Loki returned 0), `|= "a+b"` matched
 // nothing, and `|= "\x1b"` matched every line. Only `|~`/`!~` carry a pattern
 // the user wrote as one.
-func lineFilterAlternation(values []string, negated, literal bool) string {
-	joined := ""
-	for i, v := range values {
-		if i > 0 {
-			joined += " OR "
-		}
+//
+// `fields` names the VictoriaLogs fields the filter reads BESIDES `_msg`
+// (MappingOptions.LineFilterFields). Loki matches the whole stored line, and
+// the collector here split that line into fields, so each value fans out to
+// `(~v OR Scopes:~v OR State.*:~v)`; a negative filter negates the whole
+// disjunction, as Loki's `!=` excludes a line matching anywhere.
+func lineFilterAlternation(values []string, negated, literal bool, fields []string) string {
+	var alternatives []string
+	for _, v := range values {
 		if literal {
 			v = quoteLineFilterLiteral(v)
 		}
-		joined += "~" + v
+		alternatives = append(alternatives, "~"+v)
+		for _, f := range fields {
+			alternatives = append(alternatives, lineFilterFieldName(f)+":~"+v)
+		}
 	}
-	if len(values) > 1 {
+	joined := strings.Join(alternatives, " OR ")
+	if len(alternatives) > 1 {
 		joined = "(" + joined + ")"
 	}
 	if negated {
 		return "NOT " + joined
 	}
 	return joined
+}
+
+// lineFilterFieldName renders a configured line-filter field for LogsQL. A
+// trailing `*` is VictoriaLogs' field-name wildcard and must stay unquoted
+// (`State.*:~"x"` matches every `State.…` field, measured on v1.52.0); any
+// other name is quoted when it needs to be.
+func lineFilterFieldName(field string) string {
+	if strings.HasSuffix(field, "*") {
+		return field
+	}
+	return quoteVLField(field)
 }
 
 // quoteLineFilterLiteral turns an already-quoted LogQL literal into a quoted
@@ -3068,19 +3166,20 @@ func streamMatcherToFieldFilter(matcher string, labelFn LabelTranslateFunc, mapp
 			// Loki anchors label-matcher regexps to the whole value; VL's
 			// `field:~"re"` does not. Anchor here, once, before the value fans
 			// out to the fallback-chain / service_name / plain branches below.
+			// The literal is unquoted ONCE (see translateSingleLabelFilterM).
+			value = unquoteLogQLValue(value)
 			if op.isRe {
-				value = logsql.AnchorLabelMatcherRegex(strings.Trim(value, "\"`"))
+				value = logsql.AnchorLabelMatcherRegex(value)
 			}
 
 			// Fallback chain: the Loki label is backed by an ordered list of VL
 			// fields. Positive matchers become a disjunction over the chain,
 			// negative matchers a conjunction of negations.
 			if chain := mapping.expand(origLabel); len(chain) > 0 {
-				v := strings.Trim(value, "\"`")
-				if v == "" && !op.isRe {
+				if value == "" && !op.isRe {
 					return chainEmptyFilter(chain, op.negate)
 				}
-				return chainFilter(chain, op.vlOp, v, op.negate)
+				return chainFilter(chain, op.vlOp, value, op.negate)
 			}
 
 			// Apply label name translation (e.g., service_name → service.name)
@@ -3110,8 +3209,6 @@ func streamMatcherToFieldFilter(matcher string, labelFn LabelTranslateFunc, mapp
 			if strings.Contains(label, ".") {
 				label = `"` + label + `"`
 			}
-
-			value = strings.Trim(value, "\"`")
 
 			if value == "" && !op.isRe {
 				// detected_level="" in the stream selector means "no level detected":

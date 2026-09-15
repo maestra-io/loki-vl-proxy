@@ -245,6 +245,11 @@ type Config struct {
 	// (vlagent msgField); a filter on one of them reads _msg when the field is
 	// absent after `| json`.
 	MsgFieldAliases []string
+	// LineFilterFields lists the VL fields a LogQL line filter (`|=`, `!=`,
+	// `|~`, `!~`) reads besides _msg — the JSON keys the collector split out of
+	// the line Loki would have searched whole. A trailing `*` is a field-name
+	// wildcard. Empty or `_msg` alone keeps the _msg-only translation.
+	LineFilterFields []string
 	// DerivedLevelGroupBy appends the unpack + coalesce + normalise pipe chain to
 	// queries that reference level, so `sum by (level)` groups on VL's side.
 	DerivedLevelGroupBy bool
@@ -501,6 +506,7 @@ type Proxy struct {
 	labelPromotions                   []labelPromotion // mapped/computed labels lifted into result stream labels
 	derivedLevelFields                []string         // VL fields carrying a raw level inside _msg
 	msgFieldAliases                   []string         // JSON keys the collector lifted into _msg
+	lineFilterFields                  []string         // VL fields a line filter reads besides _msg
 	derivedLevelGroupBy               bool             // materialise `level` server-side for group-by
 	lineFieldMsg                      bool             // return _msg as the Loki log line
 	peerCache                         *cache.PeerCache // L3 fleet peer cache
@@ -1139,6 +1145,7 @@ func New(cfg Config) (*Proxy, error) {
 		labelPromotions:                       buildLabelPromotions(labelTranslator, validComputedLabels(cfg.ComputedLabels)),
 		derivedLevelFields:                    normalizeDerivedLevelFields(cfg.DerivedLevelFields),
 		msgFieldAliases:                       normalizeDerivedLevelFields(cfg.MsgFieldAliases),
+		lineFilterFields:                      normalizeLineFilterFields(cfg.LineFilterFields),
 		derivedLevelGroupBy:                   cfg.DerivedLevelGroupBy,
 		lineFieldMsg:                          strings.TrimSpace(cfg.LineField) == "_msg",
 		peerCache:                             cfg.PeerCache,
@@ -1283,6 +1290,7 @@ func New(cfg Config) (*Proxy, error) {
 			computedLabels:                        p.computedLabels,
 			derivedLevelFields:                    p.derivedLevelFields,
 			msgFieldAliases:                       p.msgFieldAliases,
+			lineFilterFields:                      p.lineFilterFields,
 			derivedLevelGroupBy:                   p.derivedLevelGroupBy,
 			lineFieldMsg:                          p.lineFieldMsg,
 			registerInstrumentation:               p.registerInstrumentation,
@@ -1495,6 +1503,21 @@ func normalizeDerivedLevelFields(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, f := range in {
 		if f = strings.TrimSpace(f); f != "" {
+			out = appendUniqueString(out, f)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normalizeLineFilterFields drops blanks, duplicates and `_msg` (always read)
+// from -line-filter-fields; nil means the upstream `_msg`-only translation.
+func normalizeLineFilterFields(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, f := range in {
+		if f = strings.TrimSpace(f); f != "" && f != "_msg" {
 			out = appendUniqueString(out, f)
 		}
 	}
@@ -2186,6 +2209,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// so time-shifting is not applied — results may differ from Loki for offset
 	// values but the proxy returns 200 rather than incorrectly rejecting the query.
 	// Expressions with multiple *different* offsets still return 400 (same as Loki).
+	var responseOffset time.Duration
 	{
 		offsetDur, strippedQuery, offsetErr := extractLogQLOffset(logqlQuery)
 		if offsetErr != nil {
@@ -2213,6 +2237,12 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 				if endNs, ok := parseLokiTimeToUnixNano(r.FormValue("end")); ok {
 					r.Form.Set("end", nanosToVLTimestamp(endNs-offsetDur.Nanoseconds()))
 				}
+				// The window moved back by the offset; the answer is still reported
+				// at the CLIENT's timestamps (round 12, class D).
+				shifted := newOffsetShiftWriter(w, offsetDur)
+				w = shifted
+				defer shifted.flush()
+				responseOffset = offsetDur
 			}
 		}
 	}
@@ -2361,12 +2391,12 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(cacheOut)
 		}
 		if cacheable && sc.code == http.StatusOK {
-			p.setLocalReadCacheWithTTL(cacheKey, append([]byte(nil), cacheOut...), 5*time.Minute)
+			p.setLocalReadCacheWithTTL(cacheKey, clientTimeCopy(cacheOut, responseOffset), 5*time.Minute)
 		}
 	} else if cacheTap != nil {
 		if cacheable && sc.code == http.StatusOK {
 			if body := cacheTap.CapturedBody(); len(body) > 0 {
-				p.setLocalReadCacheWithTTL(cacheKey, append([]byte(nil), body...), 5*time.Minute)
+				p.setLocalReadCacheWithTTL(cacheKey, clientTimeCopy(body, responseOffset), 5*time.Minute)
 			}
 		}
 		cacheTap.Release()
@@ -2509,6 +2539,9 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 				if timeNs, ok := parseLokiTimeToUnixNano(rawTime); ok {
 					r.Form.Set("time", nanosToVLTimestamp(timeNs-offsetDur.Nanoseconds()))
 				}
+				shifted := newOffsetShiftWriter(w, offsetDur)
+				w = shifted
+				defer shifted.flush()
 			}
 		}
 	}

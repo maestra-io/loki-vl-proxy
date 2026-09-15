@@ -330,4 +330,23 @@ func TestWindowedHits_GatedToDrilldownOrHighCard(t *testing.T) {
 	if isLikelyHighCardinalityField("status") {
 		t.Error("status must NOT be treated as high-cardinality")
 	}
+	if !isLikelyHighCardinalityField("user_uid") {
+		t.Error("user_uid must be recognized as high-cardinality (isHighCardinalityFieldName already is)")
+	}
+}
+
+// A parser stage counts only outside quotes: a literal filter for the text
+// `| unpack_json` must not switch on the dotted-alias grouping.
+func TestAfterParserQuery_IgnoresQuotedStageText(t *testing.T) {
+	for q, want := range map[string]bool{
+		`{a="b"} | unpack_json | stats by (foo_bar) count()`:                     true,
+		`{a="b"} | unpack_logfmt | stats by (foo_bar) count()`:                   true,
+		`{a="b"} _msg:"| unpack_json" | stats by (foo_bar) count()`:              false,
+		`{a="b"} _msg:"say \"hi\" | unpack_logfmt" | stats by (foo_bar) count()`: false,
+		"{a=\"b\"} _msg:`| unpack_json` | stats by (foo_bar) count()":            false,
+	} {
+		if got := afterParserQuery(q); got != want {
+			t.Errorf("afterParserQuery(%s) = %v, want %v", q, got, want)
+		}
+	}
 }

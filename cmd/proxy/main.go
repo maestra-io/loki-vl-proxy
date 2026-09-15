@@ -163,6 +163,7 @@ type proxyRuntimeConfig struct {
 	computedLabelsJSON                  string
 	derivedLevelFieldsCSV               string
 	msgFieldAliasesCSV                  string
+	lineFilterFieldsCSV                 string
 	derivedLevelGroupBy                 bool
 	lineField                           string
 	labelValuesIndexedCache             bool
@@ -587,6 +588,7 @@ func run(
 	extraLabelFieldsCSV := fs.String("extra-label-fields", "", `Comma-separated additional VL field names exposed on /labels and eligible for alias resolution (for example "host.id,custom.pipeline.processing")`)
 	computedLabelsJSON := fs.String("computed-labels", "", `JSON Loki labels joined from other labels: [{"loki_label":"job","join":["namespace","app"],"sep":"/"}]. Matchers on a computed label are split on the separator (= and != only); its value in results is the concatenation.`)
 	msgFieldAliasesCSV := fs.String("msg-field-aliases", "message,Message,msg,log", `Comma-separated JSON keys the collector lifts into _msg (vlagent msgField). A label filter on one of them after a parser stage reads _msg when the field is absent, matching Loki, which stores the whole line. Empty disables the aliasing.`)
+	lineFilterFieldsCSV := fs.String("line-filter-fields", "_msg", `Comma-separated VictoriaLogs fields a LogQL line filter (|=, !=, |~, !~) reads. Loki searches the whole stored line; a collector that splits the JSON wrapper into fields leaves only the message in _msg, so name the split-out keys here (for example "_msg,Scopes,Exception,Category,State.*"; a trailing * is a field-name wildcard). "_msg" alone keeps the upstream translation.`)
 	derivedLevelFieldsCSV := fs.String("derived-level-fields", "", `Comma-separated VL fields carrying a raw log level inside _msg (for example "level,loglevel,severity"). Enables level/detected_level matchers and normalises information->info, warning->warn. Empty keeps the upstream behaviour where level is a stored field.`)
 	derivedLevelGroupBy := fs.Bool("derived-level-group-by", false, "Append the unpack+coalesce+normalise pipe chain to queries that mention level, so `sum by (level)` groups server-side. Costs a full _msg unpack per matched entry.")
 	lineField := fs.String("line-field", "", `VL field returned as the Loki log line. Empty (default) re-encodes the whole VL record as JSON, matching upstream. "_msg" returns the original message and falls back to the JSON form when _msg is absent.`)
@@ -848,6 +850,7 @@ func run(
 			computedLabelsJSON:                  *computedLabelsJSON,
 			derivedLevelFieldsCSV:               *derivedLevelFieldsCSV,
 			msgFieldAliasesCSV:                  *msgFieldAliasesCSV,
+			lineFilterFieldsCSV:                 *lineFilterFieldsCSV,
 			derivedLevelGroupBy:                 *derivedLevelGroupBy,
 			lineField:                           *lineField,
 			labelValuesIndexedCache:             *labelValuesIndexedCache,
@@ -2061,6 +2064,7 @@ func buildProxyConfig(cfg proxyRuntimeConfig) (proxy.Config, error) {
 		ComputedLabels:                     computedLabels,
 		DerivedLevelFields:                 parseCSV(cfg.derivedLevelFieldsCSV),
 		MsgFieldAliases:                    parseCSV(cfg.msgFieldAliasesCSV),
+		LineFilterFields:                   parseCSV(cfg.lineFilterFieldsCSV),
 		DerivedLevelGroupBy:                cfg.derivedLevelGroupBy,
 		LineField:                          strings.TrimSpace(cfg.lineField),
 		LabelValuesIndexedCache:            cfg.labelValuesIndexedCache,

@@ -44,6 +44,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Round 12 (the round-11 comparison on `1.63.1-maestra.15`).**
+  - A single-field `count by (field)` over more than 2h took the Drilldown
+    top-N SELECTION for every client — Phase 1 keeps 200 field values — so a
+    whole-cluster `sum by (pod) (count_over_time({namespace=~".+"}[1h]))` at
+    range == step answered 183 of Loki's 939 pods, HTTP 200, no warning. The
+    two-phase path is now scoped like the windowed-/hits path (Drilldown, or a
+    Grafana panel on a `*_id`-shaped field); everything else takes the exact
+    direct path up to `-max-stats-query-series`. A series whose only bucket
+    starts AT `end` (VictoriaLogs returns it; relabelled it lies one step past
+    the range) was a `"values":[]` phantom — 44 of 183, 287 of 1234 — and is
+    dropped whole.
+  - A LogQL string literal in a label filter or stream matcher was trimmed of
+    its quotes but never unquoted, so `message=~"\\d{4}-…"` was re-quoted to
+    `\\\\d` (a literal backslash) and matched nothing while `[0-9]{4}` and the
+    line filter worked. The literal is unquoted once (`strconv.Unquote`,
+    backticks verbatim); asserted against a live VictoriaLogs in
+    test/integration.
+  - A `by (x)` over rows without x keyed the series `{x=""}`; Loki keys it
+    `{}` (an empty value is no label). Empty-valued labels are dropped on the
+    range and instant stats paths.
+  - `| (a="1" or b="2")` — a parenthesised label-filter stage — reached
+    VictoriaLogs as `(a:="1\" or b=\"2\")"`, a 400. The enclosing pair is
+    unwrapped (also as a part of `(…) and c="3"`).
+  - After `| json`/`| logfmt` an unmapped underscore name is read under both
+    the Loki spelling (`| json` flattens nested keys with `_`) and the
+    VictoriaLogs one (unpack_json uses `.`): `ExceptionDetails_StackTrace` is
+    `(ExceptionDetails_StackTrace:~… OR "ExceptionDetails.StackTrace":~…)`, and
+    `sum by (ExceptionDetails_Topic)` groups by both and coalesces. Only with a
+    fork mapping configured; a nil mapping keeps upstream output byte for byte.
 - **Round 11 (the round-10 comparison on `1.63.1-maestra.14`).**
   - The template log path bounded VictoriaLogs' sort to the raw-row ceiling —
     `sort by (_time desc) limit 1000001` for a 5000-line panel. VictoriaLogs

@@ -116,6 +116,13 @@ type LabelTranslator struct {
 	learnedMu        sync.RWMutex
 	learnedLokiToVL  map[string]string
 	learnedAmbiguous map[string]struct{}
+	// learnedChains holds a leaf alias two or more Kubernetes label fields
+	// sanitise to — `airflow_spark_app_name` is both the pod label
+	// `airflow.spark-app-name` and the pod label `airflow_spark_app_name` on
+	// omega. Loki's discovery sanitises both onto ONE label, so the alias is a
+	// fallback chain over the fields, not an ambiguity (round 12, class F: a
+	// `by (airflow_spark_app_name)` answered one empty series for Loki's five).
+	learnedChains map[string][]string
 	// learnedVLToLoki is the RESPONSE direction of a learned Kubernetes
 	// label/annotation alias. Sanitizing the whole VL path is not what Loki
 	// calls the label — Loki names `kubernetes.pod_labels.strimzi.io/cluster`
@@ -136,6 +143,7 @@ func NewLabelTranslator(style LabelStyle, mappings []FieldMapping) *LabelTransla
 		lokiToVL:         make(map[string]string),
 		learnedLokiToVL:  make(map[string]string),
 		learnedAmbiguous: make(map[string]struct{}),
+		learnedChains:    make(map[string][]string),
 		learnedVLToLoki:  make(map[string]string),
 		translateOTel:    true,
 	}
@@ -177,6 +185,11 @@ func (lt *LabelTranslator) ToVLFields(lokiLabel string) []string {
 	if mapped, ok := lt.lokiToVL[lokiLabel]; ok {
 		return []string{mapped}
 	}
+	lt.learnedMu.RLock()
+	defer lt.learnedMu.RUnlock()
+	if chain, ok := lt.learnedChains[lokiLabel]; ok {
+		return chain
+	}
 	return nil
 }
 
@@ -188,9 +201,18 @@ func (lt *LabelTranslator) MappedVLFields() []string {
 	return append([]string(nil), lt.mappedFields...)
 }
 
-// HasFallbackChains reports whether any label maps to more than one VL field.
+// HasFallbackChains reports whether any label maps to more than one VL field,
+// configured or learned from the field inventory.
 func (lt *LabelTranslator) HasFallbackChains() bool {
-	return lt != nil && len(lt.fallbacks) > 0
+	if lt == nil {
+		return false
+	}
+	if len(lt.fallbacks) > 0 {
+		return true
+	}
+	lt.learnedMu.RLock()
+	defer lt.learnedMu.RUnlock()
+	return len(lt.learnedChains) > 0
 }
 
 // ToLoki translates a VL field name to a Loki-compatible label name (response direction).
@@ -268,6 +290,11 @@ func (lt *LabelTranslator) resolveLearnedAlias(lokiLabel string) (string, bool) 
 	if _, ambiguous := lt.learnedAmbiguous[lokiLabel]; ambiguous {
 		return "", false
 	}
+	if chain, ok := lt.learnedChains[lokiLabel]; ok && len(chain) > 0 {
+		// Single-field call sites get the chain's head, as they do for a
+		// configured chain (lokiToVL points at fields[0]).
+		return chain[0], true
+	}
 	mapped, ok := lt.learnedLokiToVL[lokiLabel]
 	return mapped, ok
 }
@@ -316,10 +343,7 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 	// This runs before the empty-bucket return, which an inventory of nothing but
 	// exact names produces.
 	for name := range known {
-		if mapped, ok := lt.learnedLokiToVL[name]; ok {
-			delete(lt.learnedVLToLoki, mapped)
-		}
-		delete(lt.learnedLokiToVL, name)
+		lt.forgetLearnedAlias(name)
 		delete(lt.learnedAmbiguous, name)
 	}
 
@@ -336,6 +360,15 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 			continue
 		}
 		if len(bucket) != 1 {
+			if chain := leafAliasChain(alias, bucket); chain != nil {
+				lt.forgetLearnedAlias(alias)
+				delete(lt.learnedAmbiguous, alias)
+				lt.learnedChains[alias] = chain
+				for _, field := range chain {
+					lt.learnedVLToLoki[field] = alias
+				}
+				continue
+			}
 			lt.learnedAmbiguous[alias] = struct{}{}
 			lt.forgetLearnedAlias(alias)
 			continue
@@ -346,6 +379,11 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 		var candidate string
 		for field := range bucket {
 			candidate = field
+		}
+		// A chain learned earlier is stale once one field owns the alias:
+		// ToVLFields reads learnedChains first.
+		if _, chained := lt.learnedChains[alias]; chained {
+			lt.forgetLearnedAlias(alias)
 		}
 		if existing, ok := lt.learnedLokiToVL[alias]; ok && existing != candidate {
 			lt.learnedAmbiguous[alias] = struct{}{}
@@ -361,7 +399,8 @@ func (lt *LabelTranslator) LearnFieldAliases(fields []string) {
 	}
 }
 
-// forgetLearnedAlias drops both directions of an alias. Caller holds learnedMu.
+// forgetLearnedAlias drops both directions of an alias, single or chain.
+// Caller holds learnedMu.
 func (lt *LabelTranslator) forgetLearnedAlias(alias string) {
 	if mapped, ok := lt.learnedLokiToVL[alias]; ok {
 		if lt.learnedVLToLoki[mapped] == alias {
@@ -369,6 +408,48 @@ func (lt *LabelTranslator) forgetLearnedAlias(alias string) {
 		}
 	}
 	delete(lt.learnedLokiToVL, alias)
+	for _, field := range lt.learnedChains[alias] {
+		if lt.learnedVLToLoki[field] == alias {
+			delete(lt.learnedVLToLoki, field)
+		}
+	}
+	delete(lt.learnedChains, alias)
+}
+
+// leafAliasChain returns the sorted fields of bucket when EVERY one of them is
+// a Kubernetes label/annotation whose sanitised leaf is alias — the shape Loki
+// merges onto one label — and nil for any other collision.
+func leafAliasChain(alias string, bucket map[string]struct{}) []string {
+	if len(bucket) < 2 {
+		return nil
+	}
+	chain := make([]string, 0, len(bucket))
+	for field := range bucket {
+		if leafAlias(field) != alias {
+			return nil
+		}
+		chain = append(chain, field)
+	}
+	// Pod labels outrank namespace labels, as the configured `product` chain
+	// orders them; ties break alphabetically so the chain is deterministic.
+	sort.Slice(chain, func(i, j int) bool {
+		ri, rj := k8sContainerRank(chain[i]), k8sContainerRank(chain[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return chain[i] < chain[j]
+	})
+	return chain
+}
+
+// k8sContainerRank is the field's position in k8sLabelContainers.
+func k8sContainerRank(field string) int {
+	for i, prefix := range k8sLabelContainers {
+		if strings.HasPrefix(field, prefix) {
+			return i
+		}
+	}
+	return len(k8sLabelContainers)
 }
 
 // k8sLabelContainers are the VL field prefixes that hold a Kubernetes label or
@@ -902,6 +983,9 @@ func (lt *LabelTranslator) NeedsAliasDiscovery(lokiLabel string) bool {
 	lt.learnedMu.RLock()
 	defer lt.learnedMu.RUnlock()
 	if _, ambiguous := lt.learnedAmbiguous[label]; ambiguous {
+		return false
+	}
+	if _, chained := lt.learnedChains[label]; chained {
 		return false
 	}
 	_, learned := lt.learnedLokiToVL[label]

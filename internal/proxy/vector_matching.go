@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/translator"
 )
@@ -31,6 +32,96 @@ func (w *bufferedResponseWriter) Write(b []byte) (int, error) {
 }
 func (w *bufferedResponseWriter) WriteHeader(code int) {
 	w.code = code
+}
+
+// offsetShiftWriter buffers a metric response evaluated over an
+// offset-shifted window and moves its sample timestamps back onto the
+// client's grid. LogQL's `[5m] offset 1h` at time t reads (t-1h-5m, t-1h] and
+// REPORTS the value at t; the proxy shifts start/end/time by the offset before
+// dispatch, so every path answers at t-1h. Round 12, class D: the offset
+// series began an hour before `start` and P(t) equalled Loki's L(t+3600) on
+// 73 of 73 points.
+type offsetShiftWriter struct {
+	bufferedResponseWriter
+	dst    http.ResponseWriter
+	offset time.Duration
+}
+
+func newOffsetShiftWriter(dst http.ResponseWriter, offset time.Duration) *offsetShiftWriter {
+	return &offsetShiftWriter{dst: dst, offset: offset}
+}
+
+// flush writes the buffered response to the real writer, timestamps shifted.
+func (o *offsetShiftWriter) flush() {
+	body := o.body
+	if o.code == 0 || o.code == http.StatusOK {
+		body = shiftMetricTimestamps(body, o.offset)
+	}
+	copyHeaders(o.dst.Header(), o.Header())
+	o.dst.Header().Del("Content-Length")
+	if o.code != 0 && o.code != http.StatusOK {
+		o.dst.WriteHeader(o.code)
+	}
+	_, _ = o.dst.Write(body)
+}
+
+// clientTimeCopy returns a copy of body with its sample timestamps in the
+// CLIENT's coordinates. An offset query is answered from a window moved back
+// by offset and the writer shifts it on flush; a cache hit is written before
+// that writer exists, so the cached copy has to be shifted already.
+func clientTimeCopy(body []byte, offset time.Duration) []byte {
+	out := append([]byte(nil), body...)
+	if offset != 0 {
+		out = shiftMetricTimestamps(out, offset)
+	}
+	return out
+}
+
+// shiftMetricTimestamps adds offset to every sample timestamp of a Loki
+// matrix or vector response. Anything else (streams, errors) passes through.
+func shiftMetricTimestamps(body []byte, offset time.Duration) []byte {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+	data, _ := resp["data"].(map[string]interface{})
+	if data == nil {
+		return body
+	}
+	resultType, _ := data["resultType"].(string)
+	if resultType != "matrix" && resultType != "vector" {
+		return body
+	}
+	results, _ := data["result"].([]interface{})
+	shift := offset.Seconds()
+	shiftPoint := func(pt interface{}) {
+		arr, ok := pt.([]interface{})
+		if !ok || len(arr) == 0 {
+			return
+		}
+		if ts, ok := arr[0].(float64); ok {
+			arr[0] = ts + shift
+		}
+	}
+	for _, item := range results {
+		series, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if values, ok := series["values"].([]interface{}); ok {
+			for _, pt := range values {
+				shiftPoint(pt)
+			}
+		}
+		if value, ok := series["value"]; ok {
+			shiftPoint(value)
+		}
+	}
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // applyWithoutGrouping removes excluded labels from metric results and re-aggregates.

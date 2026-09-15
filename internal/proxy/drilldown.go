@@ -206,6 +206,19 @@ func dropEmptyDerivedLevelLabels(labels map[string]string) {
 	}
 }
 
+// dropEmptyLabels removes every label whose value is empty. A `by (x)` over
+// rows without x is `{x=""}` in VictoriaLogs and `{}` in Loki — an empty
+// value is "no label" there (round 12: `{strimzi_io_cluster=""}` keyed a
+// series Loki keys `{}`; the sums matched, the keys did not). Exact empty
+// only: a whitespace value is a value in Loki.
+func dropEmptyLabels(labels map[string]string) {
+	for key, value := range labels {
+		if value == "" {
+			delete(labels, key)
+		}
+	}
+}
+
 // extractLevelFromMsg attempts to detect a log level from a raw log line,
 // matching Loki's ingest-time automatic level detection behavior.
 // Handles JSON ({"level":"error"}) and logfmt (level=error key=val).

@@ -508,6 +508,11 @@ func (p *parser) parsePipelineStage() (Stage, error) {
 
 // parsePipeBody parses what comes after a bare `|`.
 func (p *parser) parsePipeBody() (Stage, error) {
+	// `| (a="1" or b="2")`: a parenthesised label-filter expression is a
+	// stage of its own (round 12: it was "expected stage name after |").
+	if p.cur.Typ == TokLParen {
+		return &LabelFilterStage{Raw: p.consumeRestOfStage()}, nil
+	}
 	if p.cur.Typ != TokIdent {
 		return nil, fmt.Errorf("logql: expected stage name after |, got %v", p.cur.Typ)
 	}
@@ -593,6 +598,11 @@ func (p *parser) parsePipeBody() (Stage, error) {
 	// Loki rejects this with "syntax error: unexpected IDENTIFIER".
 	if p.cur.Typ == TokIdent {
 		return nil, fmt.Errorf("logql: parse error: unexpected identifier %q after %q in pipeline stage", p.cur.Val, kw)
+	}
+	// `| ip("…")`: a function call is the OPERAND of a line or label filter,
+	// never a stage of its own (Loki: "syntax error: unexpected IP").
+	if p.cur.Typ == TokLParen {
+		return nil, fmt.Errorf("logql: parse error: unexpected %s", kw)
 	}
 	raw := kw + p.consumeRestOfStage()
 	return &LabelFilterStage{Raw: raw}, nil
@@ -839,17 +849,31 @@ func (p *parser) consumeBalancedParens() (endPos int, ok bool) {
 // consume the [duration] and closing ) tokens.
 func (p *parser) consumeRestOfStage() string {
 	var b strings.Builder
+	depth := 0 // parentheses the stage itself opened
+	// The two previous tokens: `!=`/`!~` right after an identifier that itself
+	// follows `and`/`or`/`,`/`(` is a label-filter operator (`… and z!="3"`),
+	// not a new line filter.
+	var prev, prevPrev Token
 	for {
 		switch p.cur.Typ {
 		case TokEOF, TokPipe, TokPipeEq, TokPipeTilde, TokPipeGt, TokBangGt,
-			TokLBracket, TokRParen:
+			TokLBracket:
 			return b.String()
+		case TokLParen:
+			depth++
+		case TokRParen:
+			// The stage's own `)` closes a group; an unmatched one closes the
+			// enclosing metric call and ends the stage.
+			if depth == 0 {
+				return b.String()
+			}
+			depth--
 		case TokBangEq, TokBangTilde:
 			// When b is non-empty we've already consumed `label=value` —
 			// the `!=`/`!~` here starts a NEW line filter stage; stop.
 			// When b is empty the `!=`/`!~` IS the label filter operator
 			// (e.g. `status!=200`); continue consuming.
-			if b.Len() > 0 {
+			if b.Len() > 0 && (prev.Typ != TokIdent || !startsLabelFilterOperand(prevPrev)) {
 				return b.String()
 			}
 		}
@@ -865,8 +889,20 @@ func (p *parser) consumeRestOfStage() string {
 			}
 		}
 		b.WriteString(raw)
+		prevPrev, prev = prev, p.cur
 		p.advance()
 	}
+}
+
+// startsLabelFilterOperand reports whether the token before an identifier
+// makes that identifier the LEFT side of a label-filter predicate: a logical
+// connector, a comma, an opening parenthesis, or nothing at all.
+func startsLabelFilterOperand(tok Token) bool {
+	switch tok.Typ {
+	case TokLParen, TokComma, TokAnd, TokOr:
+		return true
+	}
+	return tok.Typ == 0 && tok.Val == ""
 }
 
 // isAlphanumeric reports whether c is a letter, digit, or underscore —

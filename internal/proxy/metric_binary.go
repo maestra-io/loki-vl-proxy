@@ -394,6 +394,7 @@ func isLikelyHighCardinalityField(name string) bool {
 	// Suffix patterns — anything ending in _id/.id/_uuid/_token/_hash/_key is
 	// likely to carry a unique-per-request value.
 	return strings.HasSuffix(lower, "_id") ||
+		strings.HasSuffix(lower, "_uid") ||
 		strings.HasSuffix(lower, ".id") ||
 		strings.HasSuffix(lower, "_uuid") ||
 		strings.HasSuffix(lower, ".uuid") ||
@@ -2232,6 +2233,16 @@ func (p *Proxy) tryHighCardCountByTwoPhase(r *http.Request, logsqlQuery string) 
 	if !ok || spec.Func != "count" || len(spec.GroupBy) != 1 || isRateMathPipeline(logsqlQuery) {
 		return nil
 	}
+	// Same scope as the windowed-/hits path above: this is a top-N SELECTION
+	// (Phase 1 keeps maxDrilldownPhase2Values field values), right for a
+	// Drilldown page and for a Grafana panel on a *_id field, wrong for an
+	// exact aggregation. Round 12: a whole-cluster `sum by (pod)
+	// (count_over_time({namespace=~".+"}[1h]))` from a plain client answered
+	// 183 of Loki's 939 pods, HTTP 200, no warning — the direct path serves
+	// every series up to `-max-stats-query-series` and refuses honestly past it.
+	if !isGrafanaDrilldownRequest(r) && (!isGrafanaSourcedRequest(r) || !isLikelyHighCardinalityField(spec.GroupBy[0])) {
+		return nil
+	}
 	start := freezeRelativeRangeBound(r.FormValue("start"))
 	end := freezeRelativeRangeBound(r.FormValue("end"))
 	startNs, ok1 := parseLokiTimeToUnixNano(start)
@@ -2524,6 +2535,13 @@ func (p *Proxy) addUnderscorefallbackByLabels(logsqlQuery string, origGroupBy []
 			strings.ReplaceAll(vlLabel, ".", "_") == orig {
 			extras = append(extras, orig)
 		}
+		// The reverse case for a PARSED field: Loki's `| json` spells a nested
+		// key `a_b`, unpack_json spells it `a.b`; an unmapped underscore name
+		// after a parser groups by both, and the response coalesces them
+		// (ToLoki sanitises the dot back to the underscore).
+		if vlLabel == orig && afterParserQuery(logsqlQuery) && dottedAliasRE.MatchString(orig) {
+			extras = append(extras, quoteLogsQLIdent(strings.ReplaceAll(orig, "_", ".")))
+		}
 	}
 	if len(extras) == 0 {
 		return logsqlQuery
@@ -2538,6 +2556,37 @@ func (p *Proxy) addUnderscorefallbackByLabels(logsqlQuery string, origGroupBy []
 	}
 	insertAt := byIdx + closeIdx
 	return logsqlQuery[:insertAt] + ", " + strings.Join(extras, ", ") + logsqlQuery[insertAt:]
+}
+
+// dottedAliasRE matches the names the dotted alias applies to (the
+// translator's rule): identifier segments joined by single underscores.
+var dottedAliasRE = regexp.MustCompile(`^[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+$`)
+
+// afterParserQuery reports whether the translated query carries a parser stage,
+// i.e. whether its grouping labels may name parsed (dotted) fields. Only a
+// stage outside quotes counts: a literal filter for the text `| unpack_json`
+// is not a parser.
+func afterParserQuery(logsqlQuery string) bool {
+	inQuote := byte(0)
+	for i := 0; i < len(logsqlQuery); i++ {
+		ch := logsqlQuery[i]
+		switch {
+		case inQuote != 0:
+			if ch == '\\' && inQuote == '"' {
+				i++
+			} else if ch == inQuote {
+				inQuote = 0
+			}
+		case ch == '"' || ch == '`':
+			inQuote = ch
+		case ch == '|':
+			rest := logsqlQuery[i:]
+			if strings.HasPrefix(rest, "| unpack_json") || strings.HasPrefix(rest, "| unpack_logfmt") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // allRangeWindowsEqual returns (window, true) when every range vector in logql
@@ -3052,6 +3101,7 @@ func writeFilteredStatsQRSeriesFJ(buf *bytes.Buffer, seriesArr []*fj.Value, keep
 type trimTranslateResult struct {
 	metric   map[string]string // nil = metric unchanged
 	valsTrim bool              // at least one values point filtered by keep
+	drop     bool              // every values point filtered by keep: no series
 }
 
 // trimAndTranslateStatsQRFJ performs time-window filtering and metric-label
@@ -3127,18 +3177,28 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 		for ii, item := range slot.items {
 			res := &slotResults[si][ii]
 
-			// Pass 1: check whether any values points fall outside keep.
+			// Pass 1: check whether any values points fall outside keep. A
+			// series whose EVERY point is outside (VictoriaLogs also returns the
+			// bucket starting AT `end`, which relabels to one step past it) is
+			// dropped whole: Loki has no such series, and `"values":[]` is a
+			// phantom key (round 12: 44 of 183, 287 of 1234).
 			if keep != nil {
 				if values := item.Get("values"); values != nil {
 					pts, _ := values.Array()
+					kept := 0
 					for _, pt := range pts {
 						ptArr, _ := pt.Array()
-						if len(ptArr) > 0 && !keep(statsQRFJPointNano(ptArr[0])) {
+						if len(ptArr) == 0 {
+							continue
+						}
+						if keep(statsQRFJPointNano(ptArr[0])) {
+							kept++
+						} else {
 							res.valsTrim = true
 							needsRebuild = true
-							break
 						}
 					}
+					res.drop = res.valsTrim && kept == 0
 				}
 			}
 
@@ -3208,8 +3268,8 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 				delete(syntheticLabels, "detected_level")
 				delete(translated, "detected_level")
 			}
-			dropEmptyDerivedLevelLabels(syntheticLabels)
-			dropEmptyDerivedLevelLabels(translated)
+			dropEmptyLabels(syntheticLabels)
+			dropEmptyLabels(translated)
 			if hadStream {
 				ensureSyntheticServiceName(syntheticLabels)
 				if !serviceSignal && strings.TrimSpace(syntheticLabels["service_name"]) == unknownServiceName {
@@ -3326,11 +3386,16 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 // in a single write pass.
 func writeTrimmedTranslatedStatsFJ(buf *bytes.Buffer, items []*fj.Value, results []trimTranslateResult, keep func(int64) bool, scratch *[]byte) {
 	buf.WriteByte('[')
+	first := true
 	for i, item := range items {
-		if i > 0 {
+		res := results[i]
+		if res.drop {
+			continue
+		}
+		if !first {
 			buf.WriteByte(',')
 		}
-		res := results[i]
+		first = false
 		if res.metric != nil || res.valsTrim {
 			buf.WriteString(`{"metric":`)
 			if res.metric != nil {
@@ -3618,6 +3683,7 @@ func (p *Proxy) proxyStatsQuery(w http.ResponseWriter, r *http.Request, logsqlQu
 	}
 
 	body = p.translateStatsResponseLabelsWithContext(r.Context(), body, r.FormValue("query"))
+	body = dropEmptyAggregateInstantVector(body, originalLogql)
 	body = wrapAsLokiResponse(body, "vector")
 	if topK, topKDesc, hasTopK := parseTopKWrapper(r.FormValue("query")); hasTopK {
 		body = applyTopKToVector(body, topK, topKDesc)
@@ -4355,4 +4421,44 @@ func abs64(f float64) float64 {
 		return -f
 	}
 	return f
+}
+
+// dropEmptyAggregateInstantVector turns VictoriaLogs' answer for a bare
+// aggregation over NO rows into Loki's. `| stats count()` on an empty match is
+// one label-less row worth 0, `sum()`/`avg()` give NaN and `min()`/`max()`/
+// `quantile()` an empty string (measured on v1.52.0); Loki returns an empty
+// vector for every one of them (round 12, class B: eight instant panels drew
+// `{} 0` where Loki drew nothing). A count-family function cannot legitimately
+// answer 0 over rows — zero rows IS the empty vector — while an unwrap function
+// can (`sum_over_time` of zeros), so for those only the no-row markers go.
+func dropEmptyAggregateInstantVector(body []byte, originalLogql string) []byte {
+	if !hasOuterAggregationWithoutBy(originalLogql) {
+		return body
+	}
+	var resp struct {
+		Status string `json:"status"`
+		Data   struct {
+			ResultType string             `json:"resultType"`
+			Result     []lokiVectorResult `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Data.ResultType != "vector" || len(resp.Data.Result) != 1 {
+		return body
+	}
+	only := resp.Data.Result[0]
+	if len(only.Metric) != 0 || len(only.Value) != 2 {
+		return body
+	}
+	raw, _ := only.Value[1].(string)
+	countFamily := false
+	if spec, ok := parseOriginalRangeMetricSpec(originalLogql); ok {
+		countFamily = isAdditiveManualFunc(spec.Func)
+	}
+	switch {
+	case raw == "" || raw == "NaN":
+	case raw == "0" && countFamily:
+	default:
+		return body
+	}
+	return []byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`)
 }

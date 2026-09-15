@@ -593,12 +593,14 @@ func TestVLQuerySemantics(t *testing.T) {
 	parseNS := fmt.Sprintf("appparse-%d", runID)
 	r11NS := fmt.Sprintf("appr11-%d", runID)
 	msgNS := fmt.Sprintf("appmsg-%d", runID)
+	r12NS := fmt.Sprintf("appr12-%d", runID)
 
 	records := append(trowFixture(trowNS), levelFixture(mainNS, slowNS, tieNS)...)
 	records = append(records, chainFallbackFixture(chainNS)...)
 	records = append(records, parseFailureFixture(parseNS)...)
 	records = append(records, round11LevelFixture(r11NS)...)
 	records = append(records, msgAliasFixture(msgNS)...)
+	records = append(records, round12Fixture(r12NS)...)
 	ingest(t, base, records, now)
 
 	// LVP_TEST_PROXY_LOG=1 makes the proxy log every translated LogsQL query and
@@ -635,6 +637,9 @@ func TestVLQuerySemantics(t *testing.T) {
 	})
 	t.Run("Round11DetectedLevelOperators", func(t *testing.T) {
 		testRound11DetectedLevelOperators(t, p, r11NS, now)
+	})
+	t.Run("Round12EscapesParensDottedFields", func(t *testing.T) {
+		testRound12EscapesParensDottedFields(t, p, r12NS, now)
 	})
 	t.Run("Round11MsgFieldAlias", func(t *testing.T) {
 		testRound11MsgFieldAlias(t, p, msgNS, now)
@@ -712,6 +717,56 @@ func msgAliasFixture(ns string) []vlRecord {
 		mk(0, "2026 ERROR broker lost", map[string]interface{}{"x": 1}),
 		mk(1, "", map[string]interface{}{"message": "kept ERROR as a field", "x": 2}),
 		mk(2, "2026 INFO all good", map[string]interface{}{"x": 3}),
+	}
+}
+
+func round12Fixture(ns string) []vlRecord {
+	mk := func(i int, raw string, msg map[string]interface{}) vlRecord {
+		return vlRecord{tsOffset: -time.Duration(i+1) * time.Minute, namespace: ns, pod: "svc-0", container: "app", app: "svc", rawMsg: raw, msg: msg}
+	}
+	return []vlRecord{
+		mk(0, "2026-09-14 09:00:00 ERROR Graceful stop", map[string]interface{}{"x": 1}),
+		mk(1, "2026-09-14 09:00:01 ERROR Graceful stop", map[string]interface{}{"x": 2}),
+		mk(2, "nope", map[string]interface{}{"x": 3}),
+		mk(3, "", map[string]interface{}{"ExceptionDetails": map[string]interface{}{"StackTrace": "at Foo.bar", "Topic": "orders"}}),
+		mk(4, "", map[string]interface{}{"ExceptionDetails": map[string]interface{}{"StackTrace": "none", "Topic": "orders"}}),
+	}
+}
+
+// Round 12: N2 (a LogQL escape reaches VictoriaLogs quoted once), (b) a
+// parenthesised label-filter stage, (c) an underscore name after `| json`
+// reads the dotted key unpack_json produces. Every count is a known answer
+// by construction of round12Fixture.
+func testRound12EscapesParensDottedFields(t *testing.T, p *proxyProc, ns string, now time.Time) {
+	sel := fmt.Sprintf(`{namespace=%q}`, ns)
+	cases := []struct{ logql, want string }{
+		{sel + ` | json | message=~"\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2} ERROR .*"`, "2"},
+		{sel + ` | json | message=~"\\S+ \\S+ ERROR Graceful\\sstop"`, "2"},
+		{sel + ` |~ "^\\d{4}-\\d{2}-\\d{2} .* ERROR .*"`, "2"},
+		{sel + ` | json | (message=~"nope" or message=~".*ERROR.*")`, "3"},
+		{sel + ` | json | ExceptionDetails_StackTrace=~".*Foo.*"`, "1"},
+		{sel + ` | json | ExceptionDetails_StackTrace!="none" | ExceptionDetails_Topic="orders"`, "1"},
+	}
+	for _, c := range cases {
+		got := scalarByLabels(t, queryInstant(t, p, `sum(count_over_time(`+c.logql+` [1h]))`, now))
+		if len(got) != 1 {
+			t.Fatalf("%s: want one series, got %v", c.logql, got)
+		}
+		for _, v := range got {
+			if v != c.want {
+				t.Fatalf("%s: want %s, got %v", c.logql, c.want, got)
+			}
+		}
+	}
+	// Grouping by the Loki spelling of a nested key answers the dotted field.
+	got := scalarByLabels(t, queryInstant(t, p, `sum by (ExceptionDetails_Topic) (count_over_time(`+sel+` | json | ExceptionDetails_Topic!="" [1h]))`, now))
+	if len(got) != 1 {
+		t.Fatalf("by (ExceptionDetails_Topic): want one series, got %v", got)
+	}
+	for k, v := range got {
+		if !strings.Contains(k, `ExceptionDetails_Topic=orders`) || v != "2" {
+			t.Fatalf("by (ExceptionDetails_Topic): want {ExceptionDetails_Topic=orders}=2, got %v", got)
+		}
 	}
 }
 
@@ -1405,12 +1460,19 @@ func testPanelCompareDefects(t *testing.T, base string, p *proxyProc, ns, chainN
 	// T5. An outer aggregation over an UNGROUPED range aggregation has always
 	// produced two stats stages and has always been evaluated correctly; the
 	// two-stage guard added earlier must not divert it, at any step.
+	// The proxy truncates both bounds DOWN to the step grid as Loki does, so
+	// an `end` of "now" at step=1h lands before this run's rows and the window
+	// is empty for Loki too; the bounds are step multiples around the rows.
+	// Until round 12 an all-trimmed series still came back as `"values":[]`,
+	// which is what these two assertions used to pass on.
+	gridEnd := now.Truncate(time.Hour).Add(time.Hour)
+	gridStart := gridEnd.Add(-2 * time.Hour)
 	t.Run("T5 nested range function at any step", func(t *testing.T) {
 		logql := `max(quantile_over_time(0.95, ` + sel + ` | json | unwrap Duration [10m]))`
 		for _, step := range []time.Duration{time.Minute, 10 * time.Minute, time.Hour} {
-			resp := queryRange(t, p, logql, now.Add(-time.Hour), now, step)
-			if len(resp.Data.Result) == 0 {
-				t.Errorf("step %s: no series", step)
+			resp := queryRange(t, p, logql, gridStart, gridEnd, step)
+			if len(resp.Data.Result) == 0 || len(resp.Data.Result[0].Values) == 0 {
+				t.Errorf("step %s: no series with points: %+v", step, resp.Data.Result)
 			}
 		}
 	})
@@ -1419,8 +1481,8 @@ func testPanelCompareDefects(t *testing.T, base string, p *proxyProc, ns, chainN
 	// was the backends being dead from the S4/S5 OOM. Lock that it answers.
 	t.Run("S11 bytes_over_time", func(t *testing.T) {
 		logql := `bytes_over_time(` + sel + `[1h])`
-		if len(queryRange(t, p, logql, now.Add(-time.Hour), now, time.Hour).Data.Result) == 0 {
-			t.Error("bytes_over_time returned no series")
+		if resp := queryRange(t, p, logql, gridStart, gridEnd, time.Hour); len(resp.Data.Result) == 0 || len(resp.Data.Result[0].Values) == 0 {
+			t.Errorf("bytes_over_time returned no series with points: %+v", resp.Data.Result)
 		}
 		if len(queryInstant(t, p, logql, now).Data.Result) == 0 {
 			t.Error("bytes_over_time instant returned no series")
