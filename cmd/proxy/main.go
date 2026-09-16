@@ -166,6 +166,10 @@ type proxyRuntimeConfig struct {
 	lineFilterFieldsCSV                 string
 	derivedLevelGroupBy                 bool
 	lineField                           string
+	dedupeExactDuplicates               bool
+	bytesOverTimeSource                 string
+	recordExcludeFieldsCSV              string
+	lokiMaxLineSize                     int
 	labelValuesIndexedCache             bool
 	labelValuesHotLimit                 int
 	labelValuesIndexMaxEntries          int
@@ -591,6 +595,10 @@ func run(
 	lineFilterFieldsCSV := fs.String("line-filter-fields", "_msg", `Comma-separated VictoriaLogs fields a LogQL line filter (|=, !=, |~, !~) reads. Loki searches the whole stored line; a collector that splits the JSON wrapper into fields leaves only the message in _msg, so name the split-out keys here (for example "_msg,Scopes,Exception,Category,State.*"; a trailing * is a field-name wildcard). "_msg" alone keeps the upstream translation.`)
 	derivedLevelFieldsCSV := fs.String("derived-level-fields", "", `Comma-separated VL fields carrying a raw log level inside _msg (for example "level,loglevel,severity"). Enables level/detected_level matchers and normalises information->info, warning->warn. Empty keeps the upstream behaviour where level is a stored field.`)
 	derivedLevelGroupBy := fs.Bool("derived-level-group-by", false, "Append the unpack+coalesce+normalise pipe chain to queries that mention level, so `sum by (level)` groups server-side. Costs a full _msg unpack per matched entry.")
+	dedupeExactDuplicates := fs.Bool("dedupe-exact-duplicates", true, "Collapse rows with the same stream, timestamp and line into one, as Loki's ingester drops an exact duplicate of an entry already in the stream. Applied where the proxy reads rows (logs, and the count/bytes/rate paths that scan rows).")
+	bytesOverTimeSource := fs.String("bytes-over-time-source", "record", `What bytes_over_time / bytes_rate measure: "line" = len(_msg) (upstream); "record" = the line Loki stored via vector — the record's non-stream fields JSON-encoded, _msg as "message", plus the http_server wrapper (path, source_type, timestamp).`)
+	recordExcludeFieldsCSV := fs.String("record-exclude-fields", "kubernetes.*", "Comma-separated VL fields (trailing * = prefix wildcard) that are NOT part of the Loki line: the collector's own metadata. Used by -bytes-over-time-source=record and -loki-max-line-size.")
+	lokiMaxLineSize := fs.Int("loki-max-line-size", 0, "Drop rows whose Loki line exceeds this many bytes, as Loki's ingester did (limits_config.max_line_size with max_line_size_truncate=false). 0 disables. Native count/bytes/rate queries apply it only when they carry a line filter or a parser; a bare stream count skips it.")
 	lineField := fs.String("line-field", "", `VL field returned as the Loki log line. Empty (default) re-encodes the whole VL record as JSON, matching upstream. "_msg" returns the original message and falls back to the JSON form when _msg is absent.`)
 	labelValuesIndexedCache := fs.Bool("label-values-indexed-cache", false, "Enable indexed browse cache for /loki/api/v1/label/{name}/values (hot subset first for empty-query requests)")
 	labelValuesHotLimit := fs.Int("label-values-hot-limit", 200, "Default number of label values returned for empty-query browse requests when indexed cache is enabled")
@@ -853,6 +861,10 @@ func run(
 			lineFilterFieldsCSV:                 *lineFilterFieldsCSV,
 			derivedLevelGroupBy:                 *derivedLevelGroupBy,
 			lineField:                           *lineField,
+			dedupeExactDuplicates:               *dedupeExactDuplicates,
+			bytesOverTimeSource:                 *bytesOverTimeSource,
+			recordExcludeFieldsCSV:              *recordExcludeFieldsCSV,
+			lokiMaxLineSize:                     *lokiMaxLineSize,
 			labelValuesIndexedCache:             *labelValuesIndexedCache,
 			labelValuesHotLimit:                 *labelValuesHotLimit,
 			labelValuesIndexMaxEntries:          *labelValuesIndexMaxEntries,
@@ -2067,6 +2079,10 @@ func buildProxyConfig(cfg proxyRuntimeConfig) (proxy.Config, error) {
 		LineFilterFields:                   parseCSV(cfg.lineFilterFieldsCSV),
 		DerivedLevelGroupBy:                cfg.derivedLevelGroupBy,
 		LineField:                          strings.TrimSpace(cfg.lineField),
+		DedupeExactDuplicates:              &cfg.dedupeExactDuplicates,
+		BytesOverTimeSource:                strings.TrimSpace(cfg.bytesOverTimeSource),
+		RecordExcludeFields:                parseCSV(cfg.recordExcludeFieldsCSV),
+		LokiMaxLineSize:                    cfg.lokiMaxLineSize,
 		LabelValuesIndexedCache:            cfg.labelValuesIndexedCache,
 		LabelValuesHotLimit:                cfg.labelValuesHotLimit,
 		LabelValuesIndexMaxEntries:         cfg.labelValuesIndexMaxEntries,

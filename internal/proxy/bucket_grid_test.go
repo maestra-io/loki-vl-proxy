@@ -243,6 +243,7 @@ func TestQueryInstant_TopKOverExtractedLabelKeepsGrouping(t *testing.T) {
 	defer vlBackend.Close()
 
 	p := newGapTestProxy(t, vlBackend.URL)
+	p.dedupeExactDuplicates = false // the "b"/"c" rows are byte-identical; Loki's dedup is not under test here
 	params := url.Values{}
 	params.Set("query", `topk(2, sum by (repo) (count_over_time({app="trow"} | json | line_format "{{ or .message __line__ }}" | regexp "/v2/(?P<repo>[^/]+)/blobs/" | repo != "" [5m])))`)
 	params.Set("time", strconv.FormatInt(base.Add(5*time.Minute).Unix(), 10))

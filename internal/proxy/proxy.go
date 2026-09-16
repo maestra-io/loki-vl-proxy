@@ -253,6 +253,22 @@ type Config struct {
 	// DerivedLevelGroupBy appends the unpack + coalesce + normalise pipe chain to
 	// queries that reference level, so `sum by (level)` groups on VL's side.
 	DerivedLevelGroupBy bool
+	// DedupeExactDuplicates collapses rows with the same stream, timestamp and
+	// line into one, as Loki's ingester does. nil = true.
+	DedupeExactDuplicates *bool
+	// BytesOverTimeSource is what bytes_over_time / bytes_rate measure:
+	// "line" = len(_msg) (upstream), "record" = the line Loki stored — the
+	// record's non-stream fields JSON-encoded plus the vector http_server
+	// wrapper (see loki_record.go). Empty = "record".
+	BytesOverTimeSource string
+	// RecordExcludeFields lists the VL fields (a trailing * is a prefix
+	// wildcard) that are NOT part of the Loki line: the collector's own
+	// metadata. Empty = "kubernetes.*".
+	RecordExcludeFields []string
+	// LokiMaxLineSize drops rows whose Loki line exceeds this many bytes, as
+	// Loki's ingester did (`max_line_size` with `max_line_size_truncate:
+	// false`). 0 disables.
+	LokiMaxLineSize int
 	// LineField selects the VL field returned as the Loki log line. Empty keeps
 	// upstream behaviour (the whole VL record re-encoded as JSON). "_msg" returns
 	// the original message, falling back to the JSON form when _msg is absent.
@@ -509,6 +525,10 @@ type Proxy struct {
 	lineFilterFields                  []string         // VL fields a line filter reads besides _msg
 	derivedLevelGroupBy               bool             // materialise `level` server-side for group-by
 	lineFieldMsg                      bool             // return _msg as the Loki log line
+	dedupeExactDuplicates             bool             // collapse (stream, ts, line) duplicates like Loki's ingester
+	bytesSourceRecord                 bool             // bytes_over_time measures the Loki-stored line, not _msg
+	recordExcludeFields               []string         // VL fields outside the Loki line (kubernetes.*)
+	lokiMaxLineSize                   int              // Loki's max_line_size; rows above it are dropped
 	peerCache                         *cache.PeerCache // L3 fleet peer cache
 	peerAuthToken                     string
 	peerInsecureIPAllowlist           bool // gate the legacy IP-allowlist fallback (default false: token required)
@@ -1148,6 +1168,10 @@ func New(cfg Config) (*Proxy, error) {
 		lineFilterFields:                      normalizeLineFilterFields(cfg.LineFilterFields),
 		derivedLevelGroupBy:                   cfg.DerivedLevelGroupBy,
 		lineFieldMsg:                          strings.TrimSpace(cfg.LineField) == "_msg",
+		dedupeExactDuplicates:                 cfg.DedupeExactDuplicates == nil || *cfg.DedupeExactDuplicates,
+		bytesSourceRecord:                     strings.TrimSpace(cfg.BytesOverTimeSource) != "line",
+		recordExcludeFields:                   normalizeRecordExcludeFields(cfg.RecordExcludeFields),
+		lokiMaxLineSize:                       cfg.LokiMaxLineSize,
 		peerCache:                             cfg.PeerCache,
 		peerAuthToken:                         cfg.PeerAuthToken,
 		peerInsecureIPAllowlist:               cfg.PeerInsecureIPAllowlist,
@@ -1508,6 +1532,21 @@ func normalizeDerivedLevelFields(in []string) []string {
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// normalizeRecordExcludeFields trims -record-exclude-fields; empty means the
+// collector's `kubernetes.*` metadata.
+func normalizeRecordExcludeFields(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, f := range in {
+		if f = strings.TrimSpace(f); f != "" {
+			out = appendUniqueString(out, f)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"kubernetes.*"}
 	}
 	return out
 }

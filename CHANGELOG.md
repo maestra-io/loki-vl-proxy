@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`-bytes-over-time-source=line|record`** (default `record`) is what
+  `bytes_over_time` / `bytes_rate` measure. Loki stored the line the collector
+  shipped — every non-stream field of the record JSON-encoded with sorted keys,
+  `_msg` under `message`, plus the vector `http_server` wrapper (`path`,
+  `source_type`, a nine-digit `timestamp`) — while VictoriaLogs holds the same
+  fields split out and `sum_len(_msg)` counted the message alone (round 14,
+  A021: Loki 2049 bytes/h against 213). `record` re-derives the stored line's
+  size on VictoriaLogs' side (`pack_json` of the row minus `pack_json` of the
+  fields the wrapper never carried, `+88`) on the native and stats paths, and
+  in Go on the row-scanning paths; both are byte-exact against Loki on the
+  measured flux-operator (555/545), spark (130) and nexus (480) rows.
+  `-record-exclude-fields` (default `kubernetes.*`) names the collector's own
+  metadata that is not part of the line. `line` keeps `len(_msg)`.
+- **`-loki-max-line-size`** (default 0 = off) drops rows whose stored line
+  exceeds Loki's `limits_config.max_line_size` (512KB here, with
+  `max_line_size_truncate: false` Loki rejected the whole entry at ingest) —
+  VictoriaLogs kept them, so `count_over_time({product="tenant"} |= "Message
+  size too large" | json [1m])` counted 594 833-byte Kafka exceptions Loki
+  never had (round 14, A120: 11 of 262 points high by 1–2). The logs path and
+  the row-scanning metric paths apply it to every row; a native count applies
+  it only when the query already scans rows (a line filter, a label filter or
+  a parser) — a bare stream count stays a block-level count.
+- **`-dedupe-exact-duplicates`** (default `true`) collapses rows with the same
+  stream, timestamp and whole line into one, as Loki's ingester drops an exact
+  duplicate of an entry already in the stream. Applied where the proxy reads
+  rows (logs, and the count/bytes/rate paths that scan rows).
+
 - **`-msg-field-aliases`** (default `message,Message,msg,log`) names the JSON
   keys the collector lifts into `_msg` (vlagent `msgField`). After `| json`
   such a key is absent in VictoriaLogs while Loki, which stores the whole
@@ -43,6 +70,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   template text is never emitted as data.
 
 ### Fixed
+
+- **Round 14 (the real-query comparison on `1.63.1-maestra.17`).**
+  - After a parser stage `level` names the PARSED field. Loki's logfmt,
+    pattern and regexp read the line only, so the level the collector split out
+    of a JSON line is not among their output and `{namespace="flux-system"}
+    | decolorize | logfmt | level="error"` finds nothing — the proxy's derived
+    level filter matched the stored field (Loki 0, proxy 2). The stored
+    derived-level fields are dropped before such a parser (`| delete loglevel,
+    LogLevel, level, …`) and the filter reads the plain field; `| json` reads
+    the split-out field, which is the parsed one; a filter with no parser
+    before it keeps the derived chain. The proxy-side evaluator drops the same
+    labels at those parsers.
+  - A bare range aggregation over `| json` keyed its series by both spellings
+    of every split-out field (`State.ElapsedMilliseconds` and
+    `State_ElapsedMilliseconds`), `State_OriginalFormat` for Loki's
+    `State__OriginalFormat_`, and twelve `kubernetes_*` labels Loki never had
+    (the collector's metadata is not in the line). The series now carry the
+    parsed fields under Loki's spelling only, plus the lifted message as
+    `message`.
+  - Verified, not changed: both quantile implementations are Loki's formula
+    (rank = φ·(n−1), linear interpolation), locked by a test against a
+    reference port; the C013/C014 delta is Loki splitting `trow-0` by an
+    aggregator-only structured-metadata label, which VictoriaLogs never had.
 
 - **Round 13 (the real-query comparison on `1.63.1-maestra.16`).**
   - A `| level=~…` filter placed right after the stream selector injected

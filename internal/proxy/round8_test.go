@@ -128,6 +128,7 @@ func TestCollectRangeMetricSamples_FoldsFarMoreThanTenThousandRows(t *testing.T)
 	defer backend.Close()
 
 	p := newGapTestProxy(t, backend.URL)
+	p.dedupeExactDuplicates = false // the 25000 synthetic rows repeat 120 (ts, line) pairs; the cap is under test, not Loki's dedup
 	series, err := p.collectRangeMetricSamples(context.Background(), `app:="trow"`, nil, nil, false, "__count__", "",
 		base, base.Add(2*time.Minute))
 	if err != nil {

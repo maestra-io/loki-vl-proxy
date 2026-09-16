@@ -934,6 +934,14 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 		if translated != "" {
 			// Track parser state — after a parser, label filters become | filter
 			if isParserStage(translated) {
+				// Loki's logfmt/pattern/regexp read the line only; the level the
+				// collector split out of a JSON line is not among their output
+				// (E004: `| logfmt | level="error"` matched the stored field).
+				// Drop the stored level fields so only what the parser
+				// extracts from _msg is left for the filters after it.
+				if mapping.derivesLevel() && !strings.HasPrefix(translated, "| unpack_json") {
+					translated = "| delete " + strings.Join(mapping.DerivedLevelFields, ", ") + " " + translated
+				}
 				afterParser = true
 			}
 			// If this is a bare field filter after a parser, wrap it as | filter
@@ -984,6 +992,24 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 				parts = append(parts, translated)
 			}
 		}
+	}
+
+	if mapping != nil && mapping.recordPipesText != "" {
+		// The stored line is measured BEFORE the user's stages: a parser adds
+		// fields, `drop`/`keep`/`line_format` remove or rewrite them, and
+		// pack_json would count the row as the stages left it.
+		at := len(parts)
+		for i, part := range parts {
+			if strings.HasPrefix(part, "|") {
+				at = i
+				break
+			}
+		}
+		if at == 0 && len(streamParts) == 0 {
+			parts = append([]string{"*"}, parts...)
+			at = 1
+		}
+		parts = append(parts[:at], append([]string{mapping.recordPipesText}, parts[at:]...)...)
 	}
 
 	if coalesce := mapping.chainCoalescePipes(); len(coalesce) > 0 {
@@ -1477,7 +1503,10 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			if entry.entry.isRe && !strings.HasPrefix(rawValue, `ip("`) {
 				value = logsql.AnchorLabelMatcherRegex(rawValue)
 			}
-			if mapping.isDerivedLevelLabel(label) && rawValue != "" {
+			// After a parser stage `level` names the PARSED field (absent → the
+			// filter drops the line), not the level derived from the record;
+			// only a filter with no parser before it is served from _msg.
+			if mapping.isDerivedLevelLabel(label) && rawValue != "" && (!mapping.afterParser || label != "level") {
 				// The derived-level filter anchors the regexp itself (it matches it
 				// against the canonical levels); handing it the anchored form
 				// doubled the anchors in the emitted LogsQL.
@@ -2002,8 +2031,20 @@ func tryTranslateMetricQueryM(logql string, labelFn LabelTranslateFunc, mapping 
 			continue
 		}
 
+		// The Loki-stored line, re-derived on VictoriaLogs' side: bytes
+		// functions sum it, and Loki's max_line_size drop applies to it.
+		innerMapping := mapping
+		if pipes, bytesField := mapping.recordPipes(funcName == "bytes_over_time" || funcName == "bytes_rate", query); pipes != "" {
+			c := *mapping
+			c.recordPipesText = pipes
+			innerMapping = &c
+			if bytesField {
+				logsqlFunc = "sum(" + RecordBytesField + ")"
+			}
+		}
+
 		// Translate the inner log query part
-		logsqlQuery, err := translateLogQuery(query, labelFn, logsql.Capabilities{}, mapping)
+		logsqlQuery, err := translateLogQuery(query, labelFn, logsql.Capabilities{}, innerMapping)
 		if err != nil {
 			continue
 		}

@@ -79,6 +79,23 @@ type MappingOptions struct {
 	// filling it in from the message invented series the store does not have.
 	InferLevelFromText bool
 
+	// BytesSource is what bytes_over_time / bytes_rate measure: "record" sums
+	// the Loki-stored line re-derived by RecordBytesPipes; anything else keeps
+	// sum_len(_msg).
+	BytesSource string
+	// RecordExcludeFields are the VL fields outside the Loki line (the
+	// collector's own metadata, `kubernetes.*`).
+	RecordExcludeFields []string
+	// LokiMaxLineSize > 0 drops rows whose Loki line exceeds it, as Loki's
+	// ingester did (max_line_size, max_line_size_truncate=false).
+	LokiMaxLineSize int
+
+	// recordPipesText is set on the copy a metric translation hands to
+	// translateLogQuery: the RecordBytesPipes chain, appended after the user's
+	// stages and before the proxy's own coalesce/level chains, so a
+	// materialised label is not counted as part of the stored line.
+	recordPipesText string
+
 	// afterParser is set on the per-stage copy the pipeline loop hands out once
 	// a parser stage (`| json`, `| logfmt`, …) precedes the stage: the label
 	// filters that follow name PARSED fields, whose Loki spelling flattens
