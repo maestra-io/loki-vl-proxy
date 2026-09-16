@@ -106,6 +106,17 @@ jobs:
           aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
           aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }}
 
+          # Org-wide pull policy, the same one push-to-aws-ecr-repository and
+          # the aws-infra pull-through templates apply. Without it the
+          # repository is readable only from the registry's own account:
+          # us-omega/us-omicron pull through a mirror with an infra-account
+          # credential and never noticed, but the EU AWS clusters (their own
+          # accounts, node IAM role) got 403 on every pull (issues-maestra#1031,
+          # 2026-09-16). Set on every run, not only on create — the repository
+          # already existed without it.
+          aws ecr set-repository-policy --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} \
+            --policy-text file://.github/ecr-policy.json >/dev/null
+
       - name: Build and push
         run: |
           IMAGE="${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}"
