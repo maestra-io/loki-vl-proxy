@@ -259,6 +259,9 @@ func TestRound13_BareRangeIdentity_NativePath(t *testing.T) {
 		t.Fatalf("the bare aggregation must group by the stream and the mapped fields: %v", seen())
 	}
 	series := seriesLabels(t, rec.Body.Bytes())
+	if len(series) == 0 {
+		t.Fatalf("no series returned: %s", rec.Body.String())
+	}
 	assertStreamIdentity(t, "native", series, "helm-controller")
 	if series[0]["product"] != "infra" {
 		t.Fatalf("the product chain falls back to the namespace label: %v", series)
