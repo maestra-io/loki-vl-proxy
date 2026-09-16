@@ -1495,7 +1495,7 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			// After a parser stage `level` names the PARSED field (absent → the
 			// filter drops the line), not the level derived from the record;
 			// only a filter with no parser before it is served from _msg.
-			if mapping.isDerivedLevelLabel(label) && rawValue != "" && !(mapping.afterParser && label == "level") {
+			if mapping.isDerivedLevelLabel(label) && rawValue != "" && (!mapping.afterParser || label != "level") {
 				// The derived-level filter anchors the regexp itself (it matches it
 				// against the canonical levels); handing it the anchored form
 				// doubled the anchors in the emitted LogsQL.

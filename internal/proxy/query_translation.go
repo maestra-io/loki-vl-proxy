@@ -1125,37 +1125,7 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 		}
 		p.completeStreamIdentity(metric, entryFieldGetter(desc.rawLabels, entry), nil)
 		if includeParsedInMetric {
-			// Loki's series carry the parsed fields under Loki's spelling only:
-			// `State.{OriginalFormat}` is `State__OriginalFormat_`, never the
-			// dotted name; the collector's own metadata (kubernetes.*) was not
-			// in the line, so `| json` never produced it; and the lifted message
-			// is a field of the line (round 14, D030: the hybrid exposure put
-			// both spellings and 12 kubernetes_* labels on every series).
-			for key, value := range entry {
-				if isVLInternalField(key) || key == "_stream_id" || key == "level" || recordFieldExcluded(key, p.recordExcludeFields) {
-					continue
-				}
-				if _, isStream := desc.rawLabels[key]; isStream {
-					continue
-				}
-				sv, ok := stringifyEntryValue(value)
-				if !ok || strings.TrimSpace(sv) == "" {
-					continue
-				}
-				name := key
-				if !p.labelTranslator.IsPassthrough() {
-					name = logqlpkg.SanitizeLabel(key)
-				}
-				if spec.unwrapField != "" && (name == spec.unwrapField || key == spec.unwrapField) {
-					continue
-				}
-				metric[name] = sv
-			}
-			if len(p.msgFieldAliases) > 0 {
-				if _, present := metric[p.msgFieldAliases[0]]; !present && msg != "" {
-					metric[p.msgFieldAliases[0]] = msg
-				}
-			}
+			p.addParsedIdentity(metric, entry, desc.rawLabels, msg, spec.unwrapField)
 		}
 		seriesKey := canonicalLabelsKey(metric)
 		series, ok := seriesByKey[seriesKey]
@@ -1645,6 +1615,41 @@ func bareParserMetricWindowValue(funcName string, window []bareParserMetricSampl
 		return values[lower] + ((values[upper] - values[lower]) * weight)
 	default:
 		return 0
+	}
+}
+
+// addParsedIdentity adds a bare `| json` aggregation's parsed fields to the
+// series identity. Loki's series carry them under Loki's spelling only:
+// `State.{OriginalFormat}` is `State__OriginalFormat_`, never the dotted
+// name; the collector's own metadata (kubernetes.*) was not in the line, so
+// `| json` never produced it; and the lifted message is a field of the line
+// (round 14, D030: the hybrid exposure put both spellings and 12 kubernetes_*
+// labels on every series).
+func (p *Proxy) addParsedIdentity(metric map[string]string, entry map[string]interface{}, streamFields map[string]string, msg, unwrapField string) {
+	for key, value := range entry {
+		if isVLInternalField(key) || key == "_stream_id" || key == "level" || recordFieldExcluded(key, p.recordExcludeFields) {
+			continue
+		}
+		if _, isStream := streamFields[key]; isStream {
+			continue
+		}
+		sv, ok := stringifyEntryValue(value)
+		if !ok || strings.TrimSpace(sv) == "" {
+			continue
+		}
+		name := key
+		if !p.labelTranslator.IsPassthrough() {
+			name = logqlpkg.SanitizeLabel(key)
+		}
+		if unwrapField != "" && (name == unwrapField || key == unwrapField) {
+			continue
+		}
+		metric[name] = sv
+	}
+	if len(p.msgFieldAliases) > 0 {
+		if _, present := metric[p.msgFieldAliases[0]]; !present && msg != "" {
+			metric[p.msgFieldAliases[0]] = msg
+		}
 	}
 }
 
