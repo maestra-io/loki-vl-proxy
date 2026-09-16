@@ -63,7 +63,7 @@ func TestRound14_LevelFilterAfterParserReadsParsedField(t *testing.T) {
 // queries VictoriaLogs already evaluates per row.
 func TestRound14_RecordPipes(t *testing.T) {
 	m := round14Mapping()
-	const pipes = "| pack_json as __lvp_l | pack_json fields (_time, _stream, _stream_id, kubernetes.*) as __lvp_x | len(__lvp_l) as __lvp_a | len(__lvp_x) as __lvp_b | math __lvp_a - __lvp_b + 88 as __lvp_bytes | delete __lvp_l, __lvp_x, __lvp_a, __lvp_b"
+	const pipes = "| pack_json as __lvp_l | pack_json fields (_time, _stream, _stream_id, kubernetes.*) as __lvp_x | len(__lvp_l) as __lvp_a | len(__lvp_x) as __lvp_b | math __lvp_a - __lvp_b + 88 as __lvp_bytes | len(_msg) as __lvp_m | format if (_msg:~\"^[{]\") \"<__lvp_m>\" as __lvp_bytes | delete __lvp_l, __lvp_x, __lvp_a, __lvp_b, __lvp_m"
 	if got := RecordBytesPipes([]string{"kubernetes.*"}); got != pipes {
 		t.Fatalf("RecordBytesPipes = %s", got)
 	}

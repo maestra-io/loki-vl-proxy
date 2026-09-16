@@ -1646,8 +1646,10 @@ func (p *Proxy) addParsedIdentity(metric map[string]string, entry map[string]int
 		}
 		metric[name] = sv
 	}
-	if len(p.msgFieldAliases) > 0 {
-		if _, present := metric[p.msgFieldAliases[0]]; !present && msg != "" {
+	// The lifted message is a field of the line only when the collector lifted
+	// it: a row whose _msg IS the JSON line has no such key on Loki's side.
+	if len(p.msgFieldAliases) > 0 && msg != "" && !msgIsJSONLine([]byte(msg)) {
+		if _, present := metric[p.msgFieldAliases[0]]; !present {
 			metric[p.msgFieldAliases[0]] = msg
 		}
 	}

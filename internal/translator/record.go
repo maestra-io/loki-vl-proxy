@@ -32,14 +32,19 @@ var RecordInternalFields = []string{"_time", "_stream", "_stream_id"}
 
 // RecordBytesPipes returns the LogsQL pipes that compute the Loki line size
 // of every row into __lvp_bytes without touching any other field: pack the
-// whole row, pack the fields the wrapper never carried, take the difference.
-// Grouping by the excluded fields afterwards keeps working.
+// whole row, pack the fields the wrapper never carried, take the difference;
+// a row whose _msg is itself the JSON line (the collector lifted nothing) was
+// stored as that line, so its size is len(_msg). Grouping by the excluded
+// fields afterwards keeps working.
 func RecordBytesPipes(exclude []string) string {
 	x := append(append([]string(nil), RecordInternalFields...), exclude...)
 	return "| pack_json as __lvp_l | pack_json fields (" + strings.Join(x, ", ") + ") as __lvp_x" +
 		" | len(__lvp_l) as __lvp_a | len(__lvp_x) as __lvp_b" +
 		" | math __lvp_a - __lvp_b + " + strconv.Itoa(RecordWrapperBytes) + " as " + RecordBytesField +
-		" | delete __lvp_l, __lvp_x, __lvp_a, __lvp_b"
+		// A row whose _msg IS the JSON line (nothing lifted) was stored as
+		// that line: its size is len(_msg), not the wrapper.
+		" | len(_msg) as __lvp_m | format if (_msg:~\"^[{]\") \"<__lvp_m>\" as " + RecordBytesField +
+		" | delete __lvp_l, __lvp_x, __lvp_a, __lvp_b, __lvp_m"
 }
 
 // recordPipes returns the pipes a metric translation appends to its log

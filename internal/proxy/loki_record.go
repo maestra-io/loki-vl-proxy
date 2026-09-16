@@ -62,8 +62,17 @@ func jsonQuotedLen(s string) int {
 	return n
 }
 
+// msgIsJSONLine reports a row whose _msg is itself the JSON line: the
+// collector lifted nothing, Loki stored that line as is.
+func msgIsJSONLine(msg []byte) bool {
+	return len(msg) > 0 && msg[0] == '{'
+}
+
 // lokiRecordLineLenFJ is the Loki line size of a VL row (fastjson form).
 func lokiRecordLineLenFJ(v *fj.Value, exclude []string) int {
+	if msg := v.GetStringBytes("_msg"); msgIsJSONLine(msg) {
+		return len(msg)
+	}
 	obj, err := v.Object()
 	if err != nil {
 		return 0
@@ -86,6 +95,9 @@ func lokiRecordLineLenFJ(v *fj.Value, exclude []string) int {
 
 // lokiRecordLineLenMap is lokiRecordLineLenFJ for the map-decoded row.
 func lokiRecordLineLenMap(entry map[string]interface{}, exclude []string) int {
+	if msg, _ := stringifyEntryValue(entry["_msg"]); msgIsJSONLine([]byte(msg)) {
+		return len(msg)
+	}
 	n, count := 0, 0
 	for key, val := range entry {
 		if recordFieldExcluded(key, exclude) {

@@ -170,7 +170,7 @@ func TestRound14_BytesOverTimeSourceRecord(t *testing.T) {
 	}
 	logsql := translate(t, p, `sum by (app) (bytes_over_time({namespace="flux-system"}[1h]))`)
 	if !strings.Contains(logsql, "| pack_json as __lvp_l | pack_json fields (_time, _stream, _stream_id, kubernetes.*) as __lvp_x") ||
-		!strings.Contains(logsql, "math __lvp_a - __lvp_b + 88 as __lvp_bytes") || !strings.Contains(logsql, "sum(__lvp_bytes)") || strings.Contains(logsql, "sum_len") {
+		!strings.Contains(logsql, "math __lvp_a - __lvp_b + 88 as __lvp_bytes | len(_msg) as __lvp_m | format if (_msg:~\"^[{]\") \"<__lvp_m>\" as __lvp_bytes") || !strings.Contains(logsql, "sum(__lvp_bytes)") || strings.Contains(logsql, "sum_len") {
 		t.Fatalf("record bytes translation: %s", logsql)
 	}
 
