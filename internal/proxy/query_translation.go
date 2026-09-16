@@ -1123,8 +1123,17 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 			continue
 		}
 		msg, _ := stringifyEntryValue(entry["_msg"])
-		desc := p.logQueryStreamDescriptor(asString(entry["_stream"]), asString(entry["level"]), streamLabelCache, streamDescriptorCache)
+		levelStr := asString(entry["level"])
+		if p.bareIdentityDropsLevel() {
+			levelStr = ""
+		}
+		desc := p.logQueryStreamDescriptor(asString(entry["_stream"]), levelStr, streamLabelCache, streamDescriptorCache)
 		metric := cloneStringMap(desc.translatedLabels)
+		if p.bareIdentityDropsLevel() {
+			delete(metric, "level")
+			delete(metric, "detected_level")
+		}
+		p.completeStreamIdentity(metric, entryFieldGetter(desc.rawLabels, entry), nil)
 		if includeParsedInMetric {
 			_, parsedFields := p.classifyEntryMetadataFields(entry, desc.rawLabels, true, exposureCache, smBuf, pfBuf)
 			for key, value := range parsedFields {
@@ -2392,6 +2401,9 @@ func (p *Proxy) translateStatsResponseLabelsWithContext(ctx context.Context, bod
 				}
 			})
 
+			if hadStream && p.promoteStreamIdentity(translated, metricVal) {
+				changed = true
+			}
 			for k := range syntheticLabels {
 				delete(syntheticLabels, k)
 			}

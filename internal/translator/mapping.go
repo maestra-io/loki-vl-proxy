@@ -144,6 +144,9 @@ func (m *MappingOptions) isDerivedLevelLabel(label string) bool {
 	return m.derivesLevel() && (label == "level" || label == "detected_level")
 }
 
+// QuoteVLField is quoteVLField for callers outside the package.
+func QuoteVLField(field string) string { return quoteVLField(field) }
+
 // quoteVLField wraps a VL field name in double quotes when it is not a bare
 // LogsQL identifier. Dotted and slashed names (kubernetes.pod_labels.app,
 // kubernetes.pod_labels.app.kubernetes.io/name) must be quoted.
@@ -400,10 +403,16 @@ func (m *MappingOptions) derivedLevelPositive(value string) string {
 // levelUnpackPipes returns the pipe chain that exposes raw level fields from
 // _msg. JSON is unpacked first, then logfmt, matching the proxy's read-path
 // level detection order.
+//
+// keep_original_fields: the collector already split the line's JSON into
+// stored fields, and the message text is free text. Without it
+// `unpack_logfmt from _msg` OVERWROTE stored fields with whatever the text
+// happened to look like — the four pushhub Kafka errors lost their `Category`
+// and the line filter fanned out over it found nothing (round 13, class I).
 func levelUnpackPipes() []string {
 	return []string{
-		logsql.PipeUnpackJSON{From: "_msg"}.String(),
-		logsql.PipeUnpackLogfmt{From: "_msg"}.String(),
+		logsql.PipeUnpackJSON{From: "_msg", KeepOriginalFields: true}.String(),
+		logsql.PipeUnpackLogfmt{From: "_msg", KeepOriginalFields: true}.String(),
 	}
 }
 

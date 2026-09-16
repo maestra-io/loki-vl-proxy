@@ -765,9 +765,10 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 				parts = append(parts, "*")
 			}
 			if needsJSONUnpack {
-				parts = append(parts, logsql.PipeUnpackJSON{From: "_msg"}.String())
+				parts = append(parts, levelUnpackPipes()...)
+			} else {
+				parts = append(parts, "| unpack_logfmt")
 			}
-			parts = append(parts, "| unpack_logfmt")
 			for _, ff := range logfmtPipelineFilters {
 				parts = append(parts, "| filter "+ff)
 			}

@@ -2299,7 +2299,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	logsqlQuery = preserveMetricStreamIdentity(logqlQuery, logsqlQuery, withoutLabels)
+	logsqlQuery = p.preserveMetricStreamIdentity(logqlQuery, logsqlQuery, withoutLabels)
 	if isBareMetricFunctionQuery(strings.TrimSpace(logqlQuery)) && !isStatsQuery(logsqlQuery) {
 		p.writeError(w, http.StatusBadRequest, "unsupported metric query: range aggregations require compatible unwrap or translator support")
 		p.metrics.RecordRequest("query_range", http.StatusBadRequest, time.Since(start))
@@ -2599,7 +2599,7 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	logsqlQuery = preserveMetricStreamIdentity(logqlQuery, logsqlQuery, withoutLabels)
+	logsqlQuery = p.preserveMetricStreamIdentity(logqlQuery, logsqlQuery, withoutLabels)
 	if isBareMetricFunctionQuery(strings.TrimSpace(logqlQuery)) && !isStatsQuery(logsqlQuery) {
 		p.writeError(w, http.StatusBadRequest, "unsupported metric query: range aggregations require compatible unwrap or translator support")
 		p.metrics.RecordRequest("query", http.StatusBadRequest, time.Since(start))

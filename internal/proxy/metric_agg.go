@@ -174,17 +174,57 @@ func topLevelCommaIndex(s string) int {
 	return -1
 }
 
-func preserveMetricStreamIdentity(originalLogQL, translatedLogsQL string, withoutLabels []string) string {
+func (p *Proxy) preserveMetricStreamIdentity(originalLogQL, translatedLogsQL string, withoutLabels []string) string {
 	if !isStatsQuery(translatedLogsQL) {
 		return translatedLogsQL
 	}
+	bare := isBareMetricFunctionQuery(strings.TrimSpace(originalLogQL))
 	if strings.Contains(translatedLogsQL, "| stats by (") {
+		if bare {
+			// The translator's own default grouping for a bare rate(...) is the
+			// same `_stream, level` pair; key it the way Loki does (class G).
+			pipes, by := p.streamIdentityStats()
+			return strings.Replace(translatedLogsQL, "| stats by (_stream, level) ", pipes+"| stats "+by+" ", 1)
+		}
 		return translatedLogsQL
 	}
-	if len(withoutLabels) > 0 || isBareMetricFunctionQuery(strings.TrimSpace(originalLogQL)) {
-		return addStatsByStreamClause(translatedLogsQL)
+	if len(withoutLabels) > 0 || bare {
+		return p.addStatsByStreamClause(translatedLogsQL)
 	}
 	return translatedLogsQL
+}
+
+// streamIdentityStats is the LogsQL grouping of a bare range aggregation:
+// the stream, the stored level unless the proxy derives it (then it is no
+// stream label of Loki's), and every mapped label, so the response carries
+// app/product/node_name the way Loki's stream labels do (round 13, class G).
+// A fallback chain is materialised into its Loki name first — lowest priority
+// field first, each `format if` overwriting the last — so rows whose chains
+// resolve to one value are one series, not one per source field. The pipes
+// go before `| stats`, the by-clause replaces the translator's.
+func (p *Proxy) streamIdentityStats() (pipes, by string) {
+	parts := []string{"_stream"}
+	if !p.bareIdentityDropsLevel() {
+		parts = append(parts, "level")
+	}
+	var b strings.Builder
+	if p != nil {
+		for _, prom := range p.labelPromotions {
+			switch len(prom.fields) {
+			case 0:
+				// A computed label is joined in the response.
+			case 1:
+				parts = append(parts, translator.QuoteVLField(prom.fields[0]))
+			default:
+				for i := len(prom.fields) - 1; i >= 0; i-- {
+					q := translator.QuoteVLField(prom.fields[i])
+					b.WriteString("| format if (" + q + ":*) \"<" + prom.fields[i] + ">\" as " + prom.label + " ")
+				}
+				parts = append(parts, prom.label)
+			}
+		}
+	}
+	return b.String(), "by (" + strings.Join(parts, ", ") + ")"
 }
 
 func isBareMetricFunctionQuery(logql string) bool {
@@ -212,13 +252,13 @@ func isBareMetricFunctionQuery(logql string) bool {
 	return false
 }
 
-func addStatsByStreamClause(logsqlQuery string) string {
+func (p *Proxy) addStatsByStreamClause(logsqlQuery string) string {
 	idx := strings.Index(logsqlQuery, "| stats ")
 	if idx < 0 {
 		return logsqlQuery
 	}
-	statsStart := idx + len("| stats ")
-	return logsqlQuery[:statsStart] + "by (_stream, level) " + logsqlQuery[statsStart:]
+	pipes, by := p.streamIdentityStats()
+	return logsqlQuery[:idx] + pipes + "| stats " + by + " " + logsqlQuery[idx+len("| stats "):]
 }
 
 func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *http.Request, start time.Time, originalQuery string, postAgg instantMetricPostAgg) {
@@ -232,7 +272,7 @@ func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *htt
 		return
 	}
 	translatedInner, withoutLabels := translator.ParseWithoutMarker(translatedInner)
-	translatedInner = preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
+	translatedInner = p.preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
 
 	r = withOrgID(r)
 
@@ -327,7 +367,7 @@ func (p *Proxy) handleRangeMetricPostAggregation(w http.ResponseWriter, r *http.
 		return
 	}
 	translatedInner, withoutLabels := translator.ParseWithoutMarker(translatedInner)
-	translatedInner = preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
+	translatedInner = p.preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
 
 	r = withOrgID(r)
 

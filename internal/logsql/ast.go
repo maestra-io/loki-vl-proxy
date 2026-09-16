@@ -465,13 +465,22 @@ func (d DeferredExpr) statsFunc()     {}
 
 // PipeUnpackJSON unpacks JSON fields from log lines.
 // When From is non-empty the syntax is "| unpack_json from <From>".
-type PipeUnpackJSON struct{ From string }
+type PipeUnpackJSON struct {
+	From string
+	// KeepOriginalFields keeps a field the row already carries when the unpacked
+	// text names it too (VictoriaLogs overwrites by default).
+	KeepOriginalFields bool
+}
 
 func (p PipeUnpackJSON) String() string {
+	s := "| unpack_json"
 	if p.From != "" {
-		return "| unpack_json from " + p.From
+		s += " from " + p.From
 	}
-	return "| unpack_json"
+	if p.KeepOriginalFields {
+		s += " keep_original_fields"
+	}
+	return s
 }
 func (p PipeUnpackJSON) pipe() {}
 
@@ -512,13 +521,20 @@ type SortField struct {
 
 // PipeUnpackLogfmt unpacks logfmt key=value pairs from log lines.
 // When From is non-empty the syntax is "| unpack_logfmt from <From>".
-type PipeUnpackLogfmt struct{ From string }
+type PipeUnpackLogfmt struct {
+	From               string
+	KeepOriginalFields bool
+}
 
 func (p PipeUnpackLogfmt) String() string {
+	s := "| unpack_logfmt"
 	if p.From != "" {
-		return "| unpack_logfmt from " + p.From
+		s += " from " + p.From
 	}
-	return "| unpack_logfmt"
+	if p.KeepOriginalFields {
+		s += " keep_original_fields"
+	}
+	return s
 }
 func (p PipeUnpackLogfmt) pipe() {}
 
