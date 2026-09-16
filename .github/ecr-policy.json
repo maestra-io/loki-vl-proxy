@@ -1,0 +1,19 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowCrossAccountPull",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": [
+                "ecr:BatchGetImage",
+                "ecr:GetDownloadUrlForLayer"
+            ],
+            "Condition": {
+                "StringLike": {
+                    "aws:PrincipalOrgID": "o-mix46l0pxb"
+                }
+            }
+        }
+    ]
+}
