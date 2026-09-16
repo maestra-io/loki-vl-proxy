@@ -174,17 +174,43 @@ func topLevelCommaIndex(s string) int {
 	return -1
 }
 
-func preserveMetricStreamIdentity(originalLogQL, translatedLogsQL string, withoutLabels []string) string {
+func (p *Proxy) preserveMetricStreamIdentity(originalLogQL, translatedLogsQL string, withoutLabels []string) string {
 	if !isStatsQuery(translatedLogsQL) {
 		return translatedLogsQL
 	}
+	bare := isBareMetricFunctionQuery(strings.TrimSpace(originalLogQL))
 	if strings.Contains(translatedLogsQL, "| stats by (") {
+		if bare {
+			// The translator's own default grouping for a bare rate(...) is the
+			// same `_stream, level` pair; key it the way Loki does (class G).
+			return strings.Replace(translatedLogsQL, "| stats by (_stream, level) ", "| stats "+p.streamIdentityByClause()+" ", 1)
+		}
 		return translatedLogsQL
 	}
-	if len(withoutLabels) > 0 || isBareMetricFunctionQuery(strings.TrimSpace(originalLogQL)) {
-		return addStatsByStreamClause(translatedLogsQL)
+	if len(withoutLabels) > 0 || bare {
+		return p.addStatsByStreamClause(translatedLogsQL)
 	}
 	return translatedLogsQL
+}
+
+// streamIdentityByClause is the LogsQL grouping of a bare range aggregation:
+// the stream, the stored level unless the proxy derives it (then it is no
+// stream label of Loki's), and every field a mapped label reads, so the
+// response carries app/product/node_name the way Loki's stream labels do
+// (round 13, class G).
+func (p *Proxy) streamIdentityByClause() string {
+	parts := []string{"_stream"}
+	if !p.bareIdentityDropsLevel() {
+		parts = append(parts, "level")
+	}
+	if p != nil {
+		for _, prom := range p.labelPromotions {
+			for _, f := range prom.fields {
+				parts = append(parts, translator.QuoteVLField(f))
+			}
+		}
+	}
+	return "by (" + strings.Join(parts, ", ") + ")"
 }
 
 func isBareMetricFunctionQuery(logql string) bool {
@@ -212,13 +238,13 @@ func isBareMetricFunctionQuery(logql string) bool {
 	return false
 }
 
-func addStatsByStreamClause(logsqlQuery string) string {
+func (p *Proxy) addStatsByStreamClause(logsqlQuery string) string {
 	idx := strings.Index(logsqlQuery, "| stats ")
 	if idx < 0 {
 		return logsqlQuery
 	}
 	statsStart := idx + len("| stats ")
-	return logsqlQuery[:statsStart] + "by (_stream, level) " + logsqlQuery[statsStart:]
+	return logsqlQuery[:statsStart] + p.streamIdentityByClause() + " " + logsqlQuery[statsStart:]
 }
 
 func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *http.Request, start time.Time, originalQuery string, postAgg instantMetricPostAgg) {
@@ -232,7 +258,7 @@ func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *htt
 		return
 	}
 	translatedInner, withoutLabels := translator.ParseWithoutMarker(translatedInner)
-	translatedInner = preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
+	translatedInner = p.preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
 
 	r = withOrgID(r)
 
@@ -327,7 +353,7 @@ func (p *Proxy) handleRangeMetricPostAggregation(w http.ResponseWriter, r *http.
 		return
 	}
 	translatedInner, withoutLabels := translator.ParseWithoutMarker(translatedInner)
-	translatedInner = preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
+	translatedInner = p.preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
 
 	r = withOrgID(r)
 

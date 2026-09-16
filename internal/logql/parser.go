@@ -915,7 +915,7 @@ func isAlphanumeric(c byte) bool {
 func tokenRaw(tok Token) string {
 	switch tok.Typ {
 	case TokString:
-		return `"` + tok.Val + `"`
+		return quoteLogQLString(tok.Val)
 	case TokRawString:
 		return "`" + tok.Val + "`"
 	case TokEq:
@@ -1145,4 +1145,34 @@ func (p *parser) parseGrouping() (*Grouping, error) {
 	}
 
 	return &Grouping{Without: without, Labels: labels}, nil
+}
+
+// quoteLogQLString re-quotes a scanned string token so the stage text is a
+// valid LogQL literal again. The scanner keeps regexp escapes verbatim (`\d`
+// stays a backslash and a d) but turns `\\`, `\"`, `\n`, `\t` into the byte,
+// so those four are the ones to put back; wrapping the bare value in quotes
+// left `"\d{4}"`, which the evaluator's readQuoted unescaped a second time
+// into `d{4}` (round 13, N2).
+func quoteLogQLString(val string) string {
+	var b strings.Builder
+	b.Grow(len(val) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(val); i++ {
+		switch c := val[i]; c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

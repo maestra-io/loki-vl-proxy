@@ -44,6 +44,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Round 13 (the real-query comparison on `1.63.1-maestra.16`).**
+  - A `| level=~…` filter placed right after the stream selector injected
+    `unpack_json from _msg | unpack_logfmt from _msg`, and VictoriaLogs' unpack
+    pipes overwrite a stored field the free-text message happens to name — the
+    pushhub Kafka errors lost their `Category`, and the line filter fanned out
+    over it (`|~ "(?i)kafka"`) found nothing: {} against Loki's 4 (44 on
+    quizzes). Both injected pipes now carry `keep_original_fields`.
+  - `| json | __error__ != ""` matched EVERY line (26017 = all) and
+    `__error__ = ""` none: the collector had split the JSON line into fields and
+    left the message text in `_msg`, so the proxy-side `| json` failed on every
+    row while Loki, holding the whole line, parsed it. A row carrying split-out
+    fields (anything beyond `_*`, the stream and `kubernetes.*`/`k8s.*`
+    metadata) is a parsed line; only a plain-text row is a parser error.
+  - A double-quoted regexp in a label filter reached the proxy-side evaluator
+    (the logs path: `… | json | message=~"\d{4}-…" | line_format …`) unescaped
+    twice — the parser re-quoted the scanned value without its escapes — and
+    kept 0 of Loki's 1000 rows. Stage text is re-quoted losslessly; the
+    backtick form and the metric path were already right.
+  - A bare range aggregation (`count_over_time({namespace="flux-system"}[1h])`,
+    `bytes_over_time`, an unwrapped `min_over_time`) keyed its series by the
+    `_stream` fields plus the stored `level`: `app`, `product`, `node_name` and
+    the computed `job` were missing, the derived level split one pod into two
+    series and `service_name` named the container. Loki keys by every collector
+    label and no derived level — 11 series / 54 points against the proxy's
+    9 / 51. The raw, template and native stats paths now share that identity
+    (the native path groups by `_stream` and the mapped fields and resolves the
+    chains in the response); without `-derived-level-fields` the stored level
+    stays, as upstream has it.
+
 - **Round 12 (the round-11 comparison on `1.63.1-maestra.15`).**
   - A single-field `count by (field)` over more than 2h took the Drilldown
     top-N SELECTION for every client — Phase 1 keeps 200 field values — so a

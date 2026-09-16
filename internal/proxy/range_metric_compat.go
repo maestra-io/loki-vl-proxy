@@ -1326,9 +1326,19 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 			// Hot path: series identity depends only on _stream + level.
 			// Build once per unique (stream, level) pair and reuse across all matching lines.
 			cacheKey := streamStr + "|" + levelStr
+			bare := !byExplicit && len(origGroupBy) == 0
+			if bare {
+				cacheKey += p.promotionCacheKey(v)
+			}
 			seriesEntry = seriesCache[cacheKey]
 			if seriesEntry == nil {
 				seriesEntry = p.buildMetricSeriesEntry(streamStr, levelStr, groupBy, byExplicit, origGroupBy)
+				if bare {
+					// A bare range aggregation is keyed the way Loki keys it: the
+					// collector's labels, no derived level (round 13, class G).
+					p.completeStreamIdentity(seriesEntry.translated, fjFieldGetter(nil, v), nil)
+					seriesEntry.key = canonicalLabelsKey(seriesEntry.translated)
+				}
 				seriesCache[cacheKey] = seriesEntry
 			}
 		} else {
@@ -1400,16 +1410,27 @@ func (p *Proxy) buildMetricSeriesEntry(streamStr, levelStr string, groupBy []str
 	for k, v := range rawStreamLabels {
 		streamLabels[k] = v
 	}
-	if levelStr != "" {
+	// A bare range aggregation (no by/without in the LogQL) is keyed by the
+	// stream alone; the translator's default `by (_stream, level)` grouping is
+	// its own device, and the derived level is not a Loki stream label
+	// (round 13, class G).
+	bare := !byExplicit && len(origGroupBy) == 0
+	dropLevel := bare && p.bareIdentityDropsLevel()
+	if levelStr != "" && !dropLevel {
 		streamLabels["level"] = levelStr
 		streamLabels["detected_level"] = levelStr
 	}
-	if strings.TrimSpace(streamLabels["detected_level"]) == "" {
+	if strings.TrimSpace(streamLabels["detected_level"]) == "" && !dropLevel {
 		streamLabels["detected_level"] = "unknown"
 	}
 	ensureSyntheticServiceName(streamLabels)
 
-	metricLabels := buildManualMetricLabels(streamLabels, groupBy, byExplicit)
+	var metricLabels map[string]string
+	if bare {
+		metricLabels = buildManualMetricLabels(streamLabels, nil, false)
+	} else {
+		metricLabels = buildManualMetricLabels(streamLabels, groupBy, byExplicit)
+	}
 
 	// Rename VL-translated groupBy keys back to their original Loki names.
 	// Example: VL "level" was produced by translating Loki "detected_level";
@@ -2526,4 +2547,22 @@ func reduceLokiSeriesAcrossSeries(body []byte, agg string, by []string, without 
 		return body
 	}
 	return encoded
+}
+
+// promotionCacheKey appends the row's values of every field a label promotion
+// reads, so the per-stream series cache stays correct when two rows of one
+// _stream differ in a mapped label.
+func (p *Proxy) promotionCacheKey(v *fj.Value) string {
+	if len(p.labelPromotions) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	get := fjFieldGetter(nil, v)
+	for _, prom := range p.labelPromotions {
+		for _, f := range prom.fields {
+			b.WriteByte('|')
+			b.WriteString(get(f))
+		}
+	}
+	return b.String()
 }

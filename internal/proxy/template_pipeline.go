@@ -347,7 +347,7 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 				smFields[alias] = line
 			}
 		}
-		entry := logqlpkg.Entry{TS: time.Unix(0, ts), Line: line, Labels: merged}
+		entry := logqlpkg.Entry{TS: time.Unix(0, ts), Line: line, Labels: merged, SplitJSON: p.rowIsSplitJSON(v)}
 		if !plan.pipeline.Process(&entry) {
 			continue
 		}
@@ -372,6 +372,43 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 		return nil, rowsScanned, fmt.Errorf("scanning VL response: %w", scanErr)
 	}
 	return out, rowsScanned, nil
+}
+
+// rowIsSplitJSON reports whether the collector split the line's JSON into
+// stored fields: with -line-field=_msg the row carries a field that is neither
+// internal, nor a stream label, nor collector metadata (kubernetes.* / k8s.*).
+// A plain-text line has only the metadata. Loki's `| json` parsed the whole
+// stored line, so such a row must not read as a parser error (round 13, J).
+// ponytail: the metadata prefixes are the vlagent/Vector Kubernetes shape; add
+// a flag when another collector's metadata namespace shows up.
+func (p *Proxy) rowIsSplitJSON(v *fj.Value) bool {
+	if !p.lineFieldMsg {
+		return false
+	}
+	obj, err := v.Object()
+	if err != nil {
+		return false
+	}
+	streamRaw := parseStreamLabels(string(v.GetStringBytes("_stream")))
+	split := false
+	obj.Visit(func(key []byte, _ *fj.Value) {
+		if split {
+			return
+		}
+		k := string(key)
+		if isVLInternalField(k) || strings.HasPrefix(k, "_") {
+			return
+		}
+		if _, isStream := streamRaw[k]; isStream {
+			return
+		}
+		if strings.HasPrefix(k, "kubernetes.") || strings.HasPrefix(k, "kubernetes_") ||
+			strings.HasPrefix(k, "k8s.") || strings.HasPrefix(k, "k8s_") {
+			return
+		}
+		split = true
+	})
+	return split
 }
 
 // splitTemplateLabels classifies the post-pipeline label set. A key that still
@@ -601,7 +638,7 @@ func (p *Proxy) collectTemplatePipelineSamples(
 		if len(spec.GroupBy) == 0 && !spec.ByExplicit {
 			// A bare range aggregation keeps the labels Loki's pipeline would
 			// have produced — minus the unwrapped one, which Loki removes.
-			metric = bareTemplateIdentity(e, plan)
+			metric = p.bareTemplateIdentity(e, plan)
 			delete(metric, field)
 		} else {
 			metric = templateMetricLabels(e.labels, spec)
@@ -632,7 +669,7 @@ func (p *Proxy) collectTemplatePipelineSamples(
 // every row, so each row was its own series, the per-series quantile was the
 // sample itself and `max(quantile_over_time(0.5, …))` returned the maximum
 // (p50 == p95 == 1485 against Loki's 1204.5 / 1470.25).
-func bareTemplateIdentity(e *templateEntry, plan *templatePlan) map[string]string {
+func (p *Proxy) bareTemplateIdentity(e *templateEntry, plan *templatePlan) map[string]string {
 	if plan == nil || plan.broadParser {
 		out := make(map[string]string, len(e.labels))
 		for k, v := range e.labels {
@@ -648,11 +685,17 @@ func bareTemplateIdentity(e *templateEntry, plan *templatePlan) map[string]strin
 			out[k] = v
 		}
 	}
-	for _, k := range []string{"level", "detected_level"} {
-		if v := e.labels[k]; v != "" {
-			out[k] = v
+	// Loki's stream identity is every label the collector attached — the
+	// mapped ones (app, product, node_name) and the computed ones (job) as much
+	// as the _stream fields — and no derived level (round 13, class G).
+	if !p.bareIdentityDropsLevel() {
+		for _, k := range []string{"level", "detected_level"} {
+			if v := e.labels[k]; v != "" {
+				out[k] = v
+			}
 		}
 	}
+	p.completeStreamIdentity(out, func(string) string { return "" }, e.labels)
 	for k, v := range e.parsed {
 		if !strings.HasPrefix(k, "__") && v != "" {
 			out[k] = v

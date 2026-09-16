@@ -3246,6 +3246,9 @@ func (p *Proxy) trimAndTranslateStatsQRFJ(ctx context.Context, body []byte, keep
 				}
 			})
 
+			if hadStream && p.promoteStreamIdentity(translated, metricVal) {
+				changed = true
+			}
 			for k := range syntheticLabels {
 				delete(syntheticLabels, k)
 			}

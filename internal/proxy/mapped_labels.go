@@ -354,3 +354,51 @@ func namedCaptureFields(query string) map[string]struct{} {
 	}
 	return out
 }
+
+// completeStreamIdentity extends a translated stream-label set into the
+// identity Loki gives a bare range aggregation: the mapped labels (first
+// non-empty field of each chain, read through get), the computed ones, and a
+// service_name derived AFTER those so it names the app the way Loki's own
+// discovery does. present, when given, is a label set already holding the
+// mapped labels under their Loki names (the template path's merged row).
+func (p *Proxy) completeStreamIdentity(labels map[string]string, get func(string) string, present map[string]string) {
+	if p == nil || labels == nil {
+		return
+	}
+	for _, prom := range p.labelPromotions {
+		if v := strings.TrimSpace(present[prom.label]); v != "" && labels[prom.label] == "" {
+			labels[prom.label] = v
+		}
+	}
+	applyLabelPromotions(p.labelPromotions, labels, get)
+	if _, had := labels["service_name"]; had {
+		// Re-derive from the completed set: the earlier pass saw raw VL field
+		// names and named the container (or nothing) instead of the app.
+		delete(labels, "service_name")
+		ensureSyntheticServiceName(labels)
+	}
+}
+
+// bareIdentityDropsLevel reports whether a bare range aggregation keys its
+// series without level/detected_level: with -derived-level-fields the level is
+// derived from the line, not a stream label Loki would carry; without it the
+// stored level field is Loki's structured-metadata level and stays.
+func (p *Proxy) bareIdentityDropsLevel() bool {
+	return p != nil && len(p.derivedLevelFields) > 0
+}
+
+// promoteStreamIdentity resolves the mapped and computed labels on a stats
+// series that VictoriaLogs grouped by the stream AND the mapped fields (see
+// streamIdentityByClause): each chain first-non-empty, read from the raw
+// metric fields, then the computed joins — the logs path's rule (class G).
+func (p *Proxy) promoteStreamIdentity(translated map[string]string, metricVal *fj.Value) bool {
+	if p == nil || len(p.labelPromotions) == 0 || metricVal == nil {
+		return false
+	}
+	for _, prom := range p.labelPromotions {
+		delete(translated, prom.label)
+	}
+	return applyLabelPromotions(p.labelPromotions, translated, func(field string) string {
+		return string(metricVal.GetStringBytes(field))
+	})
+}

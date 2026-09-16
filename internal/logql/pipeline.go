@@ -54,6 +54,11 @@ type Entry struct {
 	TS     time.Time
 	Line   string
 	Labels map[string]string
+	// SplitJSON reports that the collector already parsed the line's JSON into
+	// the fields the entry carries as labels, leaving only the message text in
+	// Line. Loki holds the whole JSON line, so its `| json` succeeds there; a
+	// `| json` on the bare text must not record JSONParserErr (round 13, J).
+	SplitJSON bool
 }
 
 const (
@@ -393,7 +398,9 @@ func setError(labels map[string]string, kind, details string) {
 func parseJSONInto(e *Entry, params []LabelExtraction, out map[string]string) {
 	var v interface{}
 	if err := json.Unmarshal([]byte(e.Line), &v); err != nil {
-		setError(e.Labels, "JSONParserErr", err.Error())
+		if !e.SplitJSON {
+			setError(e.Labels, "JSONParserErr", err.Error())
+		}
 		return
 	}
 	if len(params) == 0 {
