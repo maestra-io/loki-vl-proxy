@@ -34,6 +34,14 @@ type Pipeline struct {
 	// VictoriaLogs spellings; a trailing `*` is a prefix wildcard.
 	LineFilterFields []string
 
+	// DerivedLevelFields names the labels the proxy derives a level from
+	// (-derived-level-fields). Loki's logfmt/pattern/regexp read the line
+	// only, so a level the collector split out of a JSON line is not among
+	// their output: those parsers drop these labels before merging what they
+	// extracted from the line, and `| logfmt | level="error"` then reads the
+	// parsed field, as Loki does. Empty keeps the labels.
+	DerivedLevelFields []string
+
 	// base is the label set the entry arrived with — its stream labels and
 	// structured metadata. LogQL gives those priority over anything a parser
 	// extracts: a `| json` that finds a `namespace` in the body does NOT
@@ -348,6 +356,12 @@ func (p *Pipeline) applyParser(st *ParserStage, e *Entry) {
 		p.parsed = make(map[string]string, 16)
 	}
 	clear(p.parsed)
+	if st.Type != ParserJSON && st.Type != ParserUnpack {
+		for _, f := range p.DerivedLevelFields {
+			delete(e.Labels, f)
+			delete(p.base, f)
+		}
+	}
 	switch st.Type {
 	case ParserJSON:
 		parseJSONInto(e, st.Params, p.parsed)

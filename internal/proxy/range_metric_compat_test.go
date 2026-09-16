@@ -1304,6 +1304,7 @@ func TestSumByBytesRate_NoParser_UsesSumLen(t *testing.T) {
 	defer vlBackend.Close()
 
 	p := newGapTestProxy(t, vlBackend.URL)
+	p.bytesSourceRecord = false // -bytes-over-time-source=line: the upstream sum_len(_msg) contract
 	params := url.Values{}
 	params.Set("query", `sum by (app) (bytes_rate({namespace="prod"}[5m]))`)
 	params.Set("start", strconv.FormatInt(base.Unix(), 10))

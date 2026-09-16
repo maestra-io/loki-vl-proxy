@@ -193,6 +193,7 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 	}()
 
 	first := true
+	dedup := p.newRowDedup()
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -206,6 +207,9 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 
 		timeStr, ok := stringifyEntryValue(entry["_time"])
 		if !ok || timeStr == "" {
+			continue
+		}
+		if p.rowOverMaxLineSizeMap(entry) || dedup.dupMap(entry) {
 			continue
 		}
 		msg, _ := stringifyEntryValue(entry["_msg"])
@@ -575,6 +579,7 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 		metadataMapPool.Put(pfBuf)
 	}()
 
+	dedup := p.newRowDedup()
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		for len(line) > 0 && (line[0] == ' ' || line[0] == '\t' || line[0] == '\r') {
@@ -602,6 +607,10 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 		timeStr := string(timeBytes)
 		tsNanos, ok := formatEntryTimestamp(timeStr)
 		if !ok {
+			vlFJParserPool.Put(fjParser)
+			continue
+		}
+		if p.rowOverMaxLineSizeFJ(fjVal) || dedup.dupFJ(fjVal) {
 			vlFJParserPool.Put(fjParser)
 			continue
 		}

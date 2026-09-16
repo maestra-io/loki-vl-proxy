@@ -79,6 +79,7 @@ func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templa
 		return nil, err
 	}
 	pipeline.LineFilterFields = p.lineFilterFields
+	pipeline.DerivedLevelFields = p.derivedLevelFields
 
 	p.metrics.RecordTemplatePipelineQuery()
 
@@ -200,6 +201,7 @@ func leadingLineFilters(stages []logqlpkg.Stage) []logqlpkg.Stage {
 type templateEntry struct {
 	ts     int64 // unix nanoseconds
 	line   string
+	bytes  float64 // bytes_over_time sample: the stored record, or the line a stage rewrote
 	labels map[string]string
 	stream map[string]string
 	sm     map[string]string
@@ -305,6 +307,7 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 
 	out := make([]templateEntry, 0, 256)
 	rowsScanned := 0
+	dedup := p.newRowDedup()
 	for scanner.Scan() {
 		raw := scanner.Bytes()
 		if len(raw) == 0 {
@@ -324,6 +327,9 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 		}
 		ts, ok := vlRowTimestampNanos(v)
 		if !ok {
+			continue
+		}
+		if p.rowOverMaxLineSizeFJ(v) || dedup.dupFJ(v) {
 			continue
 		}
 		streamLabels, smFields := p.templateEntryFields(v)
@@ -364,7 +370,12 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 			}
 			break
 		}
-		te := templateEntry{ts: ts, line: entry.Line, labels: entry.Labels}
+		te := templateEntry{ts: ts, line: entry.Line, labels: entry.Labels, bytes: float64(len(entry.Line))}
+		// Loki's bytes_over_time measures the line AFTER the pipeline; a
+		// pipeline that left it alone measured the stored record.
+		if entry.Line == line {
+			te.bytes = p.rowLineBytesFJ(v)
+		}
 		te.stream, te.sm, te.parsed = splitTemplateLabels(entry.Labels, streamLabels, smFields)
 		out = append(out, te)
 	}
@@ -715,7 +726,7 @@ func templateSampleValue(e *templateEntry, field, unwrapConv string) (float64, b
 	case "__count__":
 		return 1, true
 	case "__bytes__":
-		return float64(len(e.line)), true
+		return e.bytes, true
 	}
 	raw, ok := e.labels[field]
 	if !ok {

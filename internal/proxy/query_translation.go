@@ -1079,21 +1079,6 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 	seriesByKey := make(map[string]*bareParserMetricSeries, 16)
 	streamLabelCache := make(map[string]map[string]string, 16)
 	streamDescriptorCache := make(map[string]cachedLogQueryStreamDescriptor, 16)
-	exposureCache := make(map[string][]metadataFieldExposure, 16)
-
-	smBuf := metadataMapPool.Get().(map[string]string)
-	pfBuf := metadataMapPool.Get().(map[string]string)
-	defer func() {
-		for k := range smBuf {
-			delete(smBuf, k)
-		}
-		for k := range pfBuf {
-			delete(pfBuf, k)
-		}
-		metadataMapPool.Put(smBuf)
-		metadataMapPool.Put(pfBuf)
-	}()
-
 	// Include parsed fields in metric labels only when the base query has a
 	// post-parser pipe stage (e.g. "| json | status >= 500"). Without such a
 	// stage, grouping is by stream labels only — matching the native VL stats
@@ -1102,6 +1087,7 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 	// of the series identity (as in Loki).
 	includeParsedInMetric := hasPostParserPipeStage(spec.baseQuery)
 
+	dedup := p.newRowDedup()
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -1122,6 +1108,10 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 			vlEntryPool.Put(entry)
 			continue
 		}
+		if p.rowOverMaxLineSizeMap(entry) || dedup.dupMap(entry) {
+			vlEntryPool.Put(entry)
+			continue
+		}
 		msg, _ := stringifyEntryValue(entry["_msg"])
 		levelStr := asString(entry["level"])
 		if p.bareIdentityDropsLevel() {
@@ -1135,12 +1125,36 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 		}
 		p.completeStreamIdentity(metric, entryFieldGetter(desc.rawLabels, entry), nil)
 		if includeParsedInMetric {
-			_, parsedFields := p.classifyEntryMetadataFields(entry, desc.rawLabels, true, exposureCache, smBuf, pfBuf)
-			for key, value := range parsedFields {
-				if spec.unwrapField != "" && key == spec.unwrapField {
+			// Loki's series carry the parsed fields under Loki's spelling only:
+			// `State.{OriginalFormat}` is `State__OriginalFormat_`, never the
+			// dotted name; the collector's own metadata (kubernetes.*) was not
+			// in the line, so `| json` never produced it; and the lifted message
+			// is a field of the line (round 14, D030: the hybrid exposure put
+			// both spellings and 12 kubernetes_* labels on every series).
+			for key, value := range entry {
+				if isVLInternalField(key) || key == "_stream_id" || key == "level" || recordFieldExcluded(key, p.recordExcludeFields) {
 					continue
 				}
-				metric[key] = value
+				if _, isStream := desc.rawLabels[key]; isStream {
+					continue
+				}
+				sv, ok := stringifyEntryValue(value)
+				if !ok || strings.TrimSpace(sv) == "" {
+					continue
+				}
+				name := key
+				if !p.labelTranslator.IsPassthrough() {
+					name = logqlpkg.SanitizeLabel(key)
+				}
+				if spec.unwrapField != "" && (name == spec.unwrapField || key == spec.unwrapField) {
+					continue
+				}
+				metric[name] = sv
+			}
+			if len(p.msgFieldAliases) > 0 {
+				if _, present := metric[p.msgFieldAliases[0]]; !present && msg != "" {
+					metric[p.msgFieldAliases[0]] = msg
+				}
 			}
 		}
 		seriesKey := canonicalLabelsKey(metric)
@@ -1166,7 +1180,7 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 			}
 			weight = parsedValue
 		} else if spec.funcName == "bytes_over_time" || spec.funcName == "bytes_rate" {
-			weight = float64(len(msg))
+			weight = p.rowLineBytesMap(entry, msg)
 		}
 		series.samples = append(series.samples, bareParserMetricSample{tsNanos: tsNanos, value: weight})
 		vlEntryPool.Put(entry)
@@ -1308,6 +1322,12 @@ func (p *Proxy) fetchBareParserCountBytesViaStats(
 	logsqlQuery, translateErr := p.translateQueryWithContext(ctx, spec.baseQuery)
 	if translateErr != nil {
 		return nil, "", translateErr
+	}
+	if pipes, bytesField := p.recordStatsPipes(spec.funcName == "bytes_over_time" || spec.funcName == "bytes_rate", spec.baseQuery); pipes != "" {
+		logsqlQuery += " " + pipes
+		if bytesField {
+			statsFunc = "sum(" + translator.RecordBytesField + ") as c"
+		}
 	}
 
 	// Fetch one extra range-window of history before evalStart so the first
@@ -2788,16 +2808,23 @@ func (p *Proxy) buildMappingOptions(logql string) *translator.MappingOptions {
 	}
 	lt := p.labelTranslator
 	hasChains := lt.HasFallbackChains()
-	if !hasChains && len(p.computedLabels) == 0 && len(p.derivedLevelFields) == 0 && len(p.lineFilterFields) == 0 {
+	if !hasChains && len(p.computedLabels) == 0 && len(p.derivedLevelFields) == 0 && len(p.lineFilterFields) == 0 &&
+		!p.bytesSourceRecord && p.lokiMaxLineSize == 0 {
 		return nil
 	}
 	opts := &translator.MappingOptions{
-		DerivedLevelFields: p.derivedLevelFields,
-		MsgFieldAliases:    p.msgFieldAliases,
-		LineFilterFields:   p.lineFilterFields,
-		MaterializeLevel:   p.derivedLevelGroupBy && logqlGroupsByLevel(logql),
+		DerivedLevelFields:  p.derivedLevelFields,
+		MsgFieldAliases:     p.msgFieldAliases,
+		LineFilterFields:    p.lineFilterFields,
+		RecordExcludeFields: p.recordExcludeFields,
+		LokiMaxLineSize:     p.lokiMaxLineSize,
+		BytesSource:         "line",
+		MaterializeLevel:    p.derivedLevelGroupBy && logqlGroupsByLevel(logql),
 		// Only `detected_level` licenses inferring a level from the line text.
 		InferLevelFromText: p.derivedLevelGroupBy && logqlGroupsByDetectedLevel(logql),
+	}
+	if p.bytesSourceRecord {
+		opts.BytesSource = "record"
 	}
 	// A grouping by a fallback-chain label needs the chain coalesced into a real
 	// field first — VL cannot group by a Loki label that is backed by several

@@ -870,6 +870,7 @@ func TestExtractManualSampleValueFJ_Count(t *testing.T) {
 
 func TestExtractManualSampleValueFJ_Bytes_UsesMsg(t *testing.T) {
 	p := newGapTestProxy(t, "http://unused")
+	p.bytesSourceRecord = false // -bytes-over-time-source=line
 	var fjp fj.Parser
 	msg := "hello world"
 	v, _ := fjp.Parse(fmt.Sprintf(`{"_time":"2024-01-01T00:00:00Z","_msg":%q,"_stream":"{}"}`, msg))
@@ -881,6 +882,7 @@ func TestExtractManualSampleValueFJ_Bytes_UsesMsg(t *testing.T) {
 
 func TestExtractManualSampleValueFJ_Bytes_EmptyMsg(t *testing.T) {
 	p := newGapTestProxy(t, "http://unused")
+	p.bytesSourceRecord = false // -bytes-over-time-source=line
 	var fjp fj.Parser
 	v, _ := fjp.Parse(`{"_time":"2024-01-01T00:00:00Z","_msg":"","_stream":"{}"}`)
 	got, ok := p.extractManualSampleValueFJ(v, "__bytes__", "")

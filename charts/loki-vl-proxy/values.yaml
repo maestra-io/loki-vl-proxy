@@ -242,6 +242,10 @@ extraArgs:
   # Log line source: "" (default) re-encodes the whole VL record as JSON; "_msg" returns the original message
   # line-field: "_msg"
   # line-filter-fields: "_msg"        # fields a line filter (|=, !=, |~, !~) reads; list split-out JSON keys, e.g. "_msg,Scopes,Exception,Category,State.*"
+  # dedupe-exact-duplicates: "true"   # collapse (stream, timestamp, line) duplicates like Loki's ingester
+  # bytes-over-time-source: "record"  # "record" = the line Loki stored (non-stream fields JSON + vector http_server wrapper); "line" = len(_msg)
+  # record-exclude-fields: "kubernetes.*"  # VL fields that are not part of the Loki line (collector metadata)
+  # loki-max-line-size: "524288"      # drop rows Loki rejected at ingest (limits_config.max_line_size); 0 = off
   # Derived fields (trace linking)
   # derived-fields: '[{"name":"traceID","matcherRegex":"trace_id=([a-f0-9]+)","url":"http://tempo/trace/${__value.raw}"}]'
   # stream-response: "true"  # chunked transfer encoding for large results

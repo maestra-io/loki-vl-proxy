@@ -819,6 +819,7 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 		}
 	}()
 
+	dedup := p.newRowDedup()
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		for len(line) > 0 && (line[0] == ' ' || line[0] == '\t' || line[0] == '\r') {
@@ -845,6 +846,10 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 		}
 		tsNanos, ok := formatEntryTimestamp(string(timeBytes))
 		if !ok {
+			vlFJParserPool.Put(fjParser)
+			continue
+		}
+		if p.rowOverMaxLineSizeFJ(fjVal) || dedup.dupFJ(fjVal) {
 			vlFJParserPool.Put(fjParser)
 			continue
 		}

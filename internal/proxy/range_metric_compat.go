@@ -19,6 +19,7 @@ import (
 	fj "github.com/valyala/fastjson"
 
 	logqlpkg "github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
+	"github.com/ReliablyObserve/Loki-VL-proxy/internal/translator"
 )
 
 type statsCompatSpec struct {
@@ -783,6 +784,16 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 	case "__bytes__":
 		statsAggFunc = "sum_len(_msg) as c"
 	}
+	// The Loki-stored line bytes and/or Loki's max_line_size drop, on the
+	// non-parser fast path only: the drilldown parser-stage route strips the
+	// query down to existence checks and counts, where neither applies.
+	statsSpec, statsAggFuncRecord := spec, statsAggFunc
+	if pipes, bytesField := p.recordStatsPipes(field == "__bytes__", origSpec.BaseQuery); pipes != "" {
+		statsSpec.BaseQuery += " " + pipes
+		if bytesField {
+			statsAggFuncRecord = "sum(" + translator.RecordBytesField + ") as c"
+		}
+	}
 	// Sliding-window parser-stage queries (range > step) reach this path via
 	// shouldUseManualRangeMetricCompat returning true. Skip the stats_query_range
 	// fast path for them: VL's tumbling-bucket stats would diverge from LogQL's
@@ -812,7 +823,7 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 			// Fall through on error — coalescer failure is non-fatal.
 		}
 	}
-	if series, ok, capErr := p.collectStatsFastPathHits(r.Context(), spec, statsAggFunc, startTS.Add(-origSpec.Window), endTS, step); ok {
+	if series, ok, capErr := p.collectStatsFastPathHits(r.Context(), statsSpec, statsAggFuncRecord, startTS.Add(-origSpec.Window), endTS, step); ok {
 		if capErr != nil && !p.serveSeriesCapPartial(w, r, capErr) {
 			return true
 		}
@@ -1278,6 +1289,7 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 
 	rowsScanned := 0
+	dedup := p.newRowDedup()
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -1310,6 +1322,9 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 		}
 		if ts < 1e12 {
 			ts *= int64(time.Second)
+		}
+		if p.rowOverMaxLineSizeFJ(v) || dedup.dupFJ(v) {
+			continue
 		}
 
 		sampleValue, ok := p.extractManualSampleValueFJ(v, field, unwrapConv)
@@ -1496,7 +1511,7 @@ func (p *Proxy) extractManualSampleValueFJ(v *fj.Value, field, unwrapConv string
 	case "__count__":
 		return 1, true
 	case "__bytes__":
-		return float64(len(v.GetStringBytes("_msg"))), true
+		return p.rowLineBytesFJ(v), true
 	}
 
 	raw := p.lookupFJField(v, p.manualValueCandidateFields(field))
