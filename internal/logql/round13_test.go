@@ -42,9 +42,9 @@ func TestRound13_DoubleQuotedRegexpLabelFilterSurvivesReassembly(t *testing.T) {
 	}
 	// The reassembled text is a valid LogQL literal: parsing it again yields
 	// the same stage, and an escaped quote or backslash survives the trip.
-	got := quoteLogQLString(`a"b\c` + "\n")
+	got := tokenRaw(Token{Typ: TokString, Val: `a"b\c` + "\n"})
 	if got != `"a\"b\\c\n"` {
-		t.Fatalf("quoteLogQLString = %s", got)
+		t.Fatalf("tokenRaw = %s", got)
 	}
 }
 

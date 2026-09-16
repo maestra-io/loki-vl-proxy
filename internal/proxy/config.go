@@ -47,6 +47,8 @@ type HandlerConfig struct {
 	adminAuthToken                        string
 	rangeMetricRowLimit                   int
 	manualScanBudget                      *manualScanBudget
+	alignQueriesWithStep                  bool
+	orderedJSONMaxBytes                   int64 // ordered JSON metric byte cap (0=1 GiB)
 	tailAllowedOrigins                    map[string]struct{}
 	tailMode                              TailMode
 	metricsTrustProxyHeaders              bool
@@ -95,5 +97,6 @@ type HandlerConfig struct {
 	peerAuthToken                         string
 	cacheTTLLabels                        time.Duration
 	cacheTTLLabelValues                   time.Duration
+	metadataNegativeCacheTTL              time.Duration
 	logSampleN                            uint64
 }

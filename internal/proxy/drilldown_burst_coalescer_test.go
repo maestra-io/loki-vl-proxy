@@ -274,7 +274,7 @@ func TestDrilldownBurstCoalescer_CoalescesTwoFields(t *testing.T) {
 	}
 
 	c := newDrilldownBurstCoalescer(50, 30)
-	key := burstKey{orgID: "default", base: `{app="foo"}`, startSec: 1000, endSec: 2000, stepNs: int64(time.Minute)}
+	key := burstKey{orgID: "default", base: `{app="foo"}`, startNs: 1000, endNs: 2000, stepNs: int64(time.Minute)}
 
 	var wg sync.WaitGroup
 	for _, f := range []string{"trace_id", "span_id"} {
@@ -312,7 +312,7 @@ func TestDrilldownBurstCoalescer_MaxFieldsSplitsGroups(t *testing.T) {
 	}
 
 	c := newDrilldownBurstCoalescer(200, 2)
-	key := burstKey{orgID: "default", base: `{app="foo"}`, startSec: 1000, endSec: 2000, stepNs: int64(time.Minute)}
+	key := burstKey{orgID: "default", base: `{app="foo"}`, startNs: 1000, endNs: 2000, stepNs: int64(time.Minute)}
 
 	var wg sync.WaitGroup
 	for _, f := range []string{"f1", "f2", "f3"} {
@@ -339,7 +339,7 @@ func TestDrilldownBurstCoalescer_ContextCancellation(t *testing.T) {
 	}
 
 	c := newDrilldownBurstCoalescer(100, 30)
-	key := burstKey{orgID: "default", base: `{app="foo"}`, startSec: 1000, endSec: 2000, stepNs: int64(time.Minute)}
+	key := burstKey{orgID: "default", base: `{app="foo"}`, startNs: 1000, endNs: 2000, stepNs: int64(time.Minute)}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -431,5 +431,28 @@ func TestFusedFieldHits_VLNonSuccess(t *testing.T) {
 	_, err := fireFn(context.Background(), []string{"trace_id"})
 	if err == nil {
 		t.Fatal("expected error from non-success status, got nil")
+	}
+}
+
+// TestStripDrilldownExistenceFilters_KeepsFilterPrefixForRemainingTerms: a line
+// filter ANDed into the removed existence-filter stage must keep its own
+// | filter prefix, or VictoriaLogs rejects the query ("unexpected token after
+// [unpack_logfmt]") on every version.
+func TestStripDrilldownExistenceFilters_KeepsFilterPrefixForRemainingTerms(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`app:="api" | filter trace_id:!"" | stats by (trace_id) count()`, `app:="api"  | stats by (trace_id) count()`},
+		{`app:="api" ~"x" | unpack_logfmt | filter level:!"" ~"y"`, `app:="api" ~"x" | unpack_logfmt | filter ~"y"`},
+		{`app:="api" ~"x" | format "<status>" | filter level:!"" ~"y" | stats by (level) count()`, `app:="api" ~"x" | format "<status>" | filter ~"y" | stats by (level) count()`},
+		{`app:="api" | unpack_json | filter "k8s.pod.name":!"" -level:*`, `app:="api" | unpack_json | filter -level:*`},
+		{`app:="api" | filter level:!""`, `app:="api" `},
+	}
+	for _, tc := range cases {
+		if got := stripDrilldownExistenceFilters(tc.in); got != tc.want {
+			t.Errorf("stripDrilldownExistenceFilters(%q)\n got: %q\nwant: %q", tc.in, got, tc.want)
+		}
+	}
+	base, field, ok := detectDrilldownSingleFieldWithParser(`app:="api" ~"x" | unpack_logfmt | filter level:!"" ~"y" | stats by (level) count()`)
+	if !ok || field != "level" || base != `app:="api" ~"x" | unpack_logfmt | filter ~"y"` {
+		t.Fatalf("detectDrilldownSingleFieldWithParser: base=%q field=%q ok=%v", base, field, ok)
 	}
 }

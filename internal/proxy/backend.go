@@ -100,8 +100,12 @@ func (p *Proxy) recordUpstreamObservation(ctx context.Context, system, method, r
 		logAttrs = append(logAttrs, "server.port", serverPort)
 	}
 	if err != nil {
+		errorType := "transport"
+		if statusCode == 499 {
+			errorType = "canceled"
+		}
 		logAttrs = append(logAttrs,
-			"error.type", "transport",
+			"error.type", errorType,
 			"error.message", err.Error(),
 		)
 	}
@@ -301,6 +305,7 @@ func (p *Proxy) storeBackendVersion(raw, semver string) {
 	p.backendSupportsDensePatternWindowing = caps.supportsDensePatternWin
 	p.backendSupportsMetadataSubstring = caps.supportsMetadataSubstring
 	p.backendSupportsColumnFieldValues = caps.supportsColumnFieldValues
+	p.backendSupportsStatsRangeOffset = semverAtLeast(semver, 1, 45, 0)
 	if !p.backendVersionLogged {
 		p.backendVersionLogged = true
 		p.log.Info(
@@ -363,6 +368,56 @@ func (p *Proxy) supportsColumnIndexedFields() bool {
 	p.backendVersionMu.RLock()
 	defer p.backendVersionMu.RUnlock()
 	return p.backendSupportsColumnFieldValues
+}
+
+// backendVersionReprobeInterval spaces metrics version probes while the backend
+// version is still unknown.
+const backendVersionReprobeInterval = 5 * time.Minute
+
+// supportsStatsRangeOffset reports whether stats_query_range honours the offset
+// arg (VictoriaLogs v1.45+). Older releases silently ignore it and align buckets
+// to the epoch, so an unknown version (failed or pending probe) is treated as
+// unsupported: only epoch-aligned grids use buckets, others the raw evaluator.
+// While the version is unknown, the metrics probe is retried in the background.
+func (p *Proxy) supportsStatsRangeOffset() bool {
+	p.backendVersionMu.RLock()
+	known, supported := p.backendVersionSemver != "", p.backendSupportsStatsRangeOffset
+	p.backendVersionMu.RUnlock()
+	if !known {
+		p.maybeReprobeBackendVersion(time.Now())
+	}
+	return supported
+}
+
+// maybeReprobeBackendVersion starts at most one background metrics probe per
+// backendVersionReprobeInterval, bounded by the version check timeout, so a
+// startup probe that failed (backend not ready, /metrics not routed) does not
+// pin version-gated behaviour for the process lifetime. It never blocks the
+// calling request.
+func (p *Proxy) maybeReprobeBackendVersion(now time.Time) {
+	last := p.backendVersionProbedAt.Load()
+	if now.UnixNano()-last < int64(backendVersionReprobeInterval) || !p.backendVersionProbedAt.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	timeout := p.backendVersionCheckTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	stop := p.keepWarmStop // closed by Shutdown
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if stop != nil {
+			go func() {
+				select {
+				case <-stop:
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
+		}
+		p.probeBackendVersionFromMetrics(ctx)
+	}()
 }
 
 func (p *Proxy) backendVersionState() (raw, semver, profile string) {
@@ -586,17 +641,7 @@ func (p *Proxy) ValidateBackendVersionCompatibility(ctx context.Context) error {
 // Callers must either hold a breaker.Allow() token or use DoWithGuard (which
 // enforces the guard before fn is called).
 func (p *Proxy) vlGetInner(ctx context.Context, path string, params url.Values) (*http.Response, error) {
-	// Inject tenant label filter when configured and orgID is a non-default single tenant.
-	if p.tenantLabel != "" {
-		if orgID := getOrgID(ctx); orgID != "" && !isDefaultTenantAlias(orgID) && orgID != "*" {
-			p.configMu.RLock()
-			_, hasMapped := p.tenantMap[orgID]
-			p.configMu.RUnlock()
-			if !hasMapped {
-				params = injectTenantLabelFilter(params, p.tenantLabel, orgID)
-			}
-		}
-	}
+	params = p.scopedTenantParams(ctx, params)
 	u := *p.backend
 	u.Path = path
 	u.RawQuery = params.Encode()
@@ -609,14 +654,14 @@ func (p *Proxy) vlGetInner(ctx context.Context, path string, params url.Values) 
 	p.forwardTenantHeaders(req)
 	p.applyBackendHeaders(req)
 	start := time.Now()
-	resp, err := p.client.Do(req)
+	resp, err := p.doBackendRequest(req, p.client)
 	duration := time.Since(start)
 	serverPort, _ := strconv.Atoi(u.Port())
 	if err != nil {
 		err = p.sanitizeUpstreamError(err)
-		mappedStatus := statusFromUpstreamErr(err)
+		mappedStatus := upstreamErrorStatus(ctx, err)
 		p.recordUpstreamObservation(ctx, "vl", http.MethodGet, path, u.Hostname(), serverPort, mappedStatus, duration, err, params.Get("query"))
-		if shouldRecordBreakerFailure(err) {
+		if shouldRecordBreakerFailure(ctx, err) {
 			p.breaker.RecordFailure()
 		}
 		return nil, err
@@ -668,16 +713,7 @@ func (p *Proxy) vlGet(ctx context.Context, path string, params url.Values) (*htt
 // decodes compression. It does NOT interact with the circuit breaker — callers are
 // responsible for Allow() checks and RecordFailure/RecordSuccess calls.
 func (p *Proxy) vlPostHTTP(ctx context.Context, path string, params url.Values) (*http.Response, error) {
-	if p.tenantLabel != "" {
-		if orgID := getOrgID(ctx); orgID != "" && !isDefaultTenantAlias(orgID) && orgID != "*" {
-			p.configMu.RLock()
-			_, hasMapped := p.tenantMap[orgID]
-			p.configMu.RUnlock()
-			if !hasMapped {
-				params = injectTenantLabelFilter(params, p.tenantLabel, orgID)
-			}
-		}
-	}
+	params = p.scopedTenantParams(ctx, params)
 	u := *p.backend
 	u.Path = path
 	p.log.Debug("VL request", "method", "POST", "url", u.String(), "params", redactQuery(params.Encode(), p.debugLogRawQueries))
@@ -689,12 +725,12 @@ func (p *Proxy) vlPostHTTP(ctx context.Context, path string, params url.Values) 
 	p.forwardTenantHeaders(req)
 	p.applyBackendHeaders(req)
 	start := time.Now()
-	resp, err := p.client.Do(req)
+	resp, err := p.doBackendRequest(req, p.client)
 	duration := time.Since(start)
 	serverPort, _ := strconv.Atoi(u.Port())
 	if err != nil {
 		err = p.sanitizeUpstreamError(err)
-		mappedStatus := statusFromUpstreamErr(err)
+		mappedStatus := upstreamErrorStatus(ctx, err)
 		p.recordUpstreamObservation(ctx, "vl", http.MethodPost, path, u.Hostname(), serverPort, mappedStatus, duration, err, params.Get("query"))
 		return nil, err
 	}
@@ -713,7 +749,7 @@ func (p *Proxy) vlPostHTTP(ctx context.Context, path string, params url.Values) 
 func (p *Proxy) vlPostInner(ctx context.Context, path string, params url.Values) (*http.Response, error) {
 	resp, err := p.vlPostHTTP(ctx, path, params)
 	if err != nil {
-		if shouldRecordBreakerFailure(err) {
+		if shouldRecordBreakerFailure(ctx, err) {
 			p.breaker.RecordFailure()
 		}
 		return nil, err
@@ -746,6 +782,7 @@ func (p *Proxy) vlGetCoalesced(ctx context.Context, key, path string, params url
 // When the circuit breaker is open and a request for the same key is already
 // in-flight, this call joins the in-flight rather than failing immediately.
 func (p *Proxy) vlGetCoalescedWithStatus(ctx context.Context, key, path string, params url.Values) (int, []byte, error) {
+	key += ":scope:" + p.contextScopeFingerprint(ctx)
 	status, _, body, err := p.coalescer.DoWithGuard(key, p.breaker.Allow, func() (*http.Response, error) {
 		return p.vlGetInner(ctx, path, params)
 	})
@@ -760,6 +797,7 @@ func (p *Proxy) vlGetCoalescedWithStatus(ctx context.Context, key, path string, 
 
 // vlPostCoalesced wraps vlPostInner with request coalescing and a CB guard.
 func (p *Proxy) vlPostCoalesced(ctx context.Context, key, path string, params url.Values) (int, []byte, error) {
+	key += ":scope:" + p.contextScopeFingerprint(ctx)
 	status, _, body, err := p.coalescer.DoWithGuard(key, p.breaker.Allow, func() (*http.Response, error) {
 		return p.vlPostInner(ctx, path, params)
 	})

@@ -39,7 +39,17 @@ func extractDropKeepFromAST(query string) (
 		bareKeepFields = translator.ParseBareKeepFields(query)
 		return
 	}
-	for _, stage := range lq.Pipeline {
+	return dropKeepFromPipeline(lq.Pipeline)
+}
+
+// dropKeepFromPipeline extracts drop/keep conditions from a parsed pipeline.
+func dropKeepFromPipeline(pipeline []logqlpkg.Stage) (
+	dropConds []translator.DropCondition,
+	keepConds []translator.DropCondition,
+	bareDropFields []string,
+	bareKeepFields []string,
+) {
+	for _, stage := range pipeline {
 		switch s := stage.(type) {
 		case *logqlpkg.DropStage:
 			bareDropFields = append(bareDropFields, s.Labels...)
@@ -96,8 +106,7 @@ func (p *Proxy) proxyLogQuery(w http.ResponseWriter, r *http.Request, logsqlQuer
 	// Propagate VL error status to the client with Loki-compatible error format.
 	if resp.StatusCode >= 400 {
 		body, _ := readBodyLimited(resp.Body, maxUpstreamErrorBodyBytes)
-		errMsg := p.redactedBackendErrorMessage(resp.StatusCode, body)
-		p.writeError(w, resp.StatusCode, errMsg)
+		p.writeBackendError(w, resp.StatusCode, body)
 		return
 	}
 
@@ -105,7 +114,9 @@ func (p *Proxy) proxyLogQuery(w http.ResponseWriter, r *http.Request, logsqlQuer
 	categorizedLabels := requestWantsCategorizedLabels(r)
 	emitStructuredMetadata := p.shouldEmitStructuredMetadata(r)
 	p.metrics.RecordTupleMode(tupleModeForRequest(categorizedLabels, emitStructuredMetadata))
-	if p.streamResponse {
+	// Formatting must run through the bounded template evaluator before writing
+	// a response. The streaming path otherwise skips Go template functions.
+	if p.streamResponse && !lineFormatTemplateRE.MatchString(r.FormValue("query")) {
 		p.streamLogQuery(w, resp, r.FormValue("query"), categorizedLabels, emitStructuredMetadata)
 		return
 	}
@@ -146,7 +157,10 @@ func (p *Proxy) proxyLogQuery(w http.ResponseWriter, r *http.Request, logsqlQuer
 		decolorizeStreams(streams)
 	}
 	if tmpl := extractLineFormatTemplate(logqlQuery); tmpl != "" {
-		applyLineFormatTemplate(streams, tmpl)
+		if err := applyLineFormatTemplateWithContext(r.Context(), streams, tmpl); err != nil {
+			p.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	writeLokiStreamQueryResponse(w, streams, categorizedLabels)
@@ -176,9 +190,6 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 	exposureCache := make(map[string][]metadataFieldExposure, 16)
 	dropConditions, keepConditions, bareDropFields, bareKeepFields := extractDropKeepFromAST(originalQuery)
 	streamMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields, bareKeepFields}
-	// Constant for the whole response — parsing the query per entry would re-run a
-	// full LogQL parse for every streamed line.
-	skipLogLineReconstruction := hasTextExtractionParser(originalQuery)
 	smBuf2 := metadataMapPool.Get().(map[string]string)
 	pfBuf2 := metadataMapPool.Get().(map[string]string)
 	defer func() {
@@ -192,6 +203,12 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 		metadataMapPool.Put(pfBuf2)
 	}()
 
+	captureFields := regexpCaptureFields(originalQuery)
+	lineFields := logQueryLineFields(originalQuery)
+	mergeParsed := mergesParsedStreamLabels(
+		hasLabelParserStage(originalQuery),
+		categorizedLabels, emitStructuredMetadata,
+	)
 	first := true
 	dedup := p.newRowDedup()
 	for scanner.Scan() {
@@ -214,7 +231,7 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 		}
 		msg, _ := stringifyEntryValue(entry["_msg"])
 		streamLabels := parseStreamLabels(asString(entry["_stream"]))
-		msg = reconstructLogLineWithFlag(msg, entry, streamLabels, p.lineFieldSkip(msg, skipLogLineReconstruction))
+		msg = storedLogLineFromEntry(msg, entry, streamLabels, lineFields, p.defaultMsgValue())
 
 		tsNanos, ok := formatEntryTimestamp(timeStr)
 		if !ok {
@@ -222,6 +239,7 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 		}
 
 		labels, structuredMetadata, parsedFields := p.classifyEntryFields(entry, originalQuery, exposureCache, smBuf2, pfBuf2)
+		parsedFields = promoteRegexpCaptureFields(captureFields, structuredMetadata, parsedFields)
 		if len(dropConditions) > 0 {
 			applyDropConditions(dropConditions, structuredMetadata, parsedFields)
 		}
@@ -260,6 +278,7 @@ func (p *Proxy) streamLogQuery(w http.ResponseWriter, resp *http.Response, origi
 			}
 		}
 
+		translatedLabels, _ = mergeExtractedStreamLabels(translatedLabels, parsedFields, mergeParsed, captureFields)
 		stream := map[string]interface{}{
 			"stream": translatedLabels,
 			"values": buildStreamValues(tsNanos, msg, structuredMetadata, parsedFields, emitStructuredMetadata, categorizedLabels),
@@ -457,14 +476,8 @@ func vlLogsToLokiStreams(body []byte) []map[string]interface{} {
 		}
 		tsNanos := strconv.FormatInt(ts.UnixNano(), 10)
 
-		// Reconstruct JSON log line from VL's extracted fields. No originalQuery
-		// context is available here — pass empty string so only auto-ingestion
-		// fields are reconstructed (no text-extraction parser stages present).
 		tailStreamLabels := parseStreamLabels(asString(entry["_stream"]))
-		if len(entry) > len(tailStreamLabels)+5 {
-			msg = reconstructLogLine(msg, entry, tailStreamLabels, "")
-		}
-
+		msg = storedLogLineFromEntry(msg, entry, tailStreamLabels, nil, "")
 		labels := buildEntryLabelsWithStream(entry, tailStreamLabels)
 		streamKey := canonicalLabelsKey(labels)
 
@@ -516,8 +529,8 @@ func vlLogsToLokiStreams(body []byte) []map[string]interface{} {
 }
 
 type cachedLogQueryStreamDescriptor struct {
-	key              string // canonicalLabelsKey(rawLabels)
-	translatedKey    string // canonicalLabelsKey(translatedLabels); same as key when passthrough
+	key              string            // canonicalLabelsKey(translatedLabels): the emitted stream identity
+	streamLabels     map[string]string // labels parsed from _stream (shared, read-only)
 	rawLabels        map[string]string
 	translatedLabels map[string]string
 }
@@ -545,16 +558,15 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 	streamDescriptorCache := make(map[string]cachedLogQueryStreamDescriptor, 16)
 	streamLabelCache := make(map[string]map[string]string, 16)
 	exposureCache := make(map[string][]metadataFieldExposure, 16)
-	classifyAsParsed := hasParserStage(originalQuery, "json") || hasParserStage(originalQuery, "logfmt")
-	forceParsedFields := namedCaptureFields(originalQuery)
-	mergeParsedIntoLabels := classifyAsParsed || len(forceParsedFields) > 0
-	skipLogLineReconstruction := hasTextExtractionParser(originalQuery)
+	classifyAsParsed := hasLabelParserStage(originalQuery)
+	mergeParsed := mergesParsedStreamLabels(classifyAsParsed, categorizedLabels, emitStructuredMetadata)
+	captureFields := regexpCaptureFields(originalQuery)
+	lineFields := logQueryLineFields(originalQuery)
 	// classifyAsParsed is included so | json / | logfmt parsed fields are classified even
-	// without emitStructuredMetadata or categorizedLabels. Parsed fields are merged into the
-	// stream label set (matching Loki behaviour) so Grafana's unwrap field picker can see them.
-	needsClassification := emitStructuredMetadata || categorizedLabels || mergeParsedIntoLabels
-	dropConditions, keepConditions, bareDropFields2, bareKeepFields2 := extractDropKeepFromAST(originalQuery)
-	labelMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields2, bareKeepFields2}
+	// without emitStructuredMetadata or categorizedLabels (see resolveLogQueryStream).
+	needsClassification := emitStructuredMetadata || categorizedLabels || classifyAsParsed || len(captureFields) > 0
+	dropConditions, keepConditions, bareDropFields, bareKeepFields := extractDropKeepFromAST(originalQuery)
+	labelMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields, bareKeepFields}
 
 	var (
 		miner        *patternMiner
@@ -614,11 +626,8 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 			vlFJParserPool.Put(fjParser)
 			continue
 		}
-		msg := string(fjVal.GetStringBytes("_msg"))
-		// Level detection must read the ORIGINAL message: after reconstruction msg is
-		// the whole VL record as JSON, where a pod label containing "warn" would be
-		// mistaken for a level.
-		rawMsg := msg
+		// Level detection reads the stored message, not the (possibly rebuilt) line.
+		rawMsg := string(fjVal.GetStringBytes("_msg"))
 
 		// Pass raw bytes to avoid string allocation on descriptor cache hits.
 		// logQueryStreamDescriptorBytes uses m[string([]byte)] (zero-alloc lookup)
@@ -628,21 +637,16 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 			fjVal.GetStringBytes("level"),
 			streamLabelCache, streamDescriptorCache,
 		)
+		msg := storedLogLineFromFJ(fjVal, desc.streamLabels, lineFields, p.defaultMsgValue())
 
-		// Object() is needed for reconstruction or classification.
-		needsObject := needsClassification || !skipLogLineReconstruction
 		var fjObj *fj.Object
-		if needsObject {
+		if needsClassification {
 			obj, fjErr := fjVal.Object()
 			if fjErr != nil {
 				vlFJParserPool.Put(fjParser)
 				continue
 			}
 			fjObj = obj
-		}
-
-		if fjObj != nil && !p.lineFieldSkip(msg, skipLogLineReconstruction) {
-			msg = reconstructLogLineWithFlagFJ(msg, fjObj, desc.rawLabels, false)
 		}
 
 		// classifyEntryMetadataFieldsFJ returns smBuf/pfBuf directly (no copy).
@@ -652,7 +656,8 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 		// so skip the per-field visit entirely — buildStreamValue discards these maps anyway.
 		var structuredMetadata, parsedFields map[string]string
 		if needsClassification {
-			structuredMetadata, parsedFields = p.classifyEntryMetadataFieldsFJ(fjObj, desc.rawLabels, classifyAsParsed, exposureCache, smBuf, pfBuf, forceParsedFields)
+			structuredMetadata, parsedFields = p.classifyEntryMetadataFieldsFJ(fjObj, desc.rawLabels, classifyAsParsed, exposureCache, smBuf, pfBuf)
+			parsedFields = promoteRegexpCaptureFields(captureFields, structuredMetadata, parsedFields)
 			if len(dropConditions) > 0 {
 				applyDropConditions(dropConditions, structuredMetadata, parsedFields)
 			}
@@ -660,49 +665,10 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 				applyKeepConditions(keepConditions, structuredMetadata, parsedFields)
 			}
 		}
-		// Apply drop conditions to stream labels too. Loki's | drop field=value removes
-		// the field from the label set when the value matches — including stream labels.
-		streamKey := desc.key
-		streamLabels := desc.translatedLabels
-		if len(dropConditions) > 0 {
-			if newKey, newLabels, changed := applyDropConditionsToStreamLabels(dropConditions, desc.rawLabels, desc.translatedLabels, p.labelTranslator); changed {
-				streamKey = newKey
-				streamLabels = newLabels
-			}
-		}
-		if len(keepConditions) > 0 {
-			if newKey, newLabels, changed := applyKeepConditionsToStreamLabels(keepConditions, desc.rawLabels, streamLabels, p.labelTranslator); changed {
-				streamKey = newKey
-				streamLabels = newLabels
-			}
-		}
-		// Apply bare-field drop/keep to stream labels.
-		// | drop f removes f from the stream label set unconditionally.
-		// | keep f1, f2 removes any stream label NOT in the keep list.
-		if len(bareDropFields2) > 0 || len(bareKeepFields2) > 0 {
-			if newKey, newLabels, changed := applyBareFieldMutationToStreamLabels(bareDropFields2, bareKeepFields2, desc.rawLabels, streamLabels, p.labelTranslator); changed {
-				streamKey = newKey
-				streamLabels = newLabels
-			}
-		}
-		// Merge parsed fields (from | json / | logfmt) into the stream label set.
-		// Loki includes parsed labels in the stream object of its API responses so that
-		// Grafana's unwrap field picker (extractUnwrapLabelKeysFromDataFrame) can find
-		// numeric/duration/bytes fields. Without this, the proxy only returns _stream
-		// labels and the picker stays empty.
-		if mergeParsedIntoLabels && len(parsedFields) > 0 {
-			// Capacity hint uses only one operand to avoid CodeQL's integer-overflow
-			// warning on len(a)+len(b); the map grows automatically for parsedFields.
-			extLabels := make(map[string]string, len(streamLabels))
-			for k, v := range streamLabels {
-				extLabels[k] = v
-			}
-			for k, v := range parsedFields {
-				extLabels[k] = v
-			}
-			streamKey = canonicalLabelsKey(extLabels)
-			streamLabels = extLabels
-		}
+		streamKey, streamLabels := resolveLogQueryStream(
+			desc, dropConditions, keepConditions, bareDropFields, bareKeepFields,
+			parsedFields, mergeParsed, captureFields, p.labelTranslator,
+		)
 		// Lift mapped/computed labels into the stream label set and normalise the
 		// derived level, then re-key the stream so entries that differ only in a
 		// promoted label do not collapse into one series.
@@ -780,6 +746,87 @@ func (p *Proxy) vlReaderToLokiStreams(r io.Reader, originalQuery, step string, c
 	return result, patterns, nil
 }
 
+// mergesParsedStreamLabels reports whether labels extracted by | json or
+// | logfmt belong to the stream label set. Loki keys log streams by stream
+// labels plus extracted labels, so Grafana's unwrap field picker
+// (extractUnwrapLabelKeysFromDataFrame) sees numeric fields. With
+// categorize-labels metadata, Loki keys streams by the stream labels only and
+// returns extracted labels in each entry's "parsed" metadata instead.
+func mergesParsedStreamLabels(classifyAsParsed, categorizedLabels, emitStructuredMetadata bool) bool {
+	return classifyAsParsed && (!categorizedLabels || !emitStructuredMetadata)
+}
+
+// resolveLogQueryStream returns the stream key and labels one log entry is
+// grouped under: the translated stream labels after stream-label | drop and
+// | keep mutations, extended with parser-extracted labels (when mergeParsed)
+// and named regexp captures. The key is always canonicalLabelsKey of the
+// returned labels, so entries with identical emitted labels share a stream.
+// Every log-query path (single request, windowed fragments and their cache)
+// derives stream identity here so they cannot drift.
+func resolveLogQueryStream(
+	desc cachedLogQueryStreamDescriptor,
+	dropConditions, keepConditions []translator.DropCondition,
+	bareDropFields, bareKeepFields []string,
+	parsedFields map[string]string,
+	mergeParsed bool,
+	captureFields map[string]bool,
+	lt *LabelTranslator,
+) (string, map[string]string) {
+	streamLabels := desc.translatedLabels
+	changed := false
+	// Loki's | drop field=value removes the field from the label set when the
+	// value matches, including stream labels.
+	if len(dropConditions) > 0 {
+		if _, newLabels, ok := applyDropConditionsToStreamLabels(dropConditions, desc.rawLabels, streamLabels, lt); ok {
+			streamLabels, changed = newLabels, true
+		}
+	}
+	if len(keepConditions) > 0 {
+		if _, newLabels, ok := applyKeepConditionsToStreamLabels(keepConditions, desc.rawLabels, streamLabels, lt); ok {
+			streamLabels, changed = newLabels, true
+		}
+	}
+	// | drop f removes f unconditionally; | keep f1, f2 removes any label not listed.
+	if len(bareDropFields) > 0 || len(bareKeepFields) > 0 {
+		if _, newLabels, ok := applyBareFieldMutationToStreamLabels(bareDropFields, bareKeepFields, desc.rawLabels, streamLabels, lt); ok {
+			streamLabels, changed = newLabels, true
+		}
+	}
+	if merged, ok := mergeExtractedStreamLabels(streamLabels, parsedFields, mergeParsed, captureFields); ok {
+		streamLabels, changed = merged, true
+	}
+	if !changed {
+		return desc.key, streamLabels
+	}
+	return canonicalLabelsKey(streamLabels), streamLabels
+}
+
+// mergeExtractedStreamLabels returns labels extended with parser-extracted
+// fields (when mergeParsed) and named regexp captures. ok is false when labels
+// are returned unchanged. The input map is never mutated: it is usually shared
+// through the per-response stream descriptor cache.
+func mergeExtractedStreamLabels(labels, parsedFields map[string]string, mergeParsed bool, captureFields map[string]bool) (map[string]string, bool) {
+	if mergeParsed && len(parsedFields) > 0 {
+		// Named captures were already promoted into parsedFields. The size hint
+		// covers the stream labels only: an arithmetic hint over both maps is
+		// reported as an input-derived allocation size.
+		extLabels := make(map[string]string, len(labels))
+		for k, v := range labels {
+			extLabels[k] = v
+		}
+		for k, v := range parsedFields {
+			extLabels[k] = v
+		}
+		return extLabels, true
+	}
+	for name := range captureFields {
+		if _, ok := parsedFields[name]; ok {
+			return mergeRegexpCaptureLabels(labels, parsedFields, captureFields), true
+		}
+	}
+	return labels, false
+}
+
 // logQueryStreamDescriptorBytes is like logQueryStreamDescriptor but accepts
 // raw []byte slices from fastjson. It uses the Go compiler's m[string(b)] map
 // optimisation (no allocation for cache hits) and only promotes to heap strings
@@ -832,14 +879,9 @@ func (p *Proxy) logQueryStreamDescriptorMiss(rawStream, level, cacheKey string, 
 		ensureSyntheticServiceName(translatedLabels)
 	}
 
-	canonKey := canonicalLabelsKey(rawLabels)
-	translatedKey := canonKey
-	if !passthrough {
-		translatedKey = canonicalLabelsKey(translatedLabels)
-	}
 	desc := cachedLogQueryStreamDescriptor{
-		key:              canonKey,
-		translatedKey:    translatedKey,
+		key:              canonicalLabelsKey(translatedLabels),
+		streamLabels:     baseLabels,
 		rawLabels:        rawLabels,
 		translatedLabels: translatedLabels,
 	}
@@ -853,6 +895,52 @@ func (p *Proxy) logQueryStreamDescriptor(rawStream, level string, streamLabelCac
 		return desc
 	}
 	return p.logQueryStreamDescriptorMiss(rawStream, strings.TrimSpace(level), cacheKey, streamLabelCache, descriptorCache)
+}
+
+// classifyEntryMetadataFields fills smBuf and pfBuf with structured metadata
+// and parsed fields for the given log entry. Both buffers must be pre-allocated
+// and are cleared before use; callers must copy or consume content before the
+// next call (metadataFieldMap makes the required copy inside buildStreamValue).
+func (p *Proxy) classifyEntryMetadataFields(entry map[string]interface{}, streamLabels map[string]string, classifyAsParsed bool, exposureCache map[string][]metadataFieldExposure, smBuf, pfBuf map[string]string) (map[string]string, map[string]string) {
+	for k := range smBuf {
+		delete(smBuf, k)
+	}
+	for k := range pfBuf {
+		delete(pfBuf, k)
+	}
+
+	for key, value := range entry {
+		if isVLInternalField(key) || key == "_stream_id" || key == "level" {
+			continue
+		}
+		if _, exists := streamLabels[key]; exists {
+			continue
+		}
+		stringValue, ok := stringifyEntryValue(value)
+		if !ok || strings.TrimSpace(stringValue) == "" {
+			continue
+		}
+		exposures := p.metadataFieldExposuresCached(key, exposureCache)
+		for _, exposure := range exposures {
+			if _, exists := streamLabels[exposure.name]; exists && !exposure.isAlias {
+				continue
+			}
+			if classifyAsParsed {
+				pfBuf[exposure.name] = stringValue
+				continue
+			}
+			smBuf[exposure.name] = stringValue
+		}
+	}
+
+	var sm, pf map[string]string
+	if len(smBuf) > 0 {
+		sm = smBuf
+	}
+	if len(pfBuf) > 0 {
+		pf = pfBuf
+	}
+	return sm, pf
 }
 
 // classifyEntryMetadataFieldsFJ is the fastjson variant of classifyEntryMetadataFields.
@@ -1289,7 +1377,7 @@ func metadataFieldMap(fields map[string]string) map[string]string {
 // For tight per-entry loops use classifyEntryFieldsWithFlags instead to avoid
 // recomputing parser flags and stream labels on every call.
 func (p *Proxy) classifyEntryFields(entry map[string]interface{}, originalQuery string, exposureCache map[string][]metadataFieldExposure, smBuf, pfBuf map[string]string) (map[string]string, map[string]string, map[string]string) {
-	classifyAsParsed := hasParserStage(originalQuery, "json") || hasParserStage(originalQuery, "logfmt")
+	classifyAsParsed := hasLabelParserStage(originalQuery)
 	streamLabels := parseStreamLabels(asString(entry["_stream"]))
 	return p.classifyEntryFieldsWithFlags(entry, streamLabels, classifyAsParsed, exposureCache, smBuf, pfBuf)
 }
@@ -1405,6 +1493,10 @@ func parseStreamLabelsUncached(s string) map[string]string {
 	start := 0
 	for i := 0; i < len(s); i++ {
 		c := s[i]
+		if inQuote && c == '\\' && i+1 < len(s) {
+			i++
+			continue
+		}
 		if c == '"' {
 			inQuote = !inQuote
 		}
@@ -1426,7 +1518,11 @@ func appendLabelPair(pair string, dst map[string]string) {
 	}
 	k := strings.TrimSpace(pair[:eq])
 	v := strings.TrimSpace(pair[eq+1:])
-	v = strings.Trim(v, `"`)
+	if decoded, err := strconv.Unquote(v); err == nil {
+		v = decoded
+	} else {
+		v = strings.Trim(v, `"`)
+	}
 	dst[k] = v
 }
 
@@ -1708,6 +1804,10 @@ func isStatsQuery(logsqlQuery string) bool {
 func isStatsQueryHeuristic(logsqlQuery string) bool {
 	inQuote := false
 	for i := 0; i < len(logsqlQuery); i++ {
+		if inQuote && logsqlQuery[i] == '\\' && i+1 < len(logsqlQuery) {
+			i++
+			continue
+		}
 		if logsqlQuery[i] == '"' {
 			inQuote = !inQuote
 			continue
@@ -1817,62 +1917,6 @@ func requestWantsCategorizedLabels(r *http.Request) bool {
 		}
 	}
 	return false
-}
-
-// buildSlidingWindowSumsFromHits converts pre-aggregated VL hits buckets into
-// bareParserMetricSeries using sliding-window sums.
-//
-// buckets:   canonicalLabelKey → bucketStartNanos → count
-// labelSets: canonicalLabelKey → map[string]string label pairs
-// evalStart, evalEnd, stepNs, rangeNs: all in nanoseconds
-// isRate: if true, divide count by rangeNs/1e9 to get per-second rate
-//
-// Absent evaluation points (sum == 0) are omitted (matches Loki absent-point behaviour).
-func buildSlidingWindowSumsFromHits(
-	buckets map[string]map[int64]int64,
-	labelSets map[string]map[string]string,
-	evalStart, evalEnd, stepNs, rangeNs int64,
-	isRate bool,
-) []bareParserMetricSeries {
-	if len(buckets) == 0 {
-		return nil
-	}
-	result := make([]bareParserMetricSeries, 0, len(buckets))
-	for labelKey, tsBuckets := range buckets {
-		labels := labelSets[labelKey]
-		samples := make([]bareParserMetricSample, 0, (evalEnd-evalStart)/stepNs+2)
-		for evalT := evalStart; evalT <= evalEnd; evalT += stepNs {
-			windowStart := evalT - rangeNs
-			var sum int64
-			for bucketTs, cnt := range tsBuckets {
-				// Include bucket if it overlaps [windowStart, evalT).
-				// A VL hit bucket at bucketTs covers [bucketTs, bucketTs+stepNs).
-				if bucketTs >= windowStart && bucketTs < evalT {
-					sum += cnt
-				}
-			}
-			if sum == 0 {
-				continue // absent point — matches Loki behaviour
-			}
-			value := float64(sum)
-			if isRate {
-				value = float64(sum) / (float64(rangeNs) / 1e9)
-			}
-			samples = append(samples, bareParserMetricSample{tsNanos: evalT, value: value})
-		}
-		if len(samples) == 0 {
-			continue
-		}
-		metric := make(map[string]string, len(labels))
-		for k, v := range labels {
-			metric[k] = v
-		}
-		result = append(result, bareParserMetricSeries{metric: metric, samples: samples})
-	}
-	sort.Slice(result, func(i, j int) bool {
-		return canonicalLabelsKey(result[i].metric) < canonicalLabelsKey(result[j].metric)
-	})
-	return result
 }
 
 func tupleModeForRequest(categorizedLabels bool, emitStructuredMetadata bool) string {

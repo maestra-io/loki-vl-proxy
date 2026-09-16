@@ -218,40 +218,6 @@ func TestCollectRangeMetricHits_RequestsTheLokiGrid(t *testing.T) {
 	}
 }
 
-// The pushdown evaluated a window of `floor(range/step)·step`, so `[15m]` at
-// step=600 came back point-for-point identical to `[10m]` and `[1h30m]` at
-// step=3600 identical to `[1h]`. It looked correct only while the ratio was a
-// whole number — and Grafana's own step choices are what make it fractional.
-func TestPlanRangeWindowRollup_FractionalRatios(t *testing.T) {
-	const start, end = "1700000000", "1700086400"
-	for _, tc := range []struct {
-		name   string
-		query  string
-		step   string
-		want   bool
-		fineNs int64
-	}{
-		{"15m at step 600", `count_over_time({a="b"}[15m])`, "600", true, int64(5 * time.Minute)},
-		{"90m at step 3600", `count_over_time({a="b"}[1h30m])`, "3600", true, int64(30 * time.Minute)},
-		{"7m at step 120", `count_over_time({a="b"}[7m])`, "120", true, int64(time.Minute)},
-		// Equal range and step is the one case the pushdown gets right on its own.
-		{"1h at step 3600", `count_over_time({a="b"}[1h])`, "3600", false, 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			plan, ok := planRangeWindowRollup(tc.query, start, end, tc.step)
-			if ok != tc.want {
-				t.Fatalf("engaged=%v, want %v", ok, tc.want)
-			}
-			if ok && plan.fineNs != tc.fineNs {
-				t.Fatalf("fine grid = %v, want %v", time.Duration(plan.fineNs), time.Duration(tc.fineNs))
-			}
-			if ok && plan.rangeNs%plan.fineNs != 0 {
-				t.Fatalf("the fine grid must divide the range, or the inner evaluation is not exact")
-			}
-		})
-	}
-}
-
 // Grafana's `${__auto_interval_<name>}` carries the dashboard's interval-variable
 // name; every spelling resolves to the request's own step.
 func TestQueryRange_GrafanaAutoIntervalStepToken(t *testing.T) {

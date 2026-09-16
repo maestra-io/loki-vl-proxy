@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -132,11 +133,14 @@ type Config struct {
 	// 0 means use the built-in default of 1,000,000. Lower values bound memory at the cost
 	// of potential result truncation for very high-cardinality queries.
 	RangeMetricRowLimit int
-	ForwardHeaders      []string          // HTTP headers to forward from client to VL backend
-	ForwardCookies      []string          // Cookie names to forward from client to VL backend
-	BackendHeaders      map[string]string // static headers to add to all VL requests
-	BackendBasicAuth    string            // "user:password" for VL backend basic auth
-	BackendCompression  string            // upstream HTTP compression preference: auto, gzip, zstd, none
+	// OrderedJSONMetricMaxBytes caps the raw rows response read and the response
+	// built by the ordered JSON metric evaluator. 0 means 1 GiB.
+	OrderedJSONMetricMaxBytes int64
+	ForwardHeaders            []string          // HTTP headers to forward from client to VL backend
+	ForwardCookies            []string          // Cookie names to forward from client to VL backend
+	BackendHeaders            map[string]string // static headers to add to all VL requests
+	BackendBasicAuth          string            // "user:password" for VL backend basic auth
+	BackendCompression        string            // upstream HTTP compression preference: auto, gzip, zstd, none
 	// ClientResponseCompression controls downstream client-facing response
 	// compression policy used by the compatibility cache hit path.
 	ClientResponseCompression string
@@ -168,6 +172,10 @@ type Config struct {
 	BackendVersionStrict bool
 	DerivedFields        []DerivedField // derived fields for trace/link extraction
 	StreamResponse       bool           // stream responses via chunked transfer (default: false)
+	// BackendDefaultMsgValue is the VictoriaLogs -defaultMsgValue when it is not
+	// the built-in "missing _msg field; ..." text. Rows whose _msg is empty or
+	// this placeholder have their log line rebuilt from the row's fields.
+	BackendDefaultMsgValue string
 	// EmitStructuredMetadata enables Loki 3-tuple stream values [ts, line, metadata].
 	// Disabled by default for conservative datasource compatibility.
 	EmitStructuredMetadata bool
@@ -259,8 +267,12 @@ type Config struct {
 	// BytesOverTimeSource is what bytes_over_time / bytes_rate measure:
 	// "line" = len(_msg) (upstream), "record" = the line Loki stored — the
 	// record's non-stream fields JSON-encoded plus the vector http_server
-	// wrapper (see loki_record.go). Empty = "record".
+	// wrapper (see loki_record.go). Empty = "line".
 	BytesOverTimeSource string
+	// AlignQueriesWithStep truncates a metric range query's start and end to
+	// multiples of the step, as Loki's step-align middleware does when
+	// query_range.align_queries_with_step is on (the Loki Helm chart default).
+	AlignQueriesWithStep bool
 	// RecordExcludeFields lists the VL fields (a trailing * is a prefix
 	// wildcard) that are NOT part of the Loki line: the collector's own
 	// metadata. Empty = "kubernetes.*".
@@ -479,6 +491,7 @@ type Proxy struct {
 	rulerBackend                      *url.URL
 	alertsBackend                     *url.URL
 	client                            *http.Client
+	backendBudget                     chan struct{}
 	tailClient                        *http.Client
 	cache                             *cache.Cache
 	compatCache                       *cache.Cache
@@ -488,6 +501,7 @@ type Proxy struct {
 	coalescer                         *mw.Coalescer
 	limiter                           *mw.RateLimiter
 	breaker                           *mw.CircuitBreaker
+	routingNamespace                  string       // immutable digest, replaced under configMu on reload
 	configMu                          sync.RWMutex // protects tenantMap and labelTranslator
 	tenantMap                         map[string]TenantMapping
 	tenantLabel                       string
@@ -510,6 +524,7 @@ type Proxy struct {
 	derivedFields                     []DerivedField
 	streamResponse                    bool
 	emitStructuredMetadata            bool
+	backendDefaultMsgValue            string
 	patternsEnabled                   bool
 	patternsAutodetectFromQueries     bool
 	patternsCustom                    []string
@@ -529,6 +544,7 @@ type Proxy struct {
 	bytesSourceRecord                 bool             // bytes_over_time measures the Loki-stored line, not _msg
 	recordExcludeFields               []string         // VL fields outside the Loki line (kubernetes.*)
 	lokiMaxLineSize                   int              // Loki's max_line_size; rows above it are dropped
+	alignQueriesWithStep              bool             // Loki's query_range.align_queries_with_step
 	peerCache                         *cache.PeerCache // L3 fleet peer cache
 	peerAuthToken                     string
 	peerInsecureIPAllowlist           bool // gate the legacy IP-allowlist fallback (default false: token required)
@@ -539,6 +555,7 @@ type Proxy struct {
 	adminAuthToken                    string
 	metricsConcurrencyLimiter         chan struct{}
 	rangeMetricRowLimit               int           // max rows fetched per collectRangeMetricSamples call (0=1_000_000)
+	orderedJSONMaxBytes               int64         // ordered JSON metric byte cap (0=1 GiB)
 	maxStatsQuerySeries               int           // max series returned by collectRangeMetricHits (0=5000)
 	statsQueryRangeSem                chan struct{} // limits concurrent VL stats_query_range calls (nil=unlimited)
 	// manualScanBudget bounds the RETAINED samples of the manual range-metric
@@ -623,6 +640,8 @@ type Proxy struct {
 	backendSupportsDensePatternWindowing  bool
 	backendSupportsMetadataSubstring      bool
 	backendSupportsColumnFieldValues      bool
+	backendSupportsStatsRangeOffset       bool
+	backendVersionProbedAt                atomic.Int64 // Unix ns of the last metrics version probe
 	backendVersionLogged                  bool
 	labelValuesIndexWarmReady             atomic.Bool
 	labelValuesIndexPersistStarted        atomic.Bool
@@ -641,6 +660,7 @@ type Proxy struct {
 	requestSampler                        *observability.RequestSampler
 	cacheTTLLabels                        time.Duration // per-instance TTL for labels endpoint (from Config.LabelCacheTTL)
 	cacheTTLLabelValues                   time.Duration // per-instance TTL for label_values endpoint
+	metadataNegativeCacheTTL              time.Duration // TTL for empty label lists; see effectiveMetadataNegativeTTL
 	debugLogRawQueries                    bool          // when true, debug logs include raw LogQL/LogsQL and backend params
 	logTranslatedQueries                  bool          // when true, successful upstream calls log their translated LogsQL
 	metadataDefaultLookback               time.Duration // default lookback for /labels, /label/{name}/values, /series when client omits start+end; 0 disables
@@ -661,10 +681,11 @@ type Proxy struct {
 const maxReadCacheKeyMemoEntries = 16384
 
 type canonicalReadCacheMemoKey struct {
-	endpoint string
-	orgID    string
-	extra    string
-	rawQuery string
+	endpoint  string
+	orgID     string
+	extra     string
+	rawQuery  string
+	authScope string
 }
 
 var defaultTenantLimitsAllowPublish = []string{
@@ -902,7 +923,7 @@ func New(cfg Config) (*Proxy, error) {
 		maxLines = 1000
 	}
 
-	backendHeaders := cfg.BackendHeaders
+	backendHeaders := maps.Clone(cfg.BackendHeaders)
 	if backendHeaders == nil {
 		backendHeaders = make(map[string]string)
 	}
@@ -1124,8 +1145,9 @@ func New(cfg Config) (*Proxy, error) {
 		queryTracker:                          metrics.NewQueryTracker(10000),
 		coalescer:                             newCoalescer(cfg.CoalescerDisabled),
 		limiter:                               mw.NewRateLimiter(maxConcurrent, ratePerSec, rateBurst),
+		backendBudget:                         newBackendBudget(maxConcurrent),
 		breaker:                               mw.NewCircuitBreaker(cbFail, 3, cbOpen, cbWindow),
-		tenantMap:                             cfg.TenantMap,
+		tenantMap:                             maps.Clone(cfg.TenantMap),
 		tenantLabel:                           cfg.TenantLabel,
 		authEnabled:                           cfg.AuthEnabled,
 		requireTenantHeader:                   cfg.RequireTenantHeader,
@@ -1134,12 +1156,13 @@ func New(cfg Config) (*Proxy, error) {
 		maxLines:                              maxLines,
 		rangeMetricRowLimit:                   cfg.RangeMetricRowLimit,
 		manualScanBudget:                      newManualScanBudget(defaultManualScanSampleBudget),
+		orderedJSONMaxBytes:                   cfg.OrderedJSONMetricMaxBytes,
 		maxStatsQuerySeries:                   cfg.MaxStatsQuerySeries,
 		statsQueryRangeSem:                    makeStatsQueryRangeSem(cfg.StatsQueryRangeConcurrency),
 		statsQueryRangeInterQueryDelay:        time.Duration(cfg.StatsQueryRangeInterQueryDelayMs) * time.Millisecond,
 		drilldownCoalescer:                    makeDrilldownBurstCoalescer(cfg.DrilldownBurstWindowMs, cfg.DrilldownBurstMaxFields),
 		drilldownCardCache:                    newDrilldownCardinalityCache(),
-		forwardHeaders:                        cfg.ForwardHeaders,
+		forwardHeaders:                        append([]string(nil), cfg.ForwardHeaders...),
 		forwardCookies:                        forwardCookies,
 		backendHeaders:                        backendHeaders,
 		backendCompression:                    normalizeBackendCompression(cfg.BackendCompression),
@@ -1153,6 +1176,7 @@ func New(cfg Config) (*Proxy, error) {
 		derivedFields:                         cfg.DerivedFields,
 		streamResponse:                        cfg.StreamResponse,
 		emitStructuredMetadata:                cfg.EmitStructuredMetadata,
+		backendDefaultMsgValue:                cfg.BackendDefaultMsgValue,
 		patternsEnabled:                       patternsEnabled,
 		patternsAutodetectFromQueries:         cfg.PatternsAutodetectFromQueries,
 		patternsCustom:                        patternsCustom,
@@ -1169,7 +1193,8 @@ func New(cfg Config) (*Proxy, error) {
 		derivedLevelGroupBy:                   cfg.DerivedLevelGroupBy,
 		lineFieldMsg:                          strings.TrimSpace(cfg.LineField) == "_msg",
 		dedupeExactDuplicates:                 cfg.DedupeExactDuplicates == nil || *cfg.DedupeExactDuplicates,
-		bytesSourceRecord:                     strings.TrimSpace(cfg.BytesOverTimeSource) != "line",
+		bytesSourceRecord:                     strings.TrimSpace(cfg.BytesOverTimeSource) == "record",
+		alignQueriesWithStep:                  cfg.AlignQueriesWithStep,
 		recordExcludeFields:                   normalizeRecordExcludeFields(cfg.RecordExcludeFields),
 		lokiMaxLineSize:                       cfg.LokiMaxLineSize,
 		peerCache:                             cfg.PeerCache,
@@ -1239,6 +1264,7 @@ func New(cfg Config) (*Proxy, error) {
 		coldRouter:                            coldRouter,
 		cacheTTLLabels:                        labelCacheTTL,
 		cacheTTLLabelValues:                   labelCacheTTL,
+		metadataNegativeCacheTTL:              effectiveMetadataNegativeTTL(cfg.Cache.DiskMinTTL(), cfg.PeerCache.WriteThroughMinTTL()),
 		debugLogRawQueries:                    cfg.DebugLogRawQueries,
 		logTranslatedQueries:                  cfg.LogTranslatedQueries,
 		metadataDefaultLookback:               cfg.MetadataDefaultLookback,
@@ -1266,6 +1292,9 @@ func New(cfg Config) (*Proxy, error) {
 	// initialise a fresh State.  The Proxy struct still holds the live mutable fields;
 	// State on the Handler is the canonical home for those fields once receiver
 	// migration completes in a follow-on PR.
+	// The startup compatibility check probes the version; later probes run only
+	// while it stays unknown (see maybeReprobeBackendVersion).
+	p.backendVersionProbedAt.Store(time.Now().UnixNano())
 	p.handler = &Handler{
 		Deps: Deps{
 			backend:               p.backend,
@@ -1317,12 +1346,14 @@ func New(cfg Config) (*Proxy, error) {
 			lineFilterFields:                      p.lineFilterFields,
 			derivedLevelGroupBy:                   p.derivedLevelGroupBy,
 			lineFieldMsg:                          p.lineFieldMsg,
+			alignQueriesWithStep:                  p.alignQueriesWithStep,
 			registerInstrumentation:               p.registerInstrumentation,
 			enablePprof:                           p.enablePprof,
 			enableQueryAnalytics:                  p.enableQueryAnalytics,
 			adminAuthToken:                        p.adminAuthToken,
 			rangeMetricRowLimit:                   p.rangeMetricRowLimit,
 			manualScanBudget:                      p.manualScanBudget,
+			orderedJSONMaxBytes:                   p.orderedJSONMaxBytes,
 			tailAllowedOrigins:                    p.tailAllowedOrigins,
 			tailMode:                              p.tailMode,
 			metricsTrustProxyHeaders:              p.metricsTrustProxyHeaders,
@@ -1371,6 +1402,7 @@ func New(cfg Config) (*Proxy, error) {
 			peerAuthToken:                         p.peerAuthToken,
 			cacheTTLLabels:                        p.cacheTTLLabels,
 			cacheTTLLabelValues:                   p.cacheTTLLabelValues,
+			metadataNegativeCacheTTL:              p.metadataNegativeCacheTTL,
 			logSampleN:                            p.logSampleN,
 		},
 		// State shares the exact same mutex instances and map/channel references as
@@ -1425,6 +1457,7 @@ func New(cfg Config) (*Proxy, error) {
 		},
 	}
 
+	p.routingNamespace = p.buildRoutingNamespace(requestRouting{tenants: p.tenantMap, label: p.tenantLabel, translator: p.labelTranslator})
 	return p, nil
 }
 
@@ -1679,7 +1712,8 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 // ReloadTenantMap hot-reloads tenant mappings (called on SIGHUP).
 func (p *Proxy) ReloadTenantMap(m map[string]TenantMapping) {
 	p.configMu.Lock()
-	p.tenantMap = m
+	p.tenantMap = maps.Clone(m)
+	p.routingNamespace = p.buildRoutingNamespace(requestRouting{tenants: p.tenantMap, label: p.tenantLabel, translator: p.labelTranslator})
 	if p.compatCache != nil {
 		p.compatCache.InvalidatePrefix("")
 	}
@@ -1700,6 +1734,7 @@ func (p *Proxy) ReloadFieldMappings(mappings []FieldMapping) {
 	// Rebuild from the base: appending would keep the fields of every mapping ever
 	// loaded, so a removed mapping would linger on /labels until restart.
 	p.declaredLabelFields = appendUniqueStrings(append([]string(nil), p.baseDeclaredLabelFields...), p.labelTranslator.MappedVLFields()...)
+	p.routingNamespace = p.buildRoutingNamespace(requestRouting{tenants: p.tenantMap, label: p.tenantLabel, translator: p.labelTranslator})
 	if p.translationCache != nil {
 		p.translationCache.InvalidatePrefix("")
 	}
@@ -1726,7 +1761,8 @@ func (p *Proxy) routeHandler(endpoint, route string, h http.HandlerFunc) http.Ha
 		p.tenantMiddleware(
 			p.limiter.Middleware(
 				p.requestLogger(endpoint, route,
-					p.compatCacheMiddleware(endpoint, route, h)))))
+					p.lokiQueryParamValidation(endpoint,
+						p.compatCacheMiddleware(endpoint, route, h))))))
 }
 
 // RegisterRoutes wires every proxy, admin, debug, and metrics route onto the
@@ -2095,6 +2131,55 @@ func (p *Proxy) peerCacheMetrics() string {
 }
 
 // handleQueryRange translates Loki range queries.
+// lokiMaxPointsPerSeries and errLokiStepTooSmall mirror Loki's query_range
+// resolution limit (pkg/loghttp.ParseRangeQuery): (end-start)/step, as integer
+// duration division, may not exceed 11000.
+const (
+	lokiMaxPointsPerSeries = 11000
+	errLokiStepTooSmall    = "exceeded maximum resolution of 11,000 points per time series. Try increasing the value of the step parameter"
+)
+
+// exceedsLokiRangeResolution reports whether Loki would reject the request's
+// range parameters for exceeding lokiMaxPointsPerSeries. It applies Loki's
+// defaults (end=now, start=min(end, now)-since, since=1h). A missing step uses
+// Loki's range/250 default, which never exceeds the limit; unparseable or
+// inverted parameters are left to the handlers that already report them.
+func exceedsLokiRangeResolution(r *http.Request, now time.Time) bool {
+	step, ok := parsePositiveStepDuration(r.FormValue("step"))
+	if !ok {
+		return false
+	}
+	end := now
+	if raw := strings.TrimSpace(r.FormValue("end")); raw != "" {
+		ns, ok := parseLokiTimeToUnixNano(raw)
+		if !ok {
+			return false
+		}
+		end = time.Unix(0, ns)
+	}
+	var start time.Time
+	if raw := strings.TrimSpace(r.FormValue("start")); raw != "" {
+		ns, ok := parseLokiTimeToUnixNano(raw)
+		if !ok {
+			return false
+		}
+		start = time.Unix(0, ns)
+	} else {
+		since := time.Hour
+		if raw := strings.TrimSpace(r.FormValue("since")); raw != "" {
+			if since, ok = parsePositiveStepDuration(raw); !ok {
+				return false
+			}
+		}
+		endOrNow := end
+		if end.After(now) {
+			endOrNow = now
+		}
+		start = endOrNow.Add(-since)
+	}
+	return end.After(start) && end.Sub(start)/step > lokiMaxPointsPerSeries
+}
+
 // Loki: GET /loki/api/v1/query_range?query={...}&start=...&end=...&limit=...&step=...
 // VL stats: POST /select/logsql/stats_query_range with query, start, end, step
 // VL logs:  POST /select/logsql/query with query, start, end, limit
@@ -2102,6 +2187,12 @@ func (p *Proxy) peerCacheMetrics() string {
 //nolint:gocyclo // dispatches across cache, multi-tenant fanout, windowing, stats vs logs, streaming and tuple modes; branching is inherent to Loki query_range parity.
 func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	// Loki validates the range parameters before it parses the query.
+	if exceedsLokiRangeResolution(r, start) {
+		p.writeError(w, http.StatusBadRequest, errLokiStepTooSmall)
+		p.metrics.RecordRequest("query_range", http.StatusBadRequest, time.Since(start))
+		return
+	}
 	logqlQuery := r.FormValue("query")
 	// Strip incomplete | unwrap stubs (no field name) that Grafana's metric builder
 	// emits while the unwrap field picker is open. These are syntactically invalid
@@ -2156,49 +2247,8 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// caller — a per-point window is `(t-range, t]`, which is not on any k·step
 	// grid — so re-aligning would move the very window it was built to measure.
 	// The fine-grid inner is aligned by construction, so skipping costs it nothing.
-	if !exactBoundsRequested(r.Context()) {
+	if p.alignQueriesWithStep {
 		alignRangeRequestToStepGrid(r, logqlQuery)
-	}
-
-	// A LogQL range vector carries its OWN window, independent of the step. Every
-	// pushdown here asks VictoriaLogs for buckets whose width IS the step, so
-	// `count_over_time({…}[30m])` at step=1h was evaluated as `[1h]` — measured
-	// against Loki 3.7.1, 21823 vs 11982, with the error exactly zero only when
-	// range == step. Evaluate the whole request on a grid of gcd(range, step)
-	// instead, then fold each point from the ones inside its `(t-range, t]`
-	// window. Wrapping the ENTIRE handler is what makes this hold for every
-	// dispatch path below — the direct pushdown, the compat decomposition and the
-	// drilldown fast paths alike.
-	plan, planErr, planOK := planRangeWindowRollupDetailed(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
-	if planErr != nil && !rangeWindowRollupActive(r.Context()) {
-		// The common grid is finer than this instance will scan — a near-coprime
-		// range/step pair, where the grid explodes while the number of OUTPUT
-		// points stays small. Evaluate those points one window at a time: exact,
-		// and bounded by the points rather than by gcd(range, step). Loki answers
-		// these, so refusing is the last resort, not the first.
-		if p.evaluatePerPointWindows(w, r, plan) {
-			p.metrics.RecordRequest("query_range", http.StatusOK, time.Since(start))
-			return
-		}
-		p.writeError(w, http.StatusBadRequest, planErr.Error())
-		p.metrics.RecordRequest("query_range", http.StatusBadRequest, time.Since(start))
-		return
-	}
-	if planOK && !rangeWindowRollupActive(r.Context()) {
-		inner := requestWithFineStep(r, plan)
-		buf := &bufferedResponseWriter{}
-		p.handleQueryRange(buf, inner)
-		for k, v := range buf.Header() {
-			w.Header()[k] = v
-		}
-		w.Header().Set("Content-Type", "application/json")
-		if buf.code != 0 && buf.code != http.StatusOK {
-			w.WriteHeader(buf.code)
-			_, _ = w.Write(buf.body)
-			return
-		}
-		_, _ = w.Write(rollupStatsQRWindow(buf.body, plan))
-		return
 	}
 
 	categorizedLabels := requestWantsCategorizedLabels(r)
@@ -2232,7 +2282,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// withOrgID must precede any vlGet/vlPost call (preferWorkingParser, bare-parser
 	// paths, post-agg paths) so that the tenant context and forwarded auth headers
 	// are available for all upstream requests made on this request's behalf.
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 	r = p.injectAuthFingerprint(r)
 
 	logqlQuery = resolveGrafanaRangeTemplateTokens(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
@@ -2295,6 +2345,10 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+	}
+
+	if p.handleOrderedJSONMetric(w, r, start, logqlQuery, true) {
+		return
 	}
 
 	logqlQuery = p.preferWorkingParser(r.Context(), logqlQuery, r.FormValue("start"), r.FormValue("end"))
@@ -2363,15 +2417,7 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	// Route using the original LogQL AST — more reliable than re-parsing translated markers.
 	accountedByNestedHandler := false
 	parsedForRouting, _ := logqlpkg.Parse(logqlQuery)
-	if ra, ok := parsedForRouting.(*logqlpkg.RangeAggregation); ok && ra.Step != "" {
-		// Subquery: max_over_time(rate(...)[1h:5m])
-		innerLogsql, innerErr := p.translateQueryWithContext(r.Context(), ra.Inner.String())
-		if innerErr != nil {
-			p.writeError(sc, http.StatusBadRequest, innerErr.Error())
-		} else {
-			p.proxySubqueryRange(sc, r, string(ra.Op), innerLogsql, ra.Range, ra.Step)
-		}
-	} else if binOp, ok := parsedForRouting.(*logqlpkg.BinOpExpr); ok && p.serveOrVectorFallback(sc, r, binOp, true) {
+	if binOp, ok := parsedForRouting.(*logqlpkg.BinOpExpr); ok && p.serveOrVectorFallback(sc, r, binOp, true) {
 		// `<expr> or vector(N)` — served by the left side plus the constant.
 		// That nested handler did this request's accounting, so the tail below
 		// skips it: counting again would double every counter and the
@@ -2449,72 +2495,36 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	p.queryTracker.Record("query_range", logqlQuery, elapsed, sc.code >= 400)
 }
 
-// queryRangeBucket returns the cache-key bucket size for a query_range request.
-// Bucket = max(5 min, step), capped at 1 hour so very large steps don't produce
-// multi-day cache entries that hold stale data too long.
-func queryRangeBucket(r *http.Request) time.Duration {
-	const (
-		minBucket = 5 * time.Minute
-		maxBucket = time.Hour
-	)
-	stepRaw := r.FormValue("step")
-	if stepRaw == "" {
-		return minBucket
+func (p *Proxy) queryRangeCacheKey(r *http.Request, logqlQuery string) string {
+
+	var key strings.Builder
+	key.Grow(len(logqlQuery) + 256)
+	key.WriteString("query_range:v3:" + logLineCacheKeyVersion + ":")
+	writePart := func(value string) {
+		var digits [20]byte
+		key.Write(strconv.AppendInt(digits[:0], int64(len(value)), 10))
+		key.WriteByte(':')
+		key.WriteString(value)
 	}
-	d, ok := parsePositiveStepDuration(stepRaw)
-	if !ok || d <= minBucket {
-		return minBucket
+	writePart(logqlQuery)
+	for _, name := range []string{"start", "end", "step", "limit", "direction", "interval", "since", "time"} {
+		writePart(r.FormValue(name))
 	}
-	if d > maxBucket {
-		return maxBucket
-	}
-	return d
+	writePart(p.responseProfileCacheKey(r))
+	writePart(p.fingerprintFromCtx(r.Context(), r))
+	return key.String()
 }
 
-func (p *Proxy) queryRangeCacheKey(r *http.Request, logqlQuery string) string {
-	// Build a stable key by bucketing both `start` and `end` to the step granularity.
-	// Grafana's sliding time window ("from=now-2d&to=now") resolves to absolute
-	// nanosecond timestamps that advance every second, so both start and end change on
-	// every panel refresh. Bucketing only `end` (the previous behaviour) still produced
-	// a unique key on each tick because the raw `start` value was included verbatim.
-	//
-	// With both endpoints bucketed to max(5min, step), the cache key is stable for the
-	// full bucket duration. A 2-day window with step=1h now produces one VL call per
-	// field per hour instead of one per 10 seconds (~360x fewer upstream calls).
-	bucket := queryRangeBucket(r)
-	startBucketed := bucketTimestampString(r.FormValue("start"), bucket)
-	endBucketed := bucketTimestampString(r.FormValue("end"), bucket)
-
-	var b strings.Builder
-	b.Grow(len(logqlQuery) + 128)
-	b.WriteString("query=")
-	b.WriteString(url.QueryEscape(logqlQuery))
-	for _, key := range []string{"step", "limit", "direction"} {
-		if value := r.FormValue(key); value != "" {
-			b.WriteByte('&')
-			b.WriteString(key)
-			b.WriteByte('=')
-			b.WriteString(url.QueryEscape(value))
-		}
-	}
-	if startBucketed != "" {
-		b.WriteString("&start=")
-		b.WriteString(url.QueryEscape(startBucketed))
-	}
-	if endBucketed != "" {
-		b.WriteString("&end=")
-		b.WriteString(url.QueryEscape(endBucketed))
-	}
-	key := "query_range:" + r.Header.Get("X-Scope-OrgID") + ":" + b.String() + ":" + p.tupleModeCacheKey(r)
-	if fp := p.fingerprintFromCtx(r.Context(), r); fp != "" {
-		key += ":auth:" + fp
-	}
-	return key
+// responseProfileCacheKey covers negotiated tuple shape and the Grafana profile
+// used by query dispatch. Content compression varies independently.
+func (p *Proxy) responseProfileCacheKey(r *http.Request) string {
+	profile := detectGrafanaClientProfile(r, "", r.URL.Path)
+	return strings.Join([]string{p.tupleModeCacheKey(r), profile.surface, profile.runtimeFamily, profile.drilldownProfile}, "/")
 }
 
 // handleQuery translates Loki instant queries.
 //
-//nolint:gocyclo // dispatches across cache, multi-tenant fanout, stats vs logs, subquery, binary metric, and streaming modes; branching is inherent to Loki instant query parity.
+//nolint:gocyclo // dispatches across cache, multi-tenant fanout, stats vs logs, binary metric, and streaming modes; branching is inherent to Loki instant query parity.
 func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	logqlQuery := r.FormValue("query")
@@ -2542,10 +2552,14 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	// withOrgID must precede any vlGet/vlPost call (preferWorkingParser and all
 	// early-return compat paths) so that tenant context is set for upstream requests.
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 	r = p.injectAuthFingerprint(r)
 
 	logqlQuery = resolveGrafanaRangeTemplateTokens(logqlQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("step"))
+
+	if p.handleEmptySumWithout(w, r, logqlQuery) {
+		return
+	}
 
 	// Extract and apply LogQL offset: strip the offset clause and shift the eval
 	// time backward so preferWorkingParser probes the historical window where the
@@ -2583,6 +2597,10 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 				defer shifted.flush()
 			}
 		}
+	}
+
+	if p.handleOrderedJSONMetric(w, r, start, logqlQuery, false) {
+		return
 	}
 
 	logqlQuery = p.preferWorkingParser(r.Context(), logqlQuery, r.FormValue("start"), r.FormValue("end"))
@@ -2657,14 +2675,7 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	// Route using the original LogQL AST — more reliable than re-parsing translated markers.
 	parsedForRoutingQ, _ := logqlpkg.Parse(logqlQuery)
-	if ra, ok := parsedForRoutingQ.(*logqlpkg.RangeAggregation); ok && ra.Step != "" {
-		innerLogsql, innerErr := p.translateQueryWithContext(r.Context(), ra.Inner.String())
-		if innerErr != nil {
-			p.writeError(sc, http.StatusBadRequest, innerErr.Error())
-		} else {
-			p.proxySubquery(sc, r, string(ra.Op), innerLogsql, ra.Range, ra.Step)
-		}
-	} else if binOp, ok := parsedForRoutingQ.(*logqlpkg.BinOpExpr); ok {
+	if binOp, ok := parsedForRoutingQ.(*logqlpkg.BinOpExpr); ok {
 		leftLogsql, leftErr := p.translateBinOpSide(r.Context(), binOp.Left)
 		rightLogsql, rightErr := p.translateBinOpSide(r.Context(), binOp.Right)
 		if leftErr != nil {

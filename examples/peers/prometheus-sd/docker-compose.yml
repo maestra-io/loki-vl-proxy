@@ -10,7 +10,10 @@
 # Usage:
 #   docker compose up -d
 #   curl http://localhost:8080/peers          (inspect the SD endpoint)
-#   curl http://localhost:3100/_cache/peers   (peer list seen by proxy-a)
+#   PEER_AUTH_TOKEN=<value of -peer-auth-token below>
+#   curl -H "X-Peer-Token: ${PEER_AUTH_TOKEN}" http://localhost:3100/_cache/peers   (peer list seen by proxy-a)
+#
+# The proxy is read-only: write logs to VictoriaLogs (no host port here; see README.md).
 
 services:
 
@@ -24,7 +27,9 @@ services:
       - vlogs-data:/vlogs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9428/health"]
+      # VictoriaLogs images are scratch-based from v1.52.0 (no shell, no wget);
+      # the binary's -version exit path is the probe that works on every version.
+      test: ["CMD", "/victoria-logs-prod", "-version"]
       interval: 10s
       timeout: 5s
       retries: 5

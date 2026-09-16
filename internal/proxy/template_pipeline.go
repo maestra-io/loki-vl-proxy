@@ -119,10 +119,10 @@ func pipelineParserShape(stages []logqlpkg.Stage) (broad bool, names []string) {
 		}
 		switch st.Type {
 		case logqlpkg.ParserJSON, logqlpkg.ParserLogfmt, logqlpkg.ParserUnpack:
-			if len(st.Params) == 0 {
+			if len(st.Fields) == 0 {
 				broad = true
 			}
-			for _, prm := range st.Params {
+			for _, prm := range st.Fields {
 				names = append(names, logqlpkg.SanitizeLabel(prm.Name))
 			}
 		}
@@ -153,9 +153,6 @@ func innermostLogQuery(expr logqlpkg.Expr) *logqlpkg.LogQuery {
 		case *logqlpkg.VectorAggregation:
 			expr = e.Inner
 		case *logqlpkg.RangeAggregation:
-			if e.Step != "" { // subquery: the inner expression is itself a metric
-				return nil
-			}
 			expr = e.Inner
 		default:
 			return nil
@@ -883,7 +880,7 @@ func (p *Proxy) templateMetricRangeBody(r *http.Request, mp *templateMetricPlan)
 	}
 	// The template pipeline yields RAW log entries.
 	body := buildManualRangeMetricMatrix(mp.manualFunc, mp.quantile, series,
-		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries(), false)
+		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries())
 	if mp.spec.OuterAggAcrossSeries != "" {
 		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy, mp.spec.OuterAggWithout)
 	}
@@ -913,7 +910,7 @@ func (p *Proxy) templateMetricInstantBody(r *http.Request, mp *templateMetricPla
 		series = capSeriesByTotalCount(series, p.resolvedMaxStatsQuerySeries())
 	}
 	// The template pipeline yields RAW log entries.
-	body := buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window, false)
+	body := buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window)
 	if mp.spec.OuterAggAcrossSeries != "" {
 		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy, mp.spec.OuterAggWithout)
 	}

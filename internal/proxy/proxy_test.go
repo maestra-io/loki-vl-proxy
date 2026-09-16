@@ -58,17 +58,11 @@ func TestContract_Labels_ResponseFormat(t *testing.T) {
 
 func TestContract_Labels_PassesTimeRange(t *testing.T) {
 	// Input: start=1609459200 (seconds), end=1609545600 (seconds) → 24h interval.
-	// After the 5-min cap applied by capMetadataStartOnly (no bucketing — preserves
-	// original end so recently-ingested data is never hidden):
-	//   cappedStart = endNs - 5min = 1609545600e9 - 300e9 = 1609545300e9
-	//   end         = 1609545600e9 (preserved, normalized to nanoseconds)
-	//
-	// Note: the handler also fires a background full-range refresh goroutine (because the
-	// 24h input range exceeds the 5-min synchronous cap), which sends the raw uncapped
-	// params to VL. We capture ALL calls and verify that AT LEAST ONE used the capped params.
+	// Loki returns every label with data in [start, end], so the requested range is
+	// forwarded unchanged and no background refresh call follows.
 	const (
-		wantStart = "1609545300000000000"
-		wantEnd   = "1609545600000000000"
+		wantStart = "1609459200"
+		wantEnd   = "1609545600"
 	)
 	type call struct{ start, end string }
 	var mu sync.Mutex
@@ -83,16 +77,11 @@ func TestContract_Labels_PassesTimeRange(t *testing.T) {
 
 	doGet(t, vlBackend.URL, "/loki/api/v1/labels?start=1609459200&end=1609545600")
 
-	// The synchronous path must have made at least one capped VL call.
-	// (The background full-range refresh will also appear with uncapped params — that is correct.)
 	mu.Lock()
 	defer mu.Unlock()
-	for _, c := range calls {
-		if c.start == wantStart && c.end == wantEnd {
-			return // pass
-		}
+	if len(calls) != 1 || calls[0].start != wantStart || calls[0].end != wantEnd {
+		t.Errorf("want exactly one VL call with start=%s end=%s; all calls: %v", wantStart, wantEnd, calls)
 	}
-	t.Errorf("no VL call with capped start=%s end=%s; all calls: %v", wantStart, wantEnd, calls)
 }
 
 func TestContract_Labels_EmptyResult(t *testing.T) {
@@ -102,9 +91,10 @@ func TestContract_Labels_EmptyResult(t *testing.T) {
 	resp := doGet(t, vlBackend.URL, "/loki/api/v1/labels")
 	assertLokiSuccess(t, resp)
 
+	// Loki returns no label names for a window without data (no synthetic service_name).
 	data := assertDataIsStringArray(t, resp)
-	if len(data) != 1 || data[0] != "service_name" {
-		t.Errorf("expected synthetic service_name label, got %v", data)
+	if len(data) != 0 {
+		t.Errorf("expected no labels for an empty window, got %v", data)
 	}
 }
 
@@ -488,29 +478,31 @@ func TestContract_QueryRange_MatrixFormat(t *testing.T) {
 	assertLokiSuccess(t, resp)
 }
 
-func TestContract_QueryRange_MatrixFormat_SlidingRateUsesManualLogFetch(t *testing.T) {
-	// rate()[5m] with step=60s is a sliding window (range != step).
-	// The proxy must use the manual log-fetch path, not native VL stats_query_range,
-	// because VL stats uses tumbling per-step buckets which give wrong values for
-	// sliding windows. The manual path makes a single /select/logsql/query call
-	// (no window splitting) and aggregates in-process.
+func TestContract_QueryRange_MatrixFormat_SlidingRateUsesAnchoredStatsBuckets(t *testing.T) {
+	// rate()[5m] with step=60s is a sliding window (range != step). The proxy
+	// evaluates every (t-5m, t] window from one stats_query_range call with
+	// gcd(step, range) = 60s buckets anchored at start-5m, per stream, instead
+	// of scanning raw log lines (no window splitting either).
 	var (
 		mu        sync.Mutex
 		callCount int
+		gotStep   string
 	)
 
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/select/logsql/query" {
-			t.Errorf("unexpected path %s; sliding rate must use log-fetch not stats", r.URL.Path)
+		if r.URL.Path != "/select/logsql/stats_query_range" {
+			t.Errorf("unexpected path %s; sliding rate must use anchored stats buckets", r.URL.Path)
 			http.Error(w, "wrong endpoint", http.StatusBadRequest)
 			return
 		}
+		_ = r.ParseForm()
 		mu.Lock()
 		callCount++
+		gotStep = r.Form.Get("step")
 		mu.Unlock()
-		// Return one NDJSON entry so the rate aggregation has data to work with.
-		w.Header().Set("Content-Type", "application/stream+json")
-		fmt.Fprintln(w, `{"_time":"2024-01-15T10:10:00Z","_stream":"{\"app\":\"nginx\"}","_msg":"hit"}`)
+		// One per-stream bucket so the rate aggregation has data to work with.
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"c","_stream":"{app=\"nginx\"}","level":""},"values":[[1705312800,"1"]]}]}}`)
 	}))
 	defer vlBackend.Close()
 
@@ -532,13 +524,16 @@ func TestContract_QueryRange_MatrixFormat_SlidingRateUsesManualLogFetch(t *testi
 	mu.Lock()
 	got := callCount
 	mu.Unlock()
-	if got != 1 {
-		t.Fatalf("expected exactly one log-fetch call (no window splitting for manual rate), got %d", got)
+	if got != 1 || gotStep != "60s" {
+		t.Fatalf("expected exactly one stats_query_range call with 60s buckets, got %d calls (step %q)", got, gotStep)
 	}
 
 	var resp struct {
 		Data struct {
 			ResultType string `json:"resultType"`
+			Result     []struct {
+				Values [][]interface{} `json:"values"`
+			} `json:"result"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
@@ -547,13 +542,23 @@ func TestContract_QueryRange_MatrixFormat_SlidingRateUsesManualLogFetch(t *testi
 	if resp.Data.ResultType != "matrix" {
 		t.Fatalf("expected matrix result type, got %q", resp.Data.ResultType)
 	}
+	// The bucket (10:00, 10:01] lies in the 5m windows ending 10:01 .. 10:05 (end).
+	if len(resp.Data.Result) != 1 || len(resp.Data.Result[0].Values) != 5 {
+		t.Fatalf("expected one series with 5 samples, got %s", w.Body.String())
+	}
+	for _, point := range resp.Data.Result[0].Values {
+		if point[1] != strconv.FormatFloat(1.0/300, 'f', -1, 64) {
+			t.Fatalf("expected rate 1/300 in every window holding the bucket, got %s", w.Body.String())
+		}
+	}
 }
 
-func TestContract_QueryRange_MatrixFormat_TumblingRateExtendsEndAndTrimsExtraPoint(t *testing.T) {
+func TestContract_QueryRange_MatrixFormat_TumblingRateRelabelsBucketsToLokiTimes(t *testing.T) {
 	// Tumbling rate: range == step (60s == 60s). The proxy routes this to native
-	// VL stats_query_range, extends end by one step to cover the last bucket, then
-	// trims the extra trailing point from the response.
-	var receivedEnd string
+	// VL stats_query_range. VL labels each bucket by its start ([T, T+60s)) while
+	// Loki's sample at T covers (T-60s, T], so the proxy fetches from start-60s
+	// and relabels each bucket forward by one window, keeping [start, end].
+	var receivedStart, receivedEnd string
 
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/select/logsql/stats_query_range" {
@@ -564,6 +569,7 @@ func TestContract_QueryRange_MatrixFormat_TumblingRateExtendsEndAndTrimsExtraPoi
 		if err := r.ParseForm(); err != nil {
 			t.Fatalf("parse form: %v", err)
 		}
+		receivedStart = r.FormValue("start")
 		receivedEnd = r.FormValue("end")
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -572,10 +578,12 @@ func TestContract_QueryRange_MatrixFormat_TumblingRateExtendsEndAndTrimsExtraPoi
 				"result": []map[string]interface{}{
 					{
 						"metric": map[string]string{"app": "nginx"},
+						// Buckets VL returns for the shifted fetch [start-60s, end+60s].
 						"values": [][]interface{}{
-							{1705312200, "1"},
-							{1705312260, "2"},
-							{1705312320, "3"},
+							{1705312140, "1"},
+							{1705312200, "2"},
+							{1705312260, "3"},
+							{1705312320, "4"},
 						},
 					},
 				},
@@ -588,6 +596,9 @@ func TestContract_QueryRange_MatrixFormat_TumblingRateExtendsEndAndTrimsExtraPoi
 	resp := doGet(t, vlBackend.URL, "/loki/api/v1/query_range?query=rate(%7Bapp%3D%22nginx%22%7D%5B60s%5D)&start=1705312200&end=1705312260&step=60")
 	assertLokiSuccess(t, resp)
 
+	if expectedStart := strconv.FormatInt(1705312200-60, 10); receivedStart != expectedStart {
+		t.Fatalf("expected backend start shifted back one window %q, got %q", expectedStart, receivedStart)
+	}
 	expectedEnd := strconv.FormatInt(1705312260+60, 10)
 	if receivedEnd != expectedEnd {
 		t.Fatalf("expected compensated backend end %q, got %q", expectedEnd, receivedEnd)
@@ -609,25 +620,16 @@ func TestContract_QueryRange_MatrixFormat_TumblingRateExtendsEndAndTrimsExtraPoi
 	if !ok {
 		t.Fatalf("expected values array, got %#v", series["values"])
 	}
-	// Updated 10.09.2026 with the bucket-timestamp fix: a VL bucket is labelled
-	// by its START, a LogQL point by its END. Loki emits points at 1705312200 and
-	// 1705312260 here; the first covers (…140, …200], for which the backend
-	// returns no bucket, so exactly ONE point survives — the one at the requested
-	// end, carrying the bucket that starts at …200. Verified against
-	// grafana/loki 3.7.1 on the same shape.
-	if len(values) != 1 {
-		t.Fatalf("expected a single in-range point, got %#v", values)
+	// Loki at 200 covers (140, 200] = VL bucket 140; Loki at 260 = VL bucket 200.
+	want := [][2]interface{}{{float64(1705312200), "1"}, {float64(1705312260), "2"}}
+	if len(values) != len(want) {
+		t.Fatalf("expected %d relabelled points, got %#v", len(want), values)
 	}
-	lastPair, ok := values[len(values)-1].([]interface{})
-	if !ok {
-		t.Fatalf("expected [ts,value] pair, got %#v", values[len(values)-1])
-	}
-	lastTS, ok := lastPair[0].(float64)
-	if !ok {
-		t.Fatalf("expected numeric timestamp, got %T", lastPair[0])
-	}
-	if int64(lastTS) != 1705312260 {
-		t.Fatalf("expected last timestamp to stay at requested end, got %v", lastPair)
+	for i, point := range values {
+		pair, ok := point.([]interface{})
+		if !ok || len(pair) != 2 || pair[0] != want[i][0] || pair[1] != want[i][1] {
+			t.Fatalf("point %d: want %v, got %#v", i, want[i], point)
+		}
 	}
 }
 
@@ -760,7 +762,7 @@ func TestContract_IndexStats_ResponseFormat(t *testing.T) {
 
 func TestContract_Volume_ResponseFormat(t *testing.T) {
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"hits":[{"fields":{"service.name":"api"},"timestamps":["2026-01-01T00:00:00Z"],"values":[3]}]}`))
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"_b","app":"api"},"value":[1767225600,"300"]}]}}`))
 	}))
 	defer vlBackend.Close()
 
@@ -784,13 +786,13 @@ func TestContract_Volume_ResponseFormat(t *testing.T) {
 
 func TestContract_VolumeRange_ResponseFormat(t *testing.T) {
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"hits":[{"fields":{"service.name":"api"},"timestamps":["2026-01-01T00:00:00Z"],"values":[3]}]}`))
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"_b","app":"api"},"values":[[1705312200,"300"],[1705312260,"120"]]}]}}`))
 	}))
 	defer vlBackend.Close()
 
 	p := newTestProxy(t, vlBackend.URL)
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest("GET", "/loki/api/v1/index/volume_range?query=%7B%7D&start=1&end=2&step=60", nil)
+	r := httptest.NewRequest("GET", "/loki/api/v1/index/volume_range?query=%7B%7D&start=1705312200&end=1705312800&step=60", nil)
 	p.handleVolumeRange(w, r)
 
 	var resp map[string]interface{}
@@ -934,10 +936,12 @@ func TestContract_Patterns_StripsPipelineAndUsesLabelScope(t *testing.T) {
 	}
 }
 
+// A rejected query (VL 400) is Loki's 400 bad_data instead; see
+// TestUpstreamBadRequest_MapsToLokiBadData/patterns.
 func TestContract_Patterns_FallsBackToQueryRangeWhenQueryUnavailable(t *testing.T) {
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/select/logsql/query" {
-			w.WriteHeader(http.StatusBadRequest)
+			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(`{"error":"query endpoint unavailable"}`))
 		} else {
 			w.WriteHeader(http.StatusNotFound)
@@ -1208,6 +1212,89 @@ func TestContract_Patterns_WindowedSamplingCoversWholeRange(t *testing.T) {
 	}
 	if firstTS >= lastTS {
 		t.Fatalf("expected increasing sample timestamps across range, got first=%d last=%d", firstTS, lastTS)
+	}
+}
+
+// A fixture that spans a UTC midnight must yield every step bucket on both
+// sides of the boundary: neither the aligned window split, the per-window
+// backend fetch, the miner's bucketization nor the requested-range fill may
+// key or truncate by day.
+func TestContract_Patterns_WindowedSamplingCoversUTCDayBoundary(t *testing.T) {
+	const step = 30 * time.Second
+	fixtureStart := time.Date(2026, 9, 14, 23, 0, 0, 0, time.UTC)
+	fixtureEnd := fixtureStart.Add(2 * time.Hour)
+	midnight := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
+
+	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/select/logsql/query" {
+			t.Errorf("unexpected backend path %s", r.URL.Path)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("parse form: %v", err)
+			return
+		}
+		parseBound := func(raw string) int64 {
+			value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+			if err != nil {
+				t.Errorf("expected numeric timestamp, got %q: %v", raw, err)
+				return 0
+			}
+			if len(strings.TrimSpace(raw)) <= 10 {
+				return value * int64(time.Second)
+			}
+			return value
+		}
+		startNs := parseBound(r.FormValue("start"))
+		endNs := parseBound(r.FormValue("end"))
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		for ts := fixtureStart; !ts.After(fixtureEnd); ts = ts.Add(step) {
+			if ts.UnixNano() < startNs || ts.UnixNano() > endNs {
+				continue
+			}
+			_, _ = fmt.Fprintf(w, `{"_time":"%s","_msg":"stable_pattern_alpha component=collector action=scrape outcome=ok","level":"info"}`+"\n", ts.Format(time.RFC3339Nano))
+		}
+	}))
+	defer vlBackend.Close()
+
+	p := newTestProxy(t, vlBackend.URL)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(
+		"GET",
+		fmt.Sprintf("/loki/api/v1/patterns?query=%%7Bapp%%3D%%22web%%22%%7D&start=%d&end=%d&step=30s", fixtureStart.Unix(), fixtureEnd.Unix()),
+		nil,
+	)
+	p.handlePatterns(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for patterns endpoint, got %d body=%s", w.Code, w.Body.String())
+	}
+	var resp patternsResponse
+	mustUnmarshal(t, w.Body.Bytes(), &resp)
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected exactly one pattern, got %d: %s", len(resp.Data), w.Body.String())
+	}
+
+	expectedBuckets := int(fixtureEnd.Sub(fixtureStart)/step) + 1
+	counts := make(map[int64]int, expectedBuckets)
+	for _, sample := range resp.Data[0].Samples {
+		ts, okTS := numberToInt64(sample[0])
+		count, okCount := numberToInt(sample[1])
+		if !okTS || !okCount {
+			t.Fatalf("expected numeric sample, got %v", sample)
+		}
+		counts[ts] = count
+	}
+	if len(counts) != expectedBuckets {
+		t.Fatalf("expected %d buckets across the day boundary, got %d: %v", expectedBuckets, len(counts), resp.Data[0].Samples)
+	}
+	for ts := fixtureStart; !ts.After(fixtureEnd); ts = ts.Add(step) {
+		if counts[ts.Unix()] != 1 {
+			t.Fatalf("bucket %s expected count 1, got %d", ts.Format(time.RFC3339), counts[ts.Unix()])
+		}
+	}
+	if counts[midnight.Add(-step).Unix()] != 1 || counts[midnight.Unix()] != 1 {
+		t.Fatalf("buckets adjacent to UTC midnight missing: %v", counts)
 	}
 }
 
@@ -1830,11 +1917,11 @@ func TestRecentTailCacheBypass_Decision(t *testing.T) {
 func TestContract_Volume_BypassesNearNowStaleCache(t *testing.T) {
 	var backendCalls int
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/select/logsql/hits" {
+		if r.URL.Path != "/select/logsql/stats_query" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		backendCalls++
-		_, _ = w.Write([]byte(`{"hits":[{"fields":{"service.name":"api"},"timestamps":["2026-01-01T00:00:00Z"],"values":[3]}]}`))
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"_b","app":"api"},"value":[1767225600,"300"]}]}}`))
 	}))
 	defer vlBackend.Close()
 
@@ -1863,7 +1950,7 @@ func TestContract_Volume_ServesStaleCacheWhenNearNowRefreshFails(t *testing.T) {
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backendCalls++
 		if backendCalls == 1 {
-			_, _ = w.Write([]byte(`{"hits":[{"fields":{"service.name":"api"},"timestamps":["2026-01-01T00:00:00Z"],"values":[3]}]}`))
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"_b","app":"api"},"value":[1767225600,"300"]}]}}`))
 			return
 		}
 		http.Error(w, "backend unavailable", http.StatusBadGateway)
@@ -2334,7 +2421,7 @@ func TestContract_Patterns_CachedPayloadStillPrependsCustomPatterns(t *testing.T
 		t.Fatalf("failed to create proxy: %v", err)
 	}
 
-	cacheKey := p.patternsAutodetectCacheKey("", "", `{app="web"}`, "1", "2", "1m")
+	cacheKey := p.patternsAutodetectCacheKey("", p.forwardedAuthFingerprint(httptest.NewRequest("GET", "/", nil)), `{app="web"}`, "1", "2", "1m")
 	payload, err := json.Marshal(patternsResponse{
 		Status: "success",
 		Data: []patternResultEntry{
@@ -2365,16 +2452,16 @@ func TestContract_Patterns_CachedPayloadStillPrependsCustomPatterns(t *testing.T
 
 func TestContract_RefreshVolumeCacheAsync_PopulatesCache(t *testing.T) {
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/select/logsql/hits" {
+		if r.URL.Path != "/select/logsql/stats_query" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"hits":[{"fields":{"service.name":"api"},"timestamps":["2026-01-01T00:00:00Z"],"values":[3]}]}`))
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"_b","app":"api"},"value":[1767225600,"300"]}]}}`))
 	}))
 	defer vlBackend.Close()
 
 	p := newTestProxy(t, vlBackend.URL)
 	cacheKey := "volume:test-refresh"
-	p.refreshVolumeCacheAsync("", cacheKey, `{app="api"}`, "", "", "", nil)
+	p.refreshVolumeCacheAsync("volume", "", cacheKey, volumeRequest{query: `{app="api"}`, startNs: 1767222000e9, endNs: 1767225600e9, limit: defaultVolumeSeriesLimit}, nil)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -2400,14 +2487,13 @@ func TestContract_RefreshVolumeRangeCacheAsync_PopulatesCache(t *testing.T) {
 		if r.URL.Path != "/select/logsql/stats_query_range" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
-		// stats_query_range returns Loki matrix format directly.
-		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"api"},"values":[[1746057600,"5"]]}]}}`))
+		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"_b","app":"api"},"values":[[1746057600,"5"],[1746057660,"7"]]}]}}`))
 	}))
 	defer vlBackend.Close()
 
 	p := newTestProxy(t, vlBackend.URL)
 	cacheKey := "volume_range:test-refresh"
-	p.refreshVolumeRangeCacheAsync("", cacheKey, `{app="api"}`, "", "", "60", "", defaultVolumeSeriesLimit, nil)
+	p.refreshVolumeCacheAsync("volume_range", "", cacheKey, volumeRequest{query: `{app="api"}`, startNs: 1746057600e9, endNs: 1746061200e9, stepNs: 60e9, limit: defaultVolumeSeriesLimit}, nil)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -3313,9 +3399,8 @@ func TestCache_LabelsHitOnRepeat(t *testing.T) {
 	//   floor(1700000000000000000 / 300000000000) = 5666666 → same bucket as T+1ms.
 	// A shift of +5 min (300e9 ns) moves to the next bucket.
 	//
-	// Use a 4-minute range so rangeExceedsWindow(≤5min) stays false; that prevents
-	// handleLabels from spawning a background refresh goroutine that would make an
-	// extra VL call and corrupt the callCount assertions below.
+	// A 4-minute range keeps the metadata TTL at its base value, so the cache hits
+	// below cannot schedule a background refresh that would add VL calls.
 	const (
 		// req1: T, req2: T+1ms (same 5-min bucket), req3: T+5min (next bucket)
 		req1 = "start=1700000000000000000&end=1700000240000000000"

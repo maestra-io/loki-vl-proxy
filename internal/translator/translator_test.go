@@ -193,7 +193,7 @@ func TestTranslateLogQL(t *testing.T) {
 		{
 			name:  "substring matches partial words like Loki does",
 			logql: `{app="nginx"} |= "err"`,
-			// ~"err" is VL regex/substring on _msg; with reconstructLogLine, _msg contains the full JSON.
+			// ~"err" is VL regex/substring on _msg, which holds the raw log line.
 			want: `app:="nginx" ~"err"`,
 		},
 		{
@@ -276,6 +276,9 @@ func TestConvertGoTemplate(t *testing.T) {
 		{`"{{.status}}"`, `"<status>"`},
 		{`"{{.method}} {{.path}}"`, `"<method> <path>"`},
 		{`"plain text"`, `"plain text"`},
+		{"`{{.status}}`", `"<status>"`},
+		{`"quoted \"{{.status}}\""`, `"quoted \"<status>\""`},
+		{`"{{printf \"%s\" .status}}"`, `"{{printf \"%s\" .status}}"`},
 	}
 
 	for _, tt := range tests {
@@ -586,11 +589,11 @@ func TestDetectedLevelEmptyFilter(t *testing.T) {
 		},
 		{
 			// After a parser, the translated filter is wrapped in | filter.
-			// -level:* uses negated-any syntax which is NOT a standard field filter
-			// (no :="/:~/etc."), so it lands in the main query position for now.
+			// -level:* is not a standard field filter (no :="/:~/etc.), but a
+			// bare filter after a pipe stage still needs its own | filter stage.
 			name:  "detected_level empty after logfmt parser",
 			logql: `{app="nginx"} | logfmt | detected_level=""`,
-			want:  `app:="nginx" | unpack_logfmt -level:*`,
+			want:  `app:="nginx" | unpack_logfmt | filter -level:*`,
 		},
 		{
 			name:  "detected_level empty in stream selector",

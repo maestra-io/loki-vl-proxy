@@ -1773,10 +1773,9 @@ func TestPeerCache_ReadAhead_BoundedFairPrefetch(t *testing.T) {
 			_, _ = ownerCache.Get(k)
 		}
 	}
-	// Get() only ENQUEUES the hot-index update (promoteBuf); the promoter applies
-	// it on its own goroutine. Without this flush the read-ahead cycle can ask
-	// the owner for a hot index that is still empty and prefetch nothing — the
-	// assertion below then reads 0 entries on a loaded machine.
+	// Cache.Get hands hot-key hits to the promoter goroutine; the owner's
+	// hot index is only populated once that goroutine has applied them.
+	// Flush it so /_cache/hot cannot be served empty to the follower.
 	ownerCache.drainPromotions()
 
 	errs := followerPC.runReadAheadCycle()

@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -187,45 +186,6 @@ func TestReduceLokiSeriesAcrossSeries_TrimsLabelsOfASingleSeries(t *testing.T) {
 	}
 	if len(resp.Data.Result[0].Values) != 2 {
 		t.Fatalf("expected both points, got %s", out)
-	}
-}
-
-// A quantile is computed here for exactness, but the raw-row scan it needs has a
-// cap. Hitting the cap must hand the query back to VictoriaLogs' own quantile —
-// a small numeric difference beats failing the panel with a 400.
-func TestQuantileFallsBackToBackend(t *testing.T) {
-	truncated := &rawRowScanTruncatedError{limit: 10000}
-	if !quantileFallsBackToBackend("quantile", truncated) {
-		t.Fatal("a truncated quantile scan must fall back to the backend")
-	}
-	if quantileFallsBackToBackend("count_over_time", truncated) {
-		t.Fatal("only a quantile falls back")
-	}
-	if quantileFallsBackToBackend("quantile", errors.New("backend returned 500")) {
-		t.Fatal("only a TRUNCATED scan falls back")
-	}
-}
-
-// `now`/`now±d` resolve against time.Now() on every parse, so the request and
-// the response filter were built from two different instants — and the filter,
-// being later, dropped the first point the request had gone back to fetch.
-func TestFreezeRelativeRangeBound(t *testing.T) {
-	frozen := freezeRelativeRangeBound("now-1h")
-	if frozen == "now-1h" {
-		t.Fatal("a relative bound must resolve to an absolute timestamp")
-	}
-	first, ok := parseLokiTimeToUnixNano(frozen)
-	if !ok {
-		t.Fatalf("frozen bound %q does not parse", frozen)
-	}
-	time.Sleep(2 * time.Millisecond)
-	second, _ := parseLokiTimeToUnixNano(frozen)
-	if first != second {
-		t.Fatalf("frozen bound still moves: %d vs %d", first, second)
-	}
-	// Absolute bounds are untouched.
-	if got := freezeRelativeRangeBound("1700000040"); got != "1700000040" {
-		t.Fatalf("absolute bound rewritten to %q", got)
 	}
 }
 

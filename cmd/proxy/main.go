@@ -85,6 +85,7 @@ type proxyRuntimeConfig struct {
 	tenantLimitsJSON                    string
 	maxLines                            int
 	rangeMetricRowLimit                 int
+	orderedJSONMetricMaxBytes           int64
 	backendTimeout                      time.Duration
 	cbFailThreshold                     int
 	cbOpenDuration                      time.Duration
@@ -104,6 +105,7 @@ type proxyRuntimeConfig struct {
 	derivedFieldsJSON                   string
 	streamResponse                      bool
 	emitStructuredMetadata              bool
+	backendDefaultMsgValue              string
 	patternsEnabled                     bool
 	patternsAutodetectFromQueries       bool
 	patternsCustomRaw                   string
@@ -168,6 +170,7 @@ type proxyRuntimeConfig struct {
 	lineField                           string
 	dedupeExactDuplicates               bool
 	bytesOverTimeSource                 string
+	alignQueriesWithStep                bool
 	recordExcludeFieldsCSV              string
 	lokiMaxLineSize                     int
 	labelValuesIndexedCache             bool
@@ -436,7 +439,7 @@ func run(
 	diskCacheCompress := fs.Bool("disk-cache-compress", true, "Gzip compression for disk cache")
 	diskCacheFlushSize := fs.Int("disk-cache-flush-size", 100, "Flush write buffer after N entries")
 	diskCacheFlushInterval := fs.Duration("disk-cache-flush-interval", 5*time.Second, "Write buffer flush interval")
-	diskCacheMinTTL := fs.Duration("disk-cache-min-ttl", 30*time.Second, "Minimum entry TTL eligible for L2 disk cache writes (shorter TTL entries stay in-memory only)")
+	diskCacheMinTTL := fs.Duration("disk-cache-min-ttl", 30*time.Second, "Minimum entry TTL eligible for L2 disk cache writes (shorter TTL entries stay in-memory only). Empty label and label-value answers are cached for max(30s, this, -peer-write-through-min-ttl) so they replace older non-empty copies")
 	diskCacheMaxBytes := fs.Int64("disk-cache-max-bytes", 0, "Maximum on-disk L2 cache size in bytes (0 = unlimited)")
 	// Tenant mapping
 	tenantMapJSON := fs.String("tenant-map", "", `JSON tenant mapping: {"org-name":{"account_id":"1","project_id":"0"}}`)
@@ -490,6 +493,7 @@ func run(
 
 	// Grafana datasource compatibility
 	maxLines := fs.Int("max-lines", 1000, "Default max lines per query")
+	orderedJSONMetricMaxBytes := fs.Int64("ordered-json-metric-max-bytes", 1<<30, "Safety cap on the VictoriaLogs raw rows response read, and the response built, by the proxy-side ordered JSON metric evaluator (0 = default 1 GiB, no upper bound). Exceeding it rejects the query instead of returning partial results. Grafana logs volume shapes are computed from VictoriaLogs stats buckets and do not read raw rows.")
 	rangeMetricRowLimit := fs.Int("manual-range-metric-row-limit", 0, "Safety cap on RAW LOG ROWS scanned per manual range-metric compatibility call (rate, count_over_time, ...). 0 uses the built-in default. The cap is enforced PROXY-SIDE while the rows stream — no `limit` is sent to VictoriaLogs, which would execute it as a sort over the whole match — and the memory the scan may hold is bounded separately by a shared retained-sample budget. Exceeding the cap returns 400 rather than a silently truncated number.")
 	backendTimeout := fs.Duration("backend-timeout", 120*time.Second, "Timeout for non-streaming requests to the VictoriaLogs backend")
 	cbFailThreshold := fs.Int("cb-fail-threshold", 5, "Circuit breaker: failures within -cb-window-duration before opening")
@@ -508,6 +512,7 @@ func run(
 	derivedFieldsJSON := fs.String("derived-fields", "", `JSON derived fields: [{"name":"traceID","matcherRegex":"trace_id=([a-f0-9]+)","url":"http://tempo/trace/${__value.raw}"}]`)
 	streamResponse := fs.Bool("stream-response", false, "Stream log responses via chunked transfer encoding")
 	emitStructuredMetadata := fs.Bool("emit-structured-metadata", true, "Include Loki 3-tuple stream values [timestamp, line, metadata] in query responses")
+	backendDefaultMsgValue := fs.String("backend-default-msg-value", "", "VictoriaLogs -defaultMsgValue when it is customized. Rows whose _msg is empty, starts with VictoriaLogs' default \"missing _msg field\" text, or equals this value get their log line rebuilt as a JSON object of the row's non-stream fields")
 	patternsEnabled := fs.Bool("patterns-enabled", true, "Enable /loki/api/v1/patterns endpoint (Grafana Logs Drilldown patterns)")
 	patternsAutodetectFromQueries := fs.Bool("patterns-autodetect-from-queries", false, "Warm /loki/api/v1/patterns cache from successful query/query_range log responses (opt-in global autodetect)")
 	patternsCustomRaw := fs.String("patterns-custom", "", `JSON array (or newline-separated text) of custom Drilldown patterns always prepended to /loki/api/v1/patterns responses`)
@@ -596,6 +601,7 @@ func run(
 	derivedLevelFieldsCSV := fs.String("derived-level-fields", "", `Comma-separated VL fields carrying a raw log level inside _msg (for example "level,loglevel,severity"). Enables level/detected_level matchers and normalises information->info, warning->warn. Empty keeps the upstream behaviour where level is a stored field.`)
 	derivedLevelGroupBy := fs.Bool("derived-level-group-by", false, "Append the unpack+coalesce+normalise pipe chain to queries that mention level, so `sum by (level)` groups server-side. Costs a full _msg unpack per matched entry.")
 	dedupeExactDuplicates := fs.Bool("dedupe-exact-duplicates", true, "Collapse rows with the same stream, timestamp and line into one, as Loki's ingester drops an exact duplicate of an entry already in the stream. Applied where the proxy reads rows (logs, and the count/bytes/rate paths that scan rows).")
+	alignQueriesWithStep := fs.Bool("align-queries-with-step", true, "Truncate a metric range query's start and end to multiples of the step before evaluation, as Loki's step-align middleware does with query_range.align_queries_with_step (on in the Loki Helm chart). Off = Loki's binary default: the grid starts at the request's own start.")
 	bytesOverTimeSource := fs.String("bytes-over-time-source", "record", `What bytes_over_time / bytes_rate measure: "line" = len(_msg) (upstream); "record" = the line Loki stored via vector — the record's non-stream fields JSON-encoded, _msg as "message", plus the http_server wrapper (path, source_type, timestamp).`)
 	recordExcludeFieldsCSV := fs.String("record-exclude-fields", "kubernetes.*", "Comma-separated VL fields (trailing * = prefix wildcard) that are NOT part of the Loki line: the collector's own metadata. Used by -bytes-over-time-source=record and -loki-max-line-size.")
 	lokiMaxLineSize := fs.Int("loki-max-line-size", 0, "Drop rows whose Loki line exceeds this many bytes, as Loki's ingester did (limits_config.max_line_size with max_line_size_truncate=false). 0 disables. Native count/bytes/rate queries apply it only when they carry a line filter or a parser; a bare stream count skips it.")
@@ -633,7 +639,7 @@ func run(
 	peerAuthToken := fs.String("peer-auth-token", "", "Shared token required on /_cache/get and /_cache/set peer-cache requests when set")
 	peerInsecureIPAllowlist := fs.Bool("peer-insecure-ip-allowlist", false, "When true, allow peer cache requests based on source IP membership alone (legacy behavior). Default false: a shared --peer-auth-token is required when peer discovery is configured.")
 	peerWriteThrough := fs.Bool("peer-write-through", true, "Push cache writes from non-owner peers to owner peers for warmer distributed cache under skewed traffic")
-	peerWriteThroughMinTTL := fs.Duration("peer-write-through-min-ttl", 30*time.Second, "Minimum TTL eligible for peer owner write-through pushes")
+	peerWriteThroughMinTTL := fs.Duration("peer-write-through-min-ttl", 30*time.Second, "Minimum TTL eligible for peer owner write-through pushes. Empty label and label-value answers are cached for max(30s, this, -disk-cache-min-ttl) so they replace older non-empty copies")
 	peerHotReadAheadEnabled := fs.Bool("peer-hot-read-ahead-enabled", false, "Enable bounded hot read-ahead from peer hot index to prewarm local shadows")
 	peerHotReadAheadInterval := fs.Duration("peer-hot-read-ahead-interval", 30*time.Second, "Base interval for periodic peer hot read-ahead pulls")
 	peerHotReadAheadJitter := fs.Duration("peer-hot-read-ahead-jitter", 5*time.Second, "Random jitter added to peer hot read-ahead interval")
@@ -780,6 +786,7 @@ func run(
 			tenantLimitsJSON:                    envCfg.tenantLimitsJSON,
 			maxLines:                            *maxLines,
 			rangeMetricRowLimit:                 *rangeMetricRowLimit,
+			orderedJSONMetricMaxBytes:           *orderedJSONMetricMaxBytes,
 			backendTimeout:                      *backendTimeout,
 			cbFailThreshold:                     *cbFailThreshold,
 			cbOpenDuration:                      *cbOpenDuration,
@@ -799,6 +806,7 @@ func run(
 			derivedFieldsJSON:                   *derivedFieldsJSON,
 			streamResponse:                      *streamResponse,
 			emitStructuredMetadata:              *emitStructuredMetadata,
+			backendDefaultMsgValue:              *backendDefaultMsgValue,
 			patternsEnabled:                     *patternsEnabled,
 			patternsAutodetectFromQueries:       *patternsAutodetectFromQueries,
 			patternsCustomRaw:                   *patternsCustomRaw,
@@ -863,6 +871,7 @@ func run(
 			lineField:                           *lineField,
 			dedupeExactDuplicates:               *dedupeExactDuplicates,
 			bytesOverTimeSource:                 *bytesOverTimeSource,
+			alignQueriesWithStep:                *alignQueriesWithStep,
 			recordExcludeFieldsCSV:              *recordExcludeFieldsCSV,
 			lokiMaxLineSize:                     *lokiMaxLineSize,
 			labelValuesIndexedCache:             *labelValuesIndexedCache,
@@ -1999,6 +2008,7 @@ func buildProxyConfig(cfg proxyRuntimeConfig) (proxy.Config, error) {
 		TenantLimits:                       tenantLimits,
 		MaxLines:                           cfg.maxLines,
 		RangeMetricRowLimit:                cfg.rangeMetricRowLimit,
+		OrderedJSONMetricMaxBytes:          cfg.orderedJSONMetricMaxBytes,
 		BackendTimeout:                     cfg.backendTimeout,
 		CBFailThreshold:                    cfg.cbFailThreshold,
 		CBOpenDuration:                     cfg.cbOpenDuration,
@@ -2018,6 +2028,7 @@ func buildProxyConfig(cfg proxyRuntimeConfig) (proxy.Config, error) {
 		DerivedFields:                      derivedFields,
 		StreamResponse:                     cfg.streamResponse,
 		EmitStructuredMetadata:             cfg.emitStructuredMetadata,
+		BackendDefaultMsgValue:             cfg.backendDefaultMsgValue,
 		PatternsEnabled:                    boolPointer(cfg.patternsEnabled),
 		PatternsAutodetectFromQueries:      cfg.patternsAutodetectFromQueries,
 		PatternsCustom:                     customPatterns,
@@ -2081,6 +2092,7 @@ func buildProxyConfig(cfg proxyRuntimeConfig) (proxy.Config, error) {
 		LineField:                          strings.TrimSpace(cfg.lineField),
 		DedupeExactDuplicates:              &cfg.dedupeExactDuplicates,
 		BytesOverTimeSource:                strings.TrimSpace(cfg.bytesOverTimeSource),
+		AlignQueriesWithStep:               cfg.alignQueriesWithStep,
 		RecordExcludeFields:                parseCSV(cfg.recordExcludeFieldsCSV),
 		LokiMaxLineSize:                    cfg.lokiMaxLineSize,
 		LabelValuesIndexedCache:            cfg.labelValuesIndexedCache,

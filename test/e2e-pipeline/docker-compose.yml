@@ -1,6 +1,6 @@
 services:
   victorialogs:
-    image: ${VICTORIALOGS_IMAGE:-victoriametrics/victoria-logs:v1.49.0}
+    image: ${VICTORIALOGS_IMAGE:-victoriametrics/victoria-logs:v1.52.0}
     container_name: e2e-pipeline-vl
     ports:
       - "19528:9428"
@@ -11,7 +11,9 @@ services:
     volumes:
       - vl-pipeline-data:/vlogs
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:9428/health"]
+      # VictoriaLogs images are scratch-based from v1.52.0 (no shell, no wget);
+      # the binary's -version exit path is the probe that works on every version.
+      test: ["CMD", "/victoria-logs-prod", "-version"]
       interval: 3s
       timeout: 2s
       retries: 15

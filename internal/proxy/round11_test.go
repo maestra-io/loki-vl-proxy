@@ -30,9 +30,9 @@ func TestShiftStatsQRToLokiGrid_NonAlignedStart(t *testing.T) {
 	for _, rem := range []int64{0, 97, 209, 211, 388, 419} {
 		start := int64(1699999980) + rem // 1699999980 = 4047619*420, so start mod step == rem
 		startRaw := fmt.Sprintf("%d", start)
-		// What VictoriaLogs returns for buildLokiGridStatsParams(start, step): the
-		// grid begins one step before start, every label is the real bucket start
-		// plus the epsilon, and the value names the window the bucket covers.
+		// What VictoriaLogs returns for the anchored tumbling grid: it begins one
+		// step before start, every label is the real bucket start plus the
+		// epsilon, and the value names the window the bucket covers.
 		var buckets []string
 		for k := int64(-1); k <= 2; k++ {
 			label := start + k*step
@@ -41,7 +41,8 @@ func TestShiftStatsQRToLokiGrid_NonAlignedStart(t *testing.T) {
 		body := []byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[` +
 			strings.Join(buckets, ",") + `]}]}}`)
 
-		got := string(shiftStatsQRToLokiGrid(body, startRaw, "420s"))
+		_ = startRaw
+		got := string(relabelSnappedTumblingStatsQueryRange(body, start*int64(time.Second), 0, step*int64(time.Second)))
 		// The bucket labelled start-step+eps covers (start-step, start] and is the
 		// point AT start; the next one is the point at start+step, and so on.
 		for k := int64(0); k <= 3; k++ {
@@ -56,16 +57,13 @@ func TestShiftStatsQRToLokiGrid_NonAlignedStart(t *testing.T) {
 // The evaluation timestamp is what the merge keys on, so the whole per-point
 // contract in one number: with start ≡ rem (mod step) the point at start must
 // be labelled start, never start-step.
-func TestLokiGridOffsetNanos_IsNotAppliedTwice(t *testing.T) {
+func TestRelabelSnappedTumbling_IsNotAppliedTwice(t *testing.T) {
 	start := time.Unix(1699999980+300, 0)
-	off := lokiGridOffsetNanos(fmt.Sprintf("%d", start.Unix()), "420s")
-	if off != 300*int64(time.Second)+lokiGridBucketEpsilonNanos {
-		t.Fatalf("request offset = %d, want rem+epsilon", off)
-	}
-	label := start.Add(-420*time.Second).UnixNano() + lokiGridBucketEpsilonNanos
+	const step = 420 * time.Second
+	label := start.Add(-step).UnixNano() + int64(time.Microsecond)
 	body := []byte(fmt.Sprintf(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[[%d.000001,"1"]]}]}}`,
 		label/int64(time.Second)))
-	got := string(shiftStatsQRToLokiGrid(body, fmt.Sprintf("%d", start.Unix()), "420s"))
+	got := string(relabelSnappedTumblingStatsQueryRange(body, start.UnixNano(), 0, int64(step)))
 	if !strings.Contains(got, fmt.Sprintf(`[%d,"1"]`, start.Unix())) {
 		t.Fatalf("point relabelled to %s, want %d", got, start.Unix())
 	}
@@ -97,7 +95,7 @@ func TestTemplateLogPath_PushesTheRequestLimit(t *testing.T) {
 	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
 		url.QueryEscape(`{app="nginx"} | json | line_format "{{.x}}"`)+"&start=1700000000&end=1700003600&limit=37", nil)
 	rec := httptest.NewRecorder()
@@ -128,9 +126,9 @@ func TestTemplateLogPath_GrowsTheBoundOnlyWhenTheSuffixDropsRows(t *testing.T) {
 			fmt.Fprintf(w, `{"_time":"2023-11-14T22:13:%02dZ","_msg":"{\"level\":\"info\"}","_stream":"{app=\"a\"}","app":"a"}`+"\n", i%60)
 		}
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
-		url.QueryEscape(`{app="a"} | json | line_format "{{.x}}" | level="error"`)+"&start=1700000000&end=1700003600&limit=37", nil)
+		url.QueryEscape(`{app="a"} | json | line_format "{{.x | upper}}" | level="error"`)+"&start=1700000000&end=1700003600&limit=37", nil)
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, req)
 	if rec.Code != http.StatusOK {
@@ -176,7 +174,7 @@ func TestSeriesCap_RefusesInsteadOfTrimming(t *testing.T) {
 			})
 			// A fresh proxy per phase: the response caches would otherwise answer
 			// a later phase with an earlier phase's body.
-			p := newGapTestProxy(t, vl.URL)
+			p := newSlidingTestProxy(t, vl.URL)
 			target := "/loki/api/v1/query_range?query=" + url.QueryEscape(tc.query) + "&start=1700000000&end=1700000720&step=" + tc.step
 			targetDrilldown, targetRaised := target, target
 
@@ -187,7 +185,7 @@ func TestSeriesCap_RefusesInsteadOfTrimming(t *testing.T) {
 			}
 
 			// Drilldown gets the busiest N and a Warning header, as Loki does.
-			p = newGapTestProxy(t, vl.URL)
+			p = newSlidingTestProxy(t, vl.URL)
 			req := httptest.NewRequest(http.MethodGet, targetDrilldown, nil)
 			req.Header.Set("X-Query-Tags", "Source=grafana-lokiexplore-app")
 			rec = httptest.NewRecorder()
@@ -197,7 +195,7 @@ func TestSeriesCap_RefusesInsteadOfTrimming(t *testing.T) {
 			}
 
 			// The cap is configurable per deployment.
-			p = newGapTestProxy(t, vl.URL)
+			p = newSlidingTestProxy(t, vl.URL)
 			p.maxStatsQuerySeries = 1000
 			rec = httptest.NewRecorder()
 			p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, targetRaised, nil))
@@ -216,7 +214,7 @@ func TestSumRate_SlidingWindowPoolsIntoOneSeries(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
 			`{"metric":{},"values":[[1700000060.000001,"6"],[1700000120.000001,"12"]]}]}}`))
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
 		url.QueryEscape(`sum(rate({app="a"}[10m]))`)+"&start=1700000000&end=1700000600&step=60", nil))
@@ -249,7 +247,7 @@ func TestLabelFormatAlias_IsPushedDownAsFormat(t *testing.T) {
 		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
 			`{"metric":{"lf":"info"},"values":[[1700003600.000001,"6"]]},{"metric":{},"values":[[1700003600.000001,"2"]]}]}}`))
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
 		url.QueryEscape("sum by (lf) (count_over_time({app=\"a\"} | json | label_format lf=`{{ .level }}` [1h]))")+"&start=1700000000&end=1700007200&step=3600", nil))
@@ -274,7 +272,7 @@ func TestTemplateMetricPath_ReadsUnsorted(t *testing.T) {
 	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
 		url.QueryEscape(`sum by (x) (count_over_time({app="a"} | json | line_format "{{ or .x __line__ }}" | regexp "(?P<x>\\d+)" [1h]))`)+"&start=1700000000&end=1700007200&step=3600", nil))
@@ -310,10 +308,10 @@ func TestBareUnwrapOverTemplate_KeepsParsedLabelsDropsUnwrapField(t *testing.T) 
 		fmt.Fprint(w, `{"_time":"2023-11-14T22:13:30Z","_msg":"{\"message\":\"response sent duration_ms=12\",\"k\":\"v\"}","_stream":"{app=\"a\"}","app":"a"}`+"\n")
 		fmt.Fprint(w, `{"_time":"2023-11-14T22:13:40Z","_msg":"{\"message\":\"response sent duration_ms=30\",\"k\":\"v\"}","_stream":"{app=\"a\"}","app":"a"}`+"\n")
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
-		url.QueryEscape(`max_over_time({app="a"} | json message="message" | line_format "{{ or .message __line__ }}" | regexp "duration_ms=(?P<duration_ms>\d+)" | unwrap duration_ms [1m])`)+
+		url.QueryEscape(`max_over_time({app="a"} | json message="message" | line_format "{{ or .message __line__ }}" | regexp "duration_ms=(?P<duration_ms>\\d+)" | unwrap duration_ms [1m])`)+
 		"&start=1700000000&end=1700000120&step=60", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("HTTP %d: %s", rec.Code, rec.Body.String())
@@ -344,7 +342,7 @@ func TestSeriesCap_BareParserPathNeverFallsBackToRawScan(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(statsQRWithSeries(501))
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
 		url.QueryEscape(`count_over_time({app="a"} | json [5m])`)+"&start=1700000000&end=1700000600&step=60", nil))
@@ -370,7 +368,7 @@ func TestOuterAggregationWithout_KeepsTheOtherLabels(t *testing.T) {
 			fmt.Fprint(w, `{"_time":"2023-11-14T22:13:30Z","_msg":"x","_stream":"{app=\"a\",pod=\"p1\"}","app":"a","pod":"p1"}`+"\n")
 			fmt.Fprint(w, `{"_time":"2023-11-14T22:13:40Z","_msg":"y","_stream":"{app=\"a\",pod=\"p2\"}","app":"a","pod":"p2"}`+"\n")
 		})
-		p := newGapTestProxy(t, vl.URL)
+		p := newSlidingTestProxy(t, vl.URL)
 		rec := httptest.NewRecorder()
 		p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
 			url.QueryEscape(q)+"&start=1700000000&end=1700000120&step=60", nil))
@@ -397,7 +395,7 @@ func TestTemplateLogPath_MsgFieldAliasReachesLineFormat(t *testing.T) {
 		w.Header().Set("Content-Type", "application/x-ndjson")
 		fmt.Fprint(w, `{"_time":"2023-11-14T22:13:30Z","_msg":"plain ERROR text","_stream":"{app=\"a\"}","app":"a"}`+"\n")
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	p.msgFieldAliases = []string{"message", "msg"}
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
@@ -422,14 +420,14 @@ func TestSeriesCap_InstantTemplateMetric(t *testing.T) {
 	query := url.QueryEscape(`sum by (x) (count_over_time({app="a"} | json | line_format "{{.x}}" [1h]))`)
 	target := "/loki/api/v1/query?query=" + query + "&time=1700000100"
 
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	rec := httptest.NewRecorder()
 	p.handleQuery(rec, httptest.NewRequest(http.MethodGet, target, nil))
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "maximum of series (500)") {
 		t.Fatalf("501 series over a cap of 500 must be Loki's 400, got %d: %.200s", rec.Code, rec.Body.String())
 	}
 
-	p = newGapTestProxy(t, vl.URL)
+	p = newSlidingTestProxy(t, vl.URL)
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	req.Header.Set("X-Query-Tags", "Source=grafana-lokiexplore-app")
 	rec = httptest.NewRecorder()
@@ -438,7 +436,7 @@ func TestSeriesCap_InstantTemplateMetric(t *testing.T) {
 		t.Fatalf("drilldown: want 200, 500 series and a Warning, got %d (%d series, Warning=%q)", rec.Code, countLokiMatrixSeries(rec.Body.Bytes()), rec.Header().Get("Warning"))
 	}
 
-	p = newGapTestProxy(t, vl.URL)
+	p = newSlidingTestProxy(t, vl.URL)
 	p.maxStatsQuerySeries = 1000
 	rec = httptest.NewRecorder()
 	p.handleQuery(rec, httptest.NewRequest(http.MethodGet, target, nil))

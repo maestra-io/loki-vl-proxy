@@ -158,7 +158,12 @@ func ensureSyntheticServiceName(labels map[string]string) {
 	labels["service_name"] = deriveServiceName(labels)
 }
 
+// appendSyntheticLabels de-duplicates labels and adds the synthetic service_name
+// label. A window without data stays empty: Loki returns no label names for it.
 func appendSyntheticLabels(labels []string) []string {
+	if len(labels) == 0 {
+		return []string{}
+	}
 	seen := make(map[string]struct{}, len(labels)+1)
 	out := make([]string, 0, len(labels)+1)
 	for _, label := range labels {
@@ -480,9 +485,9 @@ func formatDetectedLabelSummaries(summaries map[string]*detectedLabelSummary) []
 }
 
 func (p *Proxy) serviceNameValues(ctx context.Context, query, start, end string) ([]string, error) {
-	values, err := p.serviceNameValuesFromNativeFields(ctx, query, start, end)
-	if err == nil && len(values) > 0 {
-		return values, nil
+	nativeValues, nativeErr := p.serviceNameValuesFromNativeFields(ctx, query, start, end)
+	if nativeErr == nil && len(nativeValues) > 0 {
+		return nativeValues, nil
 	}
 
 	selectorQuery := streamSelectorPrefix(query)
@@ -508,17 +513,34 @@ func (p *Proxy) serviceNameValues(ctx context.Context, query, start, end string)
 	if end != "" {
 		params.Set("end", end)
 	}
-	params = capMetadataStartOnly(params, metadataMaxFieldNamesWindow)
+	// Full requested range: /label/service_name/values must list every value with
+	// data in [start, end], like Loki.
 
 	resp, err := p.vlGet(ctx, "/select/logsql/streams", params)
 	if err != nil {
-		return p.serviceNameValuesFromDetectedLabels(ctx, detectionQuery, start, end)
+		// A failed full-range call is returned as an error (callers serve a stale
+		// answer or the error), never answered from the recent-data detection
+		// sample below, which would be a partial list.
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= http.StatusInternalServerError {
+		return nil, p.redactedBackendStatusError("", resp.StatusCode, body)
+	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		return p.serviceNameValuesFromDetectedLabels(ctx, detectionQuery, start, end)
+		if isVLUnsupportedPath(body) {
+			// A backend without /select/logsql/streams: the full-range native
+			// field lookup above is the complete answer (or its error).
+			if nativeErr != nil {
+				return nil, nativeErr
+			}
+			return []string{}, nil
+		}
+		// Invalid query or rejected request: return the error, as Loki does,
+		// instead of answering from a recent-data sample.
+		return nil, p.redactedBackendStatusError("", resp.StatusCode, body)
 	}
 	var vlResp struct {
 		Values []struct {
@@ -548,6 +570,13 @@ func (p *Proxy) serviceNameValues(ctx context.Context, query, start, end string)
 	return fallbackValues, nil
 }
 
+// isVLUnsupportedPath reports whether a VictoriaLogs error body says the
+// requested endpoint does not exist on this version (HTTP 400,
+// `unsupported path requested: "..."`), as opposed to a rejected query.
+func isVLUnsupportedPath(body []byte) bool {
+	return bytes.Contains(body, []byte("unsupported path requested"))
+}
+
 func (p *Proxy) serviceNameValuesFromNativeFields(ctx context.Context, query, start, end string) ([]string, error) {
 	values := make([]string, 0, 16)
 	seen := make(map[string]struct{}, 16)
@@ -556,12 +585,8 @@ func (p *Proxy) serviceNameValuesFromNativeFields(ctx context.Context, query, st
 	if err != nil {
 		return nil, err
 	}
-	// Cap time range for stream_field_values calls. metadataQueryParams passes the raw
-	// user range (e.g. 12h) which causes O(data-volume) scans on VL. Capping to 1h matches
-	// the cap already applied to stream_field_names/field_names calls and brings cold
-	// stream_field_values latency from 5-8s to <400ms. fetchAllFieldNamesCached applies
-	// its own internal 1h cap, so double-capping is harmless.
-	params = capMetadataStartOnly(params, metadataMaxFieldNamesWindow)
+	// No time-range cap: /label/service_name/values must list every service with
+	// data in the requested [start, end] range, like Loki.
 	appendFieldValues := func(fieldValues []string) {
 		for _, value := range fieldValues {
 			value = strings.TrimSpace(value)
@@ -787,144 +812,6 @@ func splitTargetLabels(targetLabels string) []string {
 	return labels
 }
 
-func inferPrimaryTargetLabel(query string) string {
-	query = strings.TrimSpace(query)
-	if !strings.HasPrefix(query, "{") {
-		return ""
-	}
-
-	inQuote := byte(0)
-	escape := false
-	braceDepth := 0
-	end := -1
-	for i := 0; i < len(query); i++ {
-		ch := query[i]
-		if escape {
-			escape = false
-			continue
-		}
-		if inQuote != 0 {
-			if ch == '\\' && inQuote == '"' {
-				escape = true
-				continue
-			}
-			if ch == inQuote {
-				inQuote = 0
-			}
-			continue
-		}
-		switch ch {
-		case '"', '`':
-			inQuote = ch
-		case '{':
-			braceDepth++
-		case '}':
-			braceDepth--
-			if braceDepth == 0 {
-				end = i
-				i = len(query)
-			}
-		}
-	}
-	if end <= 1 {
-		return ""
-	}
-
-	content := query[1:end]
-	inQuote = 0
-	escape = false
-	start := 0
-	firstMatcher := ""
-	for i := 0; i < len(content); i++ {
-		ch := content[i]
-		if escape {
-			escape = false
-			continue
-		}
-		if inQuote != 0 {
-			if ch == '\\' && inQuote == '"' {
-				escape = true
-				continue
-			}
-			if ch == inQuote {
-				inQuote = 0
-			}
-			continue
-		}
-		if ch == '"' || ch == '`' {
-			inQuote = ch
-			continue
-		}
-		if ch != ',' {
-			continue
-		}
-		part := strings.TrimSpace(content[start:i])
-		if part != "" {
-			firstMatcher = part
-			break
-		}
-		start = i + 1
-	}
-	if firstMatcher == "" {
-		firstMatcher = strings.TrimSpace(content[start:])
-	}
-	if firstMatcher == "" {
-		return ""
-	}
-
-	for _, op := range []string{"!~", "=~", "!=", "="} {
-		if idx := strings.Index(firstMatcher, op); idx > 0 {
-			return strings.TrimSpace(firstMatcher[:idx])
-		}
-	}
-	return ""
-}
-
-func usesDerivedVolumeLabels(targetLabels string) bool {
-	for _, label := range splitTargetLabels(targetLabels) {
-		if label == "service_name" || label == "detected_level" {
-			return true
-		}
-	}
-	return false
-}
-
-func parseVolumeBoundary(ts string) (time.Time, bool) {
-	ts = strings.TrimSpace(ts)
-	if ts == "" {
-		return time.Time{}, false
-	}
-	if ts == "now" {
-		return time.Now().UTC(), true
-	}
-	if strings.HasPrefix(ts, "now-") || strings.HasPrefix(ts, "now+") {
-		sign := ts[3:4]
-		d, err := time.ParseDuration(ts[4:])
-		if err == nil {
-			if sign == "-" {
-				return time.Now().UTC().Add(-d), true
-			}
-			return time.Now().UTC().Add(d), true
-		}
-	}
-	if sec, ok := parseFlexibleUnixSeconds(ts); ok {
-		return time.Unix(sec, 0).UTC(), true
-	}
-	return time.Time{}, false
-}
-
-func parseVolumeStep(step string) (time.Duration, bool) {
-	step = strings.TrimSpace(step)
-	if step == "" {
-		return 0, false
-	}
-	d, err := time.ParseDuration(formatVLStep(step))
-	if err != nil || d <= 0 {
-		return 0, false
-	}
-	return d, true
-}
-
 func parseEntryTime(value interface{}) (time.Time, bool) {
 	switch v := value.(type) {
 	case string:
@@ -941,232 +828,6 @@ func parseEntryTime(value interface{}) (time.Time, bool) {
 		return time.Unix(0, int64(v)).UTC(), true
 	}
 	return time.Time{}, false
-}
-
-func buildVolumeMetric(labels map[string]string, targetLabels []string) map[string]string {
-	metric := make(map[string]string, len(targetLabels))
-	for _, target := range targetLabels {
-		metric[target] = labels[target]
-	}
-	return metric
-}
-
-func volumeMetricKey(targetLabels []string, metric map[string]string) string {
-	if len(targetLabels) == 0 {
-		return "{}"
-	}
-	var b strings.Builder
-	b.WriteByte('{')
-	for i, target := range targetLabels {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(target)
-		b.WriteString(`="`)
-		b.WriteString(strings.ReplaceAll(metric[target], `"`, `\"`))
-		b.WriteByte('"')
-	}
-	b.WriteByte('}')
-	return b.String()
-}
-
-//nolint:gocyclo // builds VL stats query across multiple derived-label targets (level/detected_level/service/etc.) with per-target unpack chains and result fan-in; complexity is inherent to the volume-by-label contract.
-func (p *Proxy) volumeByDerivedLabels(ctx context.Context, query, start, end, targetLabels, step string) (map[string]interface{}, error) {
-	logsqlQuery, err := p.translateQuery(defaultQuery(query))
-	if err != nil {
-		return nil, err
-	}
-
-	// When detected_level is a target, VL must extract level from _msg because
-	// level is not a VL stream field for JSON/logfmt logs — it lives inside _msg.
-	// Chaining unpack_json then unpack_logfmt covers both formats: unpack_json
-	// extracts level from JSON objects; unpack_logfmt handles key=value lines.
-	// Logs that are neither JSON nor logfmt leave level unset (graceful no-op).
-	targets := splitTargetLabels(targetLabels)
-	needsLevelUnpack := false
-	for _, t := range targets {
-		if t == "detected_level" {
-			needsLevelUnpack = true
-			break
-		}
-	}
-	if needsLevelUnpack && !strings.Contains(logsqlQuery, "unpack_json") && !strings.Contains(logsqlQuery, "unpack_logfmt") {
-		logsqlQuery = logsqlQuery + " " + logsql.PipeUnpackJSON{From: "_msg"}.String() + " " + logsql.PipeUnpackLogfmt{From: "_msg"}.String()
-	}
-
-	params := url.Values{}
-	params.Set("query", logsqlQuery)
-	if start != "" {
-		params.Set("start", formatVLTimestamp(start))
-	}
-	if end != "" {
-		params.Set("end", formatVLTimestamp(end))
-	}
-	if strings.TrimSpace(step) != "" {
-		params.Set("step", formatVLStep(step))
-	} else {
-		// VictoriaLogs hits endpoint requires step on v1.49+.
-		params.Set("step", "1h")
-	}
-	sourceFields := p.derivedVolumeSourceFields(targets)
-	if len(sourceFields) > 0 {
-		for _, field := range sourceFields {
-			params.Add("field", field)
-		}
-	}
-
-	resp, err := p.vlGet(ctx, "/select/logsql/hits", params)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusBadRequest {
-		body, _ := readBodyLimited(resp.Body, maxUpstreamErrorBodyBytes)
-		return nil, fmt.Errorf("derived volume hits request failed: status=%d body=%s", resp.StatusCode, p.redactedBackendErrorMessage(resp.StatusCode, body))
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	hits := parseHits(body)
-	matrixMode := strings.TrimSpace(step) != ""
-
-	type seriesData struct {
-		metric map[string]string
-		total  int64
-		bucket map[int64]int64
-	}
-
-	startTime, hasStart := parseVolumeBoundary(start)
-	endTime, hasEnd := parseVolumeBoundary(end)
-	stepDur, hasStep := parseVolumeStep(step)
-	series := make(map[string]*seriesData)
-	order := make([]string, 0)
-
-	for _, hit := range hits.Hits {
-		translated := p.translateVolumeMetric(hit.Fields)
-		ensureDetectedLevel(translated)
-		ensureSyntheticServiceName(translated)
-		metric := buildVolumeMetric(translated, targets)
-		key := volumeMetricKey(targets, metric)
-
-		item := series[key]
-		if item == nil {
-			item = &seriesData{
-				metric: metric,
-				bucket: map[int64]int64{},
-			}
-			series[key] = item
-			order = append(order, key)
-		}
-
-		if !matrixMode {
-			for _, v := range hit.Values {
-				item.total += int64(v)
-			}
-			continue
-		}
-
-		for i, ts := range hit.Timestamps {
-			value := 0
-			if i < len(hit.Values) {
-				value = hit.Values[i]
-			}
-			if value < 0 {
-				continue
-			}
-			entryNs, ok := parseLokiTimeToUnixNano(strings.TrimSpace(string(ts)))
-			if !ok {
-				continue
-			}
-			entryTime := time.Unix(0, entryNs).UTC()
-			if hasStart && entryTime.Before(startTime) {
-				continue
-			}
-			if hasEnd && entryTime.After(endTime) {
-				continue
-			}
-
-			bucketTime := entryTime.Unix()
-			if hasStep {
-				stepSeconds := int64(stepDur.Seconds())
-				if stepSeconds <= 0 {
-					continue
-				}
-				if hasStart {
-					offset := entryTime.Sub(startTime)
-					if offset < 0 {
-						continue
-					}
-					bucketTime = startTime.Add((offset / stepDur) * stepDur).Unix()
-				} else {
-					bucketTime = (bucketTime / stepSeconds) * stepSeconds
-				}
-			}
-			item.bucket[bucketTime] += int64(value)
-		}
-	}
-
-	sort.Slice(order, func(i, j int) bool {
-		return order[i] < order[j]
-	})
-
-	if !matrixMode {
-		nowTS := float64(time.Now().Unix())
-		result := make([]map[string]interface{}, 0, len(order))
-		for _, key := range order {
-			item := series[key]
-			result = append(result, map[string]interface{}{
-				"metric": item.metric,
-				"value":  []interface{}{nowTS, strconv.FormatInt(item.total, 10)},
-			})
-		}
-		return map[string]interface{}{
-			"status": "success",
-			"data": map[string]interface{}{
-				"resultType": "vector",
-				"result":     result,
-			},
-		}, nil
-	}
-
-	var bucketKeys []int64
-	if hasStart && hasEnd && hasStep {
-		for ts := startTime.Unix(); ts <= endTime.Unix(); ts += int64(stepDur.Seconds()) {
-			bucketKeys = append(bucketKeys, ts)
-		}
-	}
-
-	result := make([]map[string]interface{}, 0, len(order))
-	for _, key := range order {
-		item := series[key]
-		values := make([][]interface{}, 0)
-		if len(bucketKeys) > 0 {
-			values = make([][]interface{}, 0, len(bucketKeys))
-			for _, ts := range bucketKeys {
-				values = append(values, []interface{}{float64(ts), strconv.FormatInt(item.bucket[ts], 10)})
-			}
-		} else {
-			timestamps := make([]int64, 0, len(item.bucket))
-			for ts := range item.bucket {
-				timestamps = append(timestamps, ts)
-			}
-			sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
-			for _, ts := range timestamps {
-				values = append(values, []interface{}{float64(ts), strconv.FormatInt(item.bucket[ts], 10)})
-			}
-		}
-		result = append(result, map[string]interface{}{
-			"metric": item.metric,
-			"values": values,
-		})
-	}
-
-	return map[string]interface{}{
-		"status": "success",
-		"data": map[string]interface{}{
-			"resultType": "matrix",
-			"result":     result,
-		},
-	}, nil
 }
 
 func (p *Proxy) derivedVolumeSourceFields(targets []string) []string {
@@ -1644,18 +1305,16 @@ func (p *Proxy) detectFields(ctx context.Context, query, start, end string, line
 		if resp.StatusCode >= http.StatusInternalServerError {
 			errBody, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			msg := p.redactedBackendErrorMessage(resp.StatusCode, errBody)
-			lastErr = fmt.Errorf("%s", msg)
+			lastErr = p.redactedBackendStatusError("", resp.StatusCode, errBody)
 			hadScanFailure = true
 			continue
 		}
 		if resp.StatusCode >= http.StatusBadRequest {
 			errBody, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			msg := p.redactedBackendErrorMessage(resp.StatusCode, errBody)
 			// Collect native result before returning so the goroutine doesn't leak.
 			<-nativeCh
-			return nil, nil, fmt.Errorf("%s", msg)
+			return nil, nil, p.redactedBackendStatusError("", resp.StatusCode, errBody)
 		}
 		// Stream the NDJSON response line-by-line without buffering the full body.
 		scanFieldList, scanFieldValues, scanStreamLabels = p.detectFieldSummariesStream(resp.Body)
@@ -2068,17 +1727,20 @@ func (p *Proxy) detectFieldSummariesStream(r io.Reader) ([]map[string]interface{
 			})
 		}
 
-		vlFJParserPool.Put(fjParser)
-
-		if len(msgBytes) == 0 {
-			continue
-		}
+		// msgBytes points into fjParser's buffer, which the next Parse by any
+		// goroutine that takes this parser from the pool overwrites, so copy the
+		// message before returning the parser.
 		// Skip logfmt parsing when _msg is JSON — we already extracted fields
 		// via the fastjson pass above and a logfmt scan would misparse JSON tokens.
-		if msgBytes[0] == '{' {
+		var msg string
+		if len(msgBytes) > 0 && msgBytes[0] != '{' {
+			msg = string(msgBytes)
+		}
+		vlFJParserPool.Put(fjParser)
+
+		if msg == "" {
 			continue
 		}
-		msg := string(msgBytes)
 
 		for key, value := range parseLogfmtFields(msg) {
 			if key == "level" {
@@ -2525,8 +2187,7 @@ func (p *Proxy) fetchNativeFieldValues(ctx context.Context, query, start, end, f
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode >= http.StatusBadRequest {
-			msg := p.redactedBackendErrorMessage(resp.StatusCode, body)
-			lastErr = fmt.Errorf("%s", msg)
+			lastErr = p.redactedBackendStatusError("", resp.StatusCode, body)
 			if i+1 < len(candidates) {
 				p.observeInternalOperation(ctx, "discovery_fallback", "native_field_values_relaxed_after_error", 0)
 			}
@@ -2726,12 +2387,15 @@ func (p *Proxy) detectNativeLabelsViaFieldValues(ctx context.Context, query, sta
 		if end != "" {
 			params.Set("end", end)
 		}
-		names, err := p.fetchStreamFieldNamesCached(ctx, params)
+		// detected_labels samples recent data: discover names over the same capped
+		// window its values are fetched from.
+		capped := capMetadataStartOnly(params, metadataMaxFieldNamesWindow)
+		names, err := p.fetchStreamFieldNamesCached(ctx, capped)
 		if err != nil || len(names) == 0 {
 			continue
 		}
 		labelNames = names
-		baseParams = capMetadataStartOnly(params, metadataMaxFieldNamesWindow)
+		baseParams = capped
 		break
 	}
 	if len(labelNames) == 0 {
@@ -2879,8 +2543,7 @@ func (p *Proxy) detectScannedLabels(ctx context.Context, query, start, end strin
 		if resp.StatusCode >= http.StatusBadRequest {
 			errBody, _ := io.ReadAll(resp.Body)
 			_ = resp.Body.Close()
-			msg := p.redactedBackendErrorMessage(resp.StatusCode, errBody)
-			lastErr = fmt.Errorf("%s", msg)
+			lastErr = p.redactedBackendStatusError("", resp.StatusCode, errBody)
 			if i+1 < len(candidates) {
 				p.observeInternalOperation(ctx, "discovery_fallback", "detected_labels_relaxed_after_error", 0)
 			}

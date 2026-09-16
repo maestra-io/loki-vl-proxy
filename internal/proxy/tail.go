@@ -34,6 +34,7 @@ func (p *Proxy) handleTail(w http.ResponseWriter, r *http.Request) {
 		p.metrics.RecordRequest("tail", http.StatusBadRequest, time.Since(start))
 		return
 	}
+	lineFields := logQueryLineFields(logqlQuery)
 
 	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !p.isAllowedTailOrigin(origin) {
 		p.writeError(w, http.StatusForbidden, "tail origin not allowed")
@@ -41,7 +42,7 @@ func (p *Proxy) handleTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 
 	tailCtx, tailCancel := context.WithCancel(r.Context())
 	defer tailCancel()
@@ -63,6 +64,9 @@ func (p *Proxy) handleTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = conn.Close() }()
+	// Tail is server-to-client data. Preserve control frames and tolerate small
+	// legacy client messages, but never allocate an arbitrary client payload.
+	conn.SetReadLimit(4096)
 	p.metrics.RecordRequest("tail", http.StatusOK, time.Since(start))
 
 	// Start a read loop to detect client disconnect (WebSocket protocol requires it).
@@ -72,7 +76,11 @@ func (p *Proxy) handleTail(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer tailCancel()
 		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
+			_, reader, err := conn.NextReader()
+			if err != nil {
+				return
+			}
+			if _, err := io.Copy(io.Discard, reader); err != nil {
 				return
 			}
 		}
@@ -83,7 +91,7 @@ func (p *Proxy) handleTail(w http.ResponseWriter, r *http.Request) {
 
 	if p.tailMode == TailModeSynthetic {
 		p.log.Debug("tail connected", "logql", redactQuery(logqlQuery, p.debugLogRawQueries), "logsql", redactQuery(logsqlQuery, p.debugLogRawQueries), "native", false, "fallback", "forced synthetic tail mode")
-		p.streamSyntheticTail(wsCtx, conn, logsqlQuery, r.FormValue("start"))
+		p.streamSyntheticTail(wsCtx, conn, logsqlQuery, lineFields, r.FormValue("start"))
 		return
 	}
 
@@ -94,7 +102,7 @@ func (p *Proxy) handleTail(w http.ResponseWriter, r *http.Request) {
 			_ = p.writeTailControl(conn, websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, fallbackReason))
 			return
 		}
-		p.streamSyntheticTail(wsCtx, conn, logsqlQuery, r.FormValue("start"))
+		p.streamSyntheticTail(wsCtx, conn, logsqlQuery, lineFields, r.FormValue("start"))
 		return
 	}
 	defer resp.Body.Close()
@@ -142,7 +150,7 @@ func (p *Proxy) handleTail(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Convert to Loki tail frame
-			frame := p.vlLineToTailFrame(vlLine)
+			frame := p.vlLineToTailFrame(vlLine, lineFields)
 			frameJSON, err := json.Marshal(frame)
 			if err != nil {
 				continue
@@ -209,22 +217,8 @@ func (p *Proxy) openNativeTailStream(parent context.Context, logsqlQuery string)
 	// VL sends headers well within the 5s budget.  VL expects a duration string
 	// (e.g. "0s"), not a bare integer.
 
-	// Inject tenant label filter: this function builds its VL URL by hand and does
-	// not go through vlGetInner/vlPostInner, so the filter must be applied here.
-	if p.tenantLabel != "" {
-		if orgID := getOrgID(parent); orgID != "" && !isDefaultTenantAlias(orgID) && orgID != "*" {
-			p.configMu.RLock()
-			_, hasMapped := p.tenantMap[orgID]
-			p.configMu.RUnlock()
-			if !hasMapped {
-				injected := injectTenantLabelFilter(url.Values{"query": {logsqlQuery}}, p.tenantLabel, orgID)
-				logsqlQuery = injected.Get("query")
-			}
-		}
-	}
-
-	vlURL := fmt.Sprintf("%s/select/logsql/tail?query=%s&offset=0s",
-		p.backend.String(), url.QueryEscape(logsqlQuery))
+	params := p.scopedTenantParams(parent, url.Values{"query": {logsqlQuery}, "offset": {"0s"}})
+	vlURL := p.backend.String() + "/select/logsql/tail?" + params.Encode()
 	req, err := http.NewRequestWithContext(parent, "GET", vlURL, nil)
 	if err != nil {
 		return nil, false, "failed to create native tail request"
@@ -253,7 +247,7 @@ func (p *Proxy) openNativeTailStream(parent context.Context, logsqlQuery string)
 	return nil, false, fmt.Sprintf("backend tail unavailable: %s", msg)
 }
 
-func (p *Proxy) streamSyntheticTail(ctx context.Context, conn tailConn, logsqlQuery, startHint string) {
+func (p *Proxy) streamSyntheticTail(ctx context.Context, conn tailConn, logsqlQuery string, lineFields map[string]bool, startHint string) {
 	lastSeen := newSyntheticTailSeen(maxSyntheticTailSeenEntries)
 	windowStart := time.Now().Add(-5 * time.Second)
 	if parsed, ok := parseEntryTime(startHint); ok {
@@ -264,7 +258,7 @@ func (p *Proxy) streamSyntheticTail(ctx context.Context, conn tailConn, logsqlQu
 	defer ticker.Stop()
 
 	for {
-		if err := p.writeSyntheticTailBatch(ctx, conn, logsqlQuery, &windowStart, lastSeen); err != nil {
+		if err := p.writeSyntheticTailBatch(ctx, conn, logsqlQuery, lineFields, &windowStart, lastSeen); err != nil {
 			p.log.Debug("synthetic tail batch failed", "error", err)
 		}
 
@@ -279,7 +273,7 @@ func (p *Proxy) streamSyntheticTail(ctx context.Context, conn tailConn, logsqlQu
 // syntheticTailBatchLimit is the per-poll row budget of the synthetic tail.
 const syntheticTailBatchLimit = 200
 
-func (p *Proxy) writeSyntheticTailBatch(ctx context.Context, conn tailConn, logsqlQuery string, windowStart *time.Time, lastSeen *syntheticTailSeen) error {
+func (p *Proxy) writeSyntheticTailBatch(ctx context.Context, conn tailConn, logsqlQuery string, lineFields map[string]bool, windowStart *time.Time, lastSeen *syntheticTailSeen) error {
 	params := url.Values{}
 	params.Set("query", logsqlQuery+sortByTimePipe(true, syntheticTailBatchLimit))
 	params.Set("start", formatVLTimestamp(windowStart.UTC().Format(time.RFC3339Nano)))
@@ -322,7 +316,7 @@ func (p *Proxy) writeSyntheticTailBatch(ctx context.Context, conn tailConn, logs
 			newest = entryTime
 		}
 
-		frameJSON, err := json.Marshal(p.vlLineToTailFrame(vlLine))
+		frameJSON, err := json.Marshal(p.vlLineToTailFrame(vlLine, lineFields))
 		if err != nil {
 			continue
 		}
@@ -386,7 +380,8 @@ func (p *Proxy) writeTailControl(conn tailConn, messageType int, data []byte) er
 }
 
 // vlLineToTailFrame converts a single VL NDJSON log line to a Loki tail WebSocket frame.
-func (p *Proxy) vlLineToTailFrame(vlLine map[string]interface{}) map[string]interface{} {
+// lineFields are the fields the tail query's pipeline writes (logQueryLineFields).
+func (p *Proxy) vlLineToTailFrame(vlLine map[string]interface{}, lineFields map[string]bool) map[string]interface{} {
 	ts := ""
 	msg := ""
 
@@ -408,6 +403,7 @@ func (p *Proxy) vlLineToTailFrame(vlLine map[string]interface{}) map[string]inte
 	if ts == "" {
 		ts = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
+	msg = storedLogLineFromEntry(msg, vlLine, parseStreamLabels(asString(vlLine["_stream"])), lineFields, p.defaultMsgValue())
 
 	labels := buildEntryLabels(vlLine)
 	translatedLabels := labels

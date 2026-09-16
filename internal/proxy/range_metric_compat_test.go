@@ -194,7 +194,7 @@ func TestShouldUseManualRangeMetricCompat_ParserStageRate(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldUseManualRangeMetricCompat(tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep, false)
+			got := shouldUseManualRangeMetricCompat(tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep)
 			if got != tc.wantManual {
 				t.Errorf("shouldUseManualRangeMetricCompat(%q, %q, rangeEqualsStep=%v) = %v, want %v",
 					tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep, got, tc.wantManual)
@@ -208,7 +208,7 @@ func TestQueryRange_RateParserStageTumblingUsesSlowPath(t *testing.T) {
 	// (range == step, tumbling window) — after removing the parser-stage guard this now
 	// routes to VL stats_query_range (fast path). The test name is kept for history but
 	// the expectation is updated: fast path is now correct for tumbling-window parser queries.
-	base := time.Unix(1700000000, 0).UTC()
+	base := time.Unix(1699999200, 0).UTC() // epoch-aligned: no known VL version, so no offset arg
 	var statsCalled bool
 
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -218,7 +218,7 @@ func TestQueryRange_RateParserStageTumblingUsesSlowPath(t *testing.T) {
 		switch r.URL.Path {
 		case "/select/logsql/query":
 			// slow path must NOT be called for tumbling-window parser-stage rate after guard removal.
-			if r.Form.Get("limit") == "1000000" {
+			if r.Form.Get("limit") == "1000000" || r.Form.Get("limit") == "1000001" || strings.HasSuffix(r.FormValue("query"), " | limit 1000001") {
 				t.Error("unexpected slow-path /select/logsql/query call for parser-stage tumbling rate (guard removed)")
 			}
 			w.Header().Set("Content-Type", "application/x-ndjson")
@@ -258,7 +258,7 @@ func TestQueryRange_RateParserStageDropErrTumblingUsesStatsQueryRange(t *testing
 	// sum by (app) (rate({app="api-gateway"} | json | drop __error__ [5m])) with step=5m
 	// (range == step, tumbling window) WITH "| drop __error__" opts in to VL count-all
 	// semantics and MUST route to VL stats_query_range fast path.
-	base := time.Unix(1700000000, 0).UTC()
+	base := time.Unix(1699999200, 0).UTC() // epoch-aligned: no known VL version, so no offset arg
 	var statsCalled bool
 
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -363,72 +363,69 @@ func TestQueryRange_RateParserStageSlidingProducesResult(t *testing.T) {
 	}
 }
 
-func TestQueryRange_RateManualFallback(t *testing.T) {
-	// rate({app="nginx"} | json [2m]) with step=60s is a sliding window.
-	// The sliding-window stats path routes to stats_query_range (O(buckets))
-	// instead of the 1M-limit raw log fetch. Verifies multi-series label output.
+func TestQueryRange_JSONRatePreservesParsedSeriesAndSlidingBounds(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
-	statsCalled := false
-	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var rawCalled, statsCalled bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/select/logsql/query":
+			rawCalled = true
+			for i, kind := range []string{"first", "second"} {
+				_ = json.NewEncoder(w).Encode(map[string]string{"_time": base.Add(time.Duration(i+1) * time.Minute).Format(time.RFC3339Nano), "_msg": `{"kind":"` + kind + `"}`, "_stream": `{app="nginx",level="info"}`})
+			}
 		case "/select/logsql/stats_query_range":
 			statsCalled = true
-			w.Header().Set("Content-Type", "application/json")
-			// Return two per-step count buckets across two streams.
-			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
-				`{"metric":{"_stream":"{app=\"nginx\",level=\"info\"}"},"values":[[` +
-				strconv.FormatInt(base.Unix(), 10) + `,"2"],[` +
-				strconv.FormatInt(base.Add(60*time.Second).Unix(), 10) + `,"1"]` +
-				`]},` +
-				`{"metric":{"_stream":"{app=\"nginx\",level=\"error\"}"},"values":[[` +
-				strconv.FormatInt(base.Add(120*time.Second).Unix(), 10) + `,"1"]` +
-				`]}]}}`))
-		case "/select/logsql/query":
-			if r.FormValue("limit") == "1000000" {
-				t.Errorf("slow-path 1M log fetch must not be called for sliding-window rate (stats path should be used)")
-			}
-			w.Header().Set("Content-Type", "application/x-ndjson")
+			http.Error(w, "parser-dependent query must retain rows", 500)
 		default:
-			t.Errorf("unexpected backend path %s", r.URL.Path)
+			http.NotFound(w, r)
 		}
 	}))
-	defer vlBackend.Close()
-
-	p := newGapTestProxy(t, vlBackend.URL)
-	params := url.Values{}
-	params.Set("query", `rate({app="nginx"} | json [2m])`)
-	params.Set("start", strconv.FormatInt(base.Add(120*time.Second).Unix(), 10))
-	params.Set("end", strconv.FormatInt(base.Add(180*time.Second).Unix(), 10))
-	params.Set("step", "60")
-	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?"+params.Encode(), nil)
-	rec := httptest.NewRecorder()
-	p.handleQueryRange(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	defer backend.Close()
+	p := newGapTestProxy(t, backend.URL)
+	params := url.Values{"query": {`rate({app="nginx"}|json[2m])`}, "start": {base.Add(2 * time.Minute).Format(time.RFC3339Nano)}, "end": {base.Add(3 * time.Minute).Format(time.RFC3339Nano)}, "step": {"60"}}
+	rec := doCompatProxyRequest(p, "/loki/api/v1/query_range?"+params.Encode(), nil)
+	if rec.Code != 200 || !rawCalled || statsCalled {
+		t.Fatalf("status=%d raw=%v stats=%v body=%s", rec.Code, rawCalled, statsCalled, rec.Body)
 	}
-	if !statsCalled {
-		t.Fatalf("expected stats_query_range to be called for sliding-window rate")
-	}
-
-	var resp struct {
+	var response struct {
 		Data struct {
 			Result []struct {
-				Metric map[string]string `json:"metric"`
-				Values [][]interface{}   `json:"values"`
-			} `json:"result"`
-		} `json:"data"`
+				Metric map[string]string
+				Values [][]json.RawMessage
+			}
+		}
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
 	}
-	if len(resp.Data.Result) == 0 {
-		t.Fatalf("expected non-empty series, got %s", rec.Body.String())
+	if len(response.Data.Result) != 2 {
+		t.Fatalf("parsed series collapsed: %s", rec.Body)
+	}
+	seen := make(map[string]bool)
+	for _, series := range response.Data.Result {
+		kind := series.Metric["kind"]
+		wantPoints := 2
+		if kind == "first" {
+			wantPoints = 1
+		} else if kind != "second" {
+			t.Fatalf("unexpected parsed label: %v", series.Metric)
+		}
+		if seen[kind] || series.Metric["app"] != "nginx" || len(series.Values) != wantPoints {
+			t.Fatalf("unexpected series: %s", rec.Body)
+		}
+		seen[kind] = true
+		for i, point := range series.Values {
+			var stamp int64
+			var value string
+			if len(point) != 2 || json.Unmarshal(point[0], &stamp) != nil || json.Unmarshal(point[1], &value) != nil || stamp != base.Add(time.Duration(2+i)*time.Minute).Unix() || value != strconv.FormatFloat(1.0/120, 'f', -1, 64) {
+				t.Fatalf("wrong trailing-window sample: %s", point)
+			}
+		}
 	}
 }
 
 func TestQueryRange_CountOverTimeParserUsesDirectStatsRange(t *testing.T) {
-	base := time.Unix(1700000000, 0).UTC()
+	base := time.Unix(1699999200, 0).UTC() // epoch-aligned: no known VL version, so no offset arg
 	var (
 		manualCalled bool
 		statsCalled  bool
@@ -441,7 +438,7 @@ func TestQueryRange_CountOverTimeParserUsesDirectStatsRange(t *testing.T) {
 		case "/select/logsql/query":
 			// Parser probe may hit this endpoint, but manual metric fallback
 			// should not for parser count_over_time.
-			if r.Form.Get("limit") == "1000000" {
+			if r.Form.Get("limit") == "1000000" || r.Form.Get("limit") == "1000001" || strings.HasSuffix(r.FormValue("query"), " | limit 1000001") {
 				manualCalled = true
 			}
 			w.Header().Set("Content-Type", "application/x-ndjson")
@@ -500,8 +497,8 @@ func TestQueryRange_CountOverTimeParserUsesDirectStatsRange(t *testing.T) {
 	}
 }
 
-func TestQueryRange_BytesRateCompatScalesFromSumLen(t *testing.T) {
-	// bytes_rate({app="nginx"} | json [5m]) with step=60s is a sliding window
+func TestQueryRange_SummedBytesWithUnusedJSONScalesFromSumLen(t *testing.T) {
+	// sum(bytes_rate({app="nginx"} | json [5m])) discards parser labels. With step=60s
 	// (range=5m > step=60s). The proxy routes to stats_query_range (fast path)
 	// instead of the 1M-limit raw log fetch. Stats returns per-step byte buckets;
 	// the proxy sums them in the 5m window and divides by 300s.
@@ -537,8 +534,9 @@ func TestQueryRange_BytesRateCompatScalesFromSumLen(t *testing.T) {
 	defer vlBackend.Close()
 
 	p := newGapTestProxy(t, vlBackend.URL)
+	p.storeBackendVersion("v1.50.0", "v1.50.0") // anchored stats buckets need offset support (v1.45+)
 	params := url.Values{}
-	params.Set("query", `bytes_rate({app="nginx"} | json [5m])`)
+	params.Set("query", `sum(bytes_rate({app="nginx"} | json [5m]))`)
 	params.Set("start", strconv.FormatInt(base.Add(180*time.Second).Unix(), 10))
 	params.Set("end", strconv.FormatInt(base.Add(180*time.Second).Unix(), 10))
 	params.Set("step", "60")
@@ -625,22 +623,27 @@ func TestQueryRange_StdvarCompatSquaresStddev(t *testing.T) {
 // TestQueryRange_FirstOverTimeStatsPath verifies that first_over_time with an
 // unwrap field uses the stats_query_range fast path (not raw log fetch) and
 // produces the correct first-value result from per-step bucket aggregates.
-func TestQueryRange_FirstOverTimeStatsPath(t *testing.T) {
+// TestQueryRange_FirstOverTimeUsesRawEvaluator: VictoriaLogs has no first()
+// stats function, so first_over_time over unwrap is evaluated from raw rows and
+// never sent to stats_query_range.
+func TestQueryRange_FirstOverTimeUsesRawEvaluator(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/select/logsql/stats_query_range" {
-			t.Fatalf("unexpected backend path %s (expected stats_query_range)", r.URL.Path)
+		if r.URL.Path != "/select/logsql/query" {
+			t.Errorf("unexpected backend path %s (expected the raw query path)", r.URL.Path)
+			http.Error(w, "unexpected", http.StatusNotFound)
+			return
 		}
-		// Return per-step first(latency) values: bucket at T+0 has first=10,
-		// T+60 has first=20, T+120 has first=30.
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[` +
-			`{"metric":{"_stream":"{app=\"nginx\"}"},` +
-			`"values":[[1700000000,"10"],[1700000060,"20"],[1700000120,"30"]]}]}}`))
+		// Samples inside the windows: 10 at T+1s, 20 at T+61s, 30 at T+119s.
+		w.Header().Set("Content-Type", "application/stream+json")
+		for i, v := range []string{"10", "20", "30"} {
+			ts := base.Add(time.Duration([]int{1, 61, 119}[i]) * time.Second).Format(time.RFC3339Nano)
+			_, _ = fmt.Fprintf(w, `{"_time":%q,"_stream":"{app=\"nginx\"}","_msg":"{\"latency\":%s}","app":"nginx","latency":%q}`+"\n", ts, v, v)
+		}
 	}))
 	defer vlBackend.Close()
 
-	p := newGapTestProxy(t, vlBackend.URL)
+	p := newSlidingTestProxy(t, vlBackend.URL) // offset support anchors the unaligned bucket grid
 	params := url.Values{}
 	params.Set("query", `first_over_time({app="nginx"} | json | unwrap latency [2m])`)
 	params.Set("start", strconv.FormatInt(base.Add(60*time.Second).Unix(), 10))
@@ -698,7 +701,7 @@ func TestQueryRange_SumOverTimeUsesStatsPath(t *testing.T) {
 	}))
 	defer vlBackend.Close()
 
-	p := newGapTestProxy(t, vlBackend.URL)
+	p := newSlidingTestProxy(t, vlBackend.URL) // offset support anchors the unaligned bucket grid
 	params := url.Values{}
 	// window=2m > step=60s → sliding window
 	params.Set("query", `sum_over_time({app="api"} | json | unwrap duration [2m])`)
@@ -728,6 +731,11 @@ func TestQueryRange_SumOverTimeUsesStatsPath(t *testing.T) {
 	}
 	if len(resp.Data.Result) == 0 {
 		t.Fatalf("expected at least one series, got empty result: %s", rec.Body.String())
+	}
+	// The bucket labelled L covers (L, L+60s]: the window (T-60s, T+60s] holds
+	// only the T+0 bucket, and (T, T+120s] the T+0 and T+60s buckets.
+	if got := fmt.Sprint(resp.Data.Result[0].Values); got != "[[1.70000006e+09 100] [1.70000012e+09 300]]" {
+		t.Fatalf("unexpected sliding sums %s: %s", got, rec.Body.String())
 	}
 }
 
@@ -970,7 +978,7 @@ func TestShouldUseManualRangeMetricCompat_WithoutSlidingWindowNowUsesManualPath(
 	// buildManualMetricLabels correctly expands _stream into all stream labels.
 	// Previously this fell back to native VL tumbling stats, producing wrong results.
 	want := true
-	got := shouldUseManualRangeMetricCompat(`app:="api"`, "rate", false /* sliding */, false)
+	got := shouldUseManualRangeMetricCompat(`app:="api"`, "rate", false /* sliding */)
 	if got != want {
 		t.Errorf("sliding-window without() should use manual path, got %v", got)
 	}
@@ -1054,7 +1062,7 @@ func TestShouldUseManualRangeMetricCompat_ParserStageGuardRemoved(t *testing.T) 
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := shouldUseManualRangeMetricCompat(tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep, false)
+			got := shouldUseManualRangeMetricCompat(tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep)
 			if got != tc.wantManual {
 				t.Errorf("shouldUseManualRangeMetricCompat(%q, %q, rangeEqualsStep=%v) = %v, want %v",
 					tc.baseQuery, tc.manualFunc, tc.rangeEqualsStep, got, tc.wantManual)
@@ -1090,100 +1098,85 @@ func FuzzParseOriginalRangeMetricSpec(f *testing.F) {
 	})
 }
 
-// TestBareParserCountOverTime_TumblingWindowUsesStatsPath verifies that a bare
-// parser count_over_time query with range==step (tumbling window) routes to
-// VL's stats_query_range fast path. This avoids the 1M-limit raw log fetch
-// that causes memory exhaustion on long time ranges. VL stats count all log
-// lines including those that fail parsing (minor semantic difference from Loki
-// which excludes parse-failed lines), but correctness is far preferable to OOM.
-func TestBareParserCountOverTime_TumblingWindowUsesStatsPath(t *testing.T) {
+// Bare JSON parser errors must remain visible even when the range equals step.
+func TestBareParserCountOverTime_TumblingWindowRejectsJSONErrors(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
-
-	var statsCalled bool
-	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var rawCalled, statsCalled bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/select/logsql/query":
+			rawCalled = true
+			_ = json.NewEncoder(w).Encode(map[string]string{"_time": base.Format(time.RFC3339Nano), "_msg": "malformed JSON", "_stream": `{app="api"}`})
 		case "/select/logsql/stats_query_range":
 			statsCalled = true
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"_stream":"{app=\"api\"}"},"values":[[1700000000,"3"]]}]}}`))
-		case "/select/logsql/query":
-			if r.FormValue("limit") == "1" {
-				w.Header().Set("Content-Type", "application/x-ndjson")
-				return
-			}
-			t.Errorf("slow-path query endpoint must not be called for tumbling-window count_over_time: path=%s", r.URL.Path)
+			fmt.Fprint(w, `{"status":"success","data":{"resultType":"matrix","result":[]}}`)
 		default:
-			t.Errorf("unexpected backend path: %s", r.URL.Path)
+			http.NotFound(w, r)
 		}
 	}))
-	defer vlBackend.Close()
-
-	p := newGapTestProxy(t, vlBackend.URL)
-	params := url.Values{}
-	// step=60 == range=[60s] → tumbling window → stats fast path regardless of __error__ handling.
-	params.Set("query", `count_over_time({app="api"} | json [60s])`)
-	params.Set("start", strconv.FormatInt(base.Add(-time.Minute).Unix(), 10))
-	params.Set("end", strconv.FormatInt(base.Add(time.Minute).Unix(), 10))
-	params.Set("step", "60")
-	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?"+params.Encode(), nil)
-	rec := httptest.NewRecorder()
-	p.handleQueryRange(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if !statsCalled {
-		t.Fatalf("stats_query_range was not called — tumbling-window count_over_time must use stats fast path")
+	defer backend.Close()
+	p := newGapTestProxy(t, backend.URL)
+	params := url.Values{"query": {`count_over_time({app="api"}|json[60s])`}, "start": {base.Format(time.RFC3339Nano)}, "end": {base.Add(time.Minute).Format(time.RFC3339Nano)}, "step": {"60"}}
+	rec := doCompatProxyRequest(p, "/loki/api/v1/query_range?"+params.Encode(), nil)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "JSONParserErr") || !rawCalled || statsCalled {
+		t.Fatalf("parser error hidden: status=%d raw=%v stats=%v body=%s", rec.Code, rawCalled, statsCalled, rec.Body)
 	}
 }
 
-// TestBareParserCountOverTime_WithErrorHandling_UsesFastPath ensures that when
-// __error__ is explicitly handled, the tumbling-window fast path IS taken.
-func TestBareParserCountOverTime_WithErrorHandling_UsesFastPath(t *testing.T) {
+func TestBareParserCountOverTime_DropErrorsRetainsParsedDimensions(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
-
-	var statsCalled bool
-	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var rawCalled, statsCalled bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/select/logsql/query":
+			rawCalled = true
+			for _, line := range []string{`{"kind":"first"}`, `{"kind":"second"}`, "malformed JSON"} {
+				_ = json.NewEncoder(w).Encode(map[string]string{"_time": base.Format(time.RFC3339Nano), "_msg": line, "_stream": `{app="api"}`})
+			}
 		case "/select/logsql/stats_query_range":
 			statsCalled = true
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{},"values":[[1700000000,"3"]]}]}}`))
-		case "/select/logsql/query":
-			// Should not be called on the fast path.
-			if r.FormValue("limit") != "1" {
-				t.Errorf("slow-path query endpoint called unexpectedly (limit=%s)", r.FormValue("limit"))
-			}
-			w.Header().Set("Content-Type", "application/x-ndjson")
+			http.Error(w, "parsed labels would be lost", 500)
 		default:
-			t.Errorf("unexpected backend path: %s", r.URL.Path)
+			http.NotFound(w, r)
 		}
 	}))
-	defer vlBackend.Close()
-
-	p := newGapTestProxy(t, vlBackend.URL)
-	params := url.Values{}
-	// Explicit __error__ handling — fast path allowed.
-	params.Set("query", `count_over_time({app="api"} | json | drop __error__, __error_details__ [60s])`)
-	params.Set("start", strconv.FormatInt(base.Add(-time.Minute).Unix(), 10))
-	params.Set("end", strconv.FormatInt(base.Add(time.Minute).Unix(), 10))
-	params.Set("step", "60")
-	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?"+params.Encode(), nil)
-	rec := httptest.NewRecorder()
-	p.handleQueryRange(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	defer backend.Close()
+	p := newGapTestProxy(t, backend.URL)
+	params := url.Values{"query": {`count_over_time({app="api"}|json|drop __error__,__error_details__[60s])`}, "start": {base.Add(30 * time.Second).Format(time.RFC3339Nano)}, "end": {base.Add(30 * time.Second).Format(time.RFC3339Nano)}, "step": {"60"}}
+	rec := doCompatProxyRequest(p, "/loki/api/v1/query_range?"+params.Encode(), nil)
+	if rec.Code != 200 || !rawCalled || statsCalled {
+		t.Fatalf("status=%d raw=%v stats=%v body=%s", rec.Code, rawCalled, statsCalled, rec.Body)
 	}
-	if !statsCalled {
-		t.Fatalf("stats_query_range was NOT called — fast path should be taken when __error__ is handled")
+	var response struct {
+		Data struct {
+			Result []struct {
+				Metric map[string]string
+				Values [][]json.RawMessage
+			}
+		}
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Data.Result) != 3 {
+		t.Fatalf("parsed dimensions or cleared-error line lost: %s", rec.Body)
+	}
+	want := map[string]bool{"first": true, "second": true, "": true}
+	for _, series := range response.Data.Result {
+		kind := series.Metric["kind"]
+		if !want[kind] || series.Metric["app"] != "api" || len(series.Values) != 1 || len(series.Values[0]) != 2 || string(series.Values[0][1]) != `"1"` {
+			t.Fatalf("incorrect series: %s", rec.Body)
+		}
+		delete(want, kind)
+		if _, ok := series.Metric["__error__"]; ok {
+			t.Fatal("dropped error label retained")
+		}
+		if _, ok := series.Metric["__error_details__"]; ok {
+			t.Fatal("dropped error details retained")
+		}
 	}
 }
 
-// TestSumByCountOverTime_NoParser_UsesStatsQueryRange checks that the outer
-// sum-by count_over_time fast path (collectRangeMetricHits) activates for pure
-// stream-selector queries (no parser) and correctly returns multi-series output.
-// This is the primary benchmark hot path: pprof showed raw-log scan was 39% CPU.
 func TestSumByCountOverTime_NoParser_UsesStatsQueryRange(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	step := 60
@@ -1210,7 +1203,7 @@ func TestSumByCountOverTime_NoParser_UsesStatsQueryRange(t *testing.T) {
 				base.Unix(), base.Add(time.Duration(step)*time.Second).Unix(),
 			)
 		case "/select/logsql/query":
-			if r.Form.Get("limit") == "1000000" {
+			if r.Form.Get("limit") == "1000000" || r.Form.Get("limit") == "1000001" || strings.HasSuffix(r.FormValue("query"), " | limit 1000001") {
 				queryCalled = true
 			}
 			w.Header().Set("Content-Type", "application/x-ndjson")
@@ -1221,6 +1214,7 @@ func TestSumByCountOverTime_NoParser_UsesStatsQueryRange(t *testing.T) {
 	defer vlBackend.Close()
 
 	p := newGapTestProxy(t, vlBackend.URL)
+	p.storeBackendVersion("v1.50.0", "v1.50.0") // anchored stats buckets need offset support (v1.45+)
 	params := url.Values{}
 	params.Set("query", `sum by (app) (count_over_time({env="prod"}[5m]))`)
 	params.Set("start", strconv.FormatInt(base.Unix(), 10))
@@ -1293,7 +1287,7 @@ func TestSumByBytesRate_NoParser_UsesSumLen(t *testing.T) {
 				base.Unix(),
 			)
 		case "/select/logsql/query":
-			if r.Form.Get("limit") == "1000000" {
+			if r.Form.Get("limit") == "1000000" || r.Form.Get("limit") == "1000001" || strings.HasSuffix(r.FormValue("query"), " | limit 1000001") {
 				queryCalled = true
 			}
 			w.Header().Set("Content-Type", "application/x-ndjson")
@@ -1304,7 +1298,8 @@ func TestSumByBytesRate_NoParser_UsesSumLen(t *testing.T) {
 	defer vlBackend.Close()
 
 	p := newGapTestProxy(t, vlBackend.URL)
-	p.bytesSourceRecord = false // -bytes-over-time-source=line: the upstream sum_len(_msg) contract
+	p.bytesSourceRecord = false                 // -bytes-over-time-source=line: the upstream sum_len(_msg) contract
+	p.storeBackendVersion("v1.50.0", "v1.50.0") // anchored stats buckets need offset support (v1.45+)
 	params := url.Values{}
 	params.Set("query", `sum by (app) (bytes_rate({namespace="prod"}[5m]))`)
 	params.Set("start", strconv.FormatInt(base.Unix(), 10))
@@ -1410,7 +1405,7 @@ func TestQueryRange_RateParserStageTumblingUsesVLNative(t *testing.T) {
 	// sum by (app) (rate({app} | json | status >= 400 [5m])) step=5m → tumbling window.
 	// After removing the parser-stage guard, this must route to VL stats_query_range
 	// (fast path), NOT to the slow /select/logsql/query raw-log-fetch path.
-	base := time.Unix(1700000000, 0).UTC()
+	base := time.Unix(1699999200, 0).UTC() // epoch-aligned: no known VL version, so no offset arg
 	var statsCalled, slowCalled bool
 
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

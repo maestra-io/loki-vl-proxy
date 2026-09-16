@@ -31,17 +31,20 @@ func newMaestraProxy(t *testing.T, backend string) *Proxy {
 			{VLFields: []string{"kubernetes.pod_labels.app", "kubernetes.pod_labels.app.kubernetes.io/name"}, LokiLabel: "app"},
 			{VLFields: []string{"kubernetes.pod_labels.product", "kubernetes.namespace_labels.product"}, LokiLabel: "product"},
 		},
-		ComputedLabels:      []ComputedLabel{{LokiLabel: "job", Join: []string{"namespace", "app"}, Sep: "/"}},
-		DerivedLevelFields:  []string{"loglevel", "LogLevel", "level", "Level", "severity", "severity_text", "lvl"},
-		DerivedLevelGroupBy: true,
-		MsgFieldAliases:     []string{"message", "Message", "msg", "log"},
-		LineField:           "_msg",
-		LineFilterFields:    []string{"_msg", "Scopes", "Exception", "Category", "State.*"},
+		ComputedLabels:       []ComputedLabel{{LokiLabel: "job", Join: []string{"namespace", "app"}, Sep: "/"}},
+		DerivedLevelFields:   []string{"loglevel", "LogLevel", "level", "Level", "severity", "severity_text", "lvl"},
+		DerivedLevelGroupBy:  true,
+		MsgFieldAliases:      []string{"message", "Message", "msg", "log"},
+		LineField:            "_msg",
+		BytesOverTimeSource:  "record",
+		AlignQueriesWithStep: true,
+		LineFilterFields:     []string{"_msg", "Scopes", "Exception", "Category", "State.*"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	p.maxStatsQuerySeries = 10000
+	p.storeBackendVersion("v1.50.0", "v1.50.0") // stats_query_range offset (v1.45+)
 	return p
 }
 

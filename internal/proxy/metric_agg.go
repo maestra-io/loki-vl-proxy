@@ -20,6 +20,30 @@ var (
 	vectorBinaryRE  = regexp.MustCompile(`^\s*vector\(\s*([^)]+?)\s*\)\s*([+\-*/])\s*vector\(\s*([^)]+?)\s*\)\s*$`)
 )
 
+// unwrapEmptySumWithout preserves every series for an explicit sum without().
+// Its grouping keeps all labels except __name__. An absent grouping or by()
+// instead reduces all labels. Evaluate the operand once, retaining the number
+// of wrappers because removing empty labels can merge groups on a later pass.
+func unwrapEmptySumWithout(query string) (logqlpkg.Expr, int) {
+	expr, err := logqlpkg.Parse(query)
+	if err != nil {
+		return nil, 0
+	}
+	count := 0
+	for {
+		agg, ok := expr.(*logqlpkg.VectorAggregation)
+		if !ok || agg.Op != logqlpkg.VectorSum || agg.Grouping == nil || !agg.Grouping.Without || len(agg.Grouping.Labels) != 0 {
+			break
+		}
+		expr = agg.Inner
+		count++
+	}
+	if count == 0 {
+		return nil, 0
+	}
+	return expr, count
+}
+
 func evaluateConstantInstantVectorQuery(expr, timeParam string) ([]byte, bool) {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
@@ -274,22 +298,13 @@ func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *htt
 	translatedInner, withoutLabels := translator.ParseWithoutMarker(translatedInner)
 	translatedInner = p.preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
 
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 
 	bw := &bufferedResponseWriter{header: make(http.Header)}
 	sc := &statusCapture{ResponseWriter: bw, code: 200}
 
 	var dispatched bool
-	if ra, ok := parsedInner.(*logqlpkg.RangeAggregation); ok && ra.Step != "" {
-		innerLogsql, innerErr := p.translateQueryWithContext(r.Context(), ra.Inner.String())
-		if innerErr != nil {
-			p.writeError(w, http.StatusBadRequest, innerErr.Error())
-			p.metrics.RecordRequest("query", http.StatusBadRequest, time.Since(start))
-			return
-		}
-		p.proxySubquery(sc, r, string(ra.Op), innerLogsql, ra.Range, ra.Step)
-		dispatched = true
-	} else if binOp, ok := parsedInner.(*logqlpkg.BinOpExpr); ok {
+	if binOp, ok := parsedInner.(*logqlpkg.BinOpExpr); ok {
 		leftLogsql, leftErr := p.translateQueryWithContext(r.Context(), binOp.Left.String())
 		rightLogsql, rightErr := p.translateQueryWithContext(r.Context(), binOp.Right.String())
 		if leftErr != nil {
@@ -358,7 +373,7 @@ func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *htt
 }
 
 // handleRangeMetricPostAggregation handles topk/bottomk/sort at /query_range by
-// fetching the full matrix from VL and then trimming to the requested K series.
+// fetching the full matrix from VL and ranking at each evaluation timestamp.
 func (p *Proxy) handleRangeMetricPostAggregation(w http.ResponseWriter, r *http.Request, start time.Time, originalQuery string, postAgg instantMetricPostAgg) {
 	translatedInner, err := p.translateQueryWithContext(r.Context(), postAgg.inner)
 	if err != nil {
@@ -369,7 +384,7 @@ func (p *Proxy) handleRangeMetricPostAggregation(w http.ResponseWriter, r *http.
 	translatedInner, withoutLabels := translator.ParseWithoutMarker(translatedInner)
 	translatedInner = p.preserveMetricStreamIdentity(postAgg.inner, translatedInner, withoutLabels)
 
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 
 	// proxyStatsQueryRange reads r.FormValue("query") as originalLogql for the stats
 	// compat layer. If the outer sort/topk wrapper is still in r.Form, parseOriginalRangeMetricSpec
@@ -383,7 +398,26 @@ func (p *Proxy) handleRangeMetricPostAggregation(w http.ResponseWriter, r *http.
 
 	bw := &bufferedResponseWriter{header: make(http.Header)}
 	sc := &statusCapture{ResponseWriter: bw, code: 200}
-	p.proxyStatsQueryRange(sc, innerR, translatedInner)
+	// Ranking needs the complete trailing window at each evaluation point.
+	// Native VL buckets are timestamped at their left edge; ranking those
+	// directly can select the next window's winner and omit the first point.
+	// The manual range adapter still uses VL pre-aggregation when available.
+	handled := false
+	if postAgg.name == "topk" || postAgg.name == "bottomk" {
+		spec, ok := parseStatsCompatSpec(translatedInner)
+		orig, hasOrig := parseOriginalRangeMetricSpec(postAgg.inner)
+		if ok && hasOrig && orig.Window > 0 {
+			fn := normalizeManualMetricFunction(spec, orig)
+			switch fn {
+			case "rate", "bytes_rate", "count_over_time", "bytes_over_time":
+				spec.OrigGroupBy = parseOriginalByLabels(postAgg.inner)
+				handled = p.proxyManualRangeMetricRange(sc, innerR, spec, orig, fn)
+			}
+		}
+	}
+	if !handled {
+		p.proxyStatsQueryRange(sc, innerR, translatedInner)
+	}
 
 	if len(withoutLabels) > 0 {
 		bw.body = applyWithoutGrouping(bw.body, withoutLabels)
@@ -491,144 +525,10 @@ func applyMatrixStddevAgg(body []byte, funcName string) []byte {
 }
 
 // applyMatrixSortTopkAgg applies topk/bottomk/sort to a matrix (query_range) result.
-// It ranks series by their last value and trims to the requested K.
-// applyMatrixTopkPerTimestamp implements topk/bottomk over a matrix the way Loki
-// does: the selection is made INDEPENDENTLY AT EACH TIMESTAMP.
-//
-// Ranking once by each series' last value and trimming globally — as the shared
-// sort path does — returns exactly k series for the whole range, so a series
-// that was in the top k earlier in the window disappears entirely. Loki returns
-// the union across steps (10 series for a topk(5) over a busy range), with each
-// series carrying samples only at the steps where it made the cut.
-func applyMatrixTopkPerTimestamp(body []byte, postAgg instantMetricPostAgg) []byte {
-	var resp struct {
-		Status string `json:"status"`
-		Data   struct {
-			ResultType string `json:"resultType"`
-			Result     []struct {
-				Metric map[string]interface{} `json:"metric"`
-				Values [][]interface{}        `json:"values"`
-			} `json:"result"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil || resp.Status != "success" || resp.Data.ResultType != "matrix" {
-		return body
-	}
-
-	k := postAgg.k
-	const maxTopK = 10000
-	if k <= 0 {
-		return body
-	}
-	if k > maxTopK {
-		k = maxTopK
-	}
-
-	type sample struct {
-		series int
-		value  float64
-		raw    interface{}
-	}
-	perTS := make(map[float64][]sample)
-	var tsOrder []float64
-	seenTS := make(map[float64]struct{})
-
-	for si, s := range resp.Data.Result {
-		for _, v := range s.Values {
-			if len(v) < 2 {
-				continue
-			}
-			ts, err := parseFloat(v[0])
-			if err != nil {
-				continue
-			}
-			val, err := parseFloat(v[1])
-			if err != nil {
-				continue
-			}
-			if _, ok := seenTS[ts]; !ok {
-				seenTS[ts] = struct{}{}
-				tsOrder = append(tsOrder, ts)
-			}
-			perTS[ts] = append(perTS[ts], sample{series: si, value: val, raw: v[1]})
-		}
-	}
-	sort.Float64s(tsOrder)
-
-	ascending := postAgg.name == "bottomk"
-	kept := make([][][]interface{}, len(resp.Data.Result))
-	for _, ts := range tsOrder {
-		bucket := perTS[ts]
-		sort.SliceStable(bucket, func(i, j int) bool {
-			if bucket[i].value == bucket[j].value {
-				// Stable tie-break by original series order, so equal values do
-				// not reshuffle between steps.
-				return bucket[i].series < bucket[j].series
-			}
-			if ascending {
-				return bucket[i].value < bucket[j].value
-			}
-			return bucket[i].value > bucket[j].value
-		})
-		n := k
-		if n > len(bucket) {
-			n = len(bucket)
-		}
-		for _, sm := range bucket[:n] {
-			kept[sm.series] = append(kept[sm.series], []interface{}{ts, sm.raw})
-		}
-	}
-
-	// Membership is per-timestamp; the ORDER of the surviving series is not
-	// semantically meaningful, but ranking them keeps the response readable and
-	// preserves the ordering callers already relied on.
-	type survivor struct {
-		idx  int
-		rank float64
-	}
-	survivors := make([]survivor, 0, len(resp.Data.Result))
-	for si := range resp.Data.Result {
-		if len(kept[si]) == 0 {
-			continue
-		}
-		last := kept[si][len(kept[si])-1]
-		v, _ := parseFloat(last[1])
-		survivors = append(survivors, survivor{idx: si, rank: v})
-	}
-	sort.SliceStable(survivors, func(i, j int) bool {
-		if survivors[i].rank == survivors[j].rank {
-			return survivors[i].idx < survivors[j].idx
-		}
-		if ascending {
-			return survivors[i].rank < survivors[j].rank
-		}
-		return survivors[i].rank > survivors[j].rank
-	})
-
-	result := make([]map[string]interface{}, 0, len(survivors))
-	for _, sv := range survivors {
-		result = append(result, map[string]interface{}{
-			"metric": resp.Data.Result[sv.idx].Metric,
-			"values": kept[sv.idx],
-		})
-	}
-
-	out, err := json.Marshal(map[string]interface{}{
-		"status": "success",
-		"data": map[string]interface{}{
-			"resultType": "matrix",
-			"result":     result,
-		},
-	})
-	if err != nil {
-		return body
-	}
-	return out
-}
-
+// topk/bottomk use per-step selection; sort orders series by their last value.
 func applyMatrixSortTopkAgg(body []byte, postAgg instantMetricPostAgg) []byte {
 	if postAgg.name == "topk" || postAgg.name == "bottomk" {
-		return applyMatrixTopkPerTimestamp(body, postAgg)
+		return applyTopKToMatrix(body, postAgg.k, postAgg.name == "topk")
 	}
 	var resp struct {
 		Status string `json:"status"`
@@ -678,19 +578,8 @@ func applyMatrixSortTopkAgg(body []byte, postAgg instantMetricPostAgg) []byte {
 		}
 	})
 
-	// sort/sort_desc return all series reordered; only topk/bottomk trim to k.
+	// sort/sort_desc return all series reordered.
 	resultCount := len(ranks)
-	if (postAgg.name == "topk" || postAgg.name == "bottomk") && postAgg.k > 0 {
-		// Ensure topk size is safe: bounded by min(requested, max constant, available)
-		const maxTopK = 10000
-		safeSize := postAgg.k
-		if safeSize > maxTopK {
-			safeSize = maxTopK
-		}
-		if safeSize < resultCount {
-			resultCount = safeSize
-		}
-	}
 
 	// Pre-allocate with safe maximum size to avoid CodeQL taint analysis issues
 	// with user-provided allocation sizes. Use a fixed-size allocation and populate
@@ -766,6 +655,10 @@ func applyInstantStddevAgg(body []byte, funcName string) []byte {
 		}
 	}
 
+	if len(vals) == 0 {
+		// Loki aggregates an empty input vector into an empty vector.
+		return []byte(`{"status":"success","data":{"resultType":"vector","result":[]}}`)
+	}
 	var agg float64
 	if funcName == "stdvar" {
 		agg = populationVariance(vals)

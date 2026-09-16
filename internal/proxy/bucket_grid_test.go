@@ -112,11 +112,12 @@ func TestQueryRange_BucketsAreLabelledByEndOnLokiGrid(t *testing.T) {
 	}
 }
 
-// The pre-bucketed manual builder must select the same buckets as its sibling
-// buildHitsRangeMetricMatrix: a VL bucket labelled `b` covers [b, b+step), so
-// point `t` (LogQL window (t-window, t]) takes bucket starts in [t-window, t).
-// The bucket AT `t` covers entries after `t` and belongs to the next point —
-// counting it both over-counts the point and double-counts the bucket.
+// The manual builder over pre-bucketed (shifted) samples must select the same
+// buckets as its sibling buildHitsRangeMetricMatrix: a VL bucket labelled `b`
+// covers [b, b+step), so point `t` (LogQL window (t-window, t]) takes bucket
+// starts in [t-window, t). The bucket AT `t` covers entries after `t` and
+// belongs to the next point — counting it both over-counts the point and
+// double-counts the bucket.
 func TestManualRangeMetricMatrix_PreBucketedWindowExcludesBucketAtEvalTime(t *testing.T) {
 	base := time.Unix(1700000040, 0).UTC()
 	const step = 60 * time.Second
@@ -135,7 +136,9 @@ func TestManualRangeMetricMatrix_PreBucketedWindowExcludesBucketAtEvalTime(t *te
 	}
 
 	start, end := base.Add(window), base.Add(6*step)
-	out := buildManualRangeMetricMatrix("sum", 0, series, start, end, step, window, 0, true)
+	// Pre-bucketed samples are moved onto the window they hold before the fold
+	// (shiftSeriesSamples), so bucket `b` counts for point `b+step`.
+	out := buildManualRangeMetricMatrix("sum", 0, shiftSeriesSamples(series, step), start, end, step, window, 0)
 
 	var resp struct {
 		Data struct {
@@ -185,16 +188,25 @@ func TestQueryRange_RatePipelineIsNotServedByCountFastPath(t *testing.T) {
 	var gotQueries []string
 	vlBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		gotQueries = append(gotQueries, r.Form.Get("query"))
+		q := r.Form.Get("query")
+		gotQueries = append(gotQueries, q)
 		w.Header().Set("Content-Type", "application/json")
-		// One bucket, already divided by the window (VL evaluates the `| math`).
+		// A count() stats query answers the raw count (150); a `| math` pipeline
+		// answers the rate VictoriaLogs computed itself (150/300 = 0.5). A path
+		// that rebuilds the query as a bare count and forgets to divide returns
+		// 150 — rate × the window in seconds.
+		value := "150"
+		if strings.Contains(q, "| math ") {
+			value = "0.5"
+		}
 		_, _ = fmt.Fprintf(w,
-			`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"namespace":"a"},"values":[[%d,"0.5"]]}]}}`,
-			base.Unix())
+			`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"namespace":"a"},"values":[[%d,"%s"]]}]}}`,
+			base.Unix(), value)
 	}))
 	defer vlBackend.Close()
 
 	p := newGapTestProxy(t, vlBackend.URL)
+	p.storeBackendVersion("v1.50.0", "v1.50.0")
 	params := url.Values{}
 	params.Set("query", `topk(5, sum by (namespace) (rate({namespace=~".+"}[5m])))`)
 	params.Set("start", strconv.FormatInt(base.Unix()+step, 10))
@@ -208,13 +220,25 @@ func TestQueryRange_RatePipelineIsNotServedByCountFastPath(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	for _, q := range gotQueries {
-		if strings.Contains(q, "stats") && !strings.Contains(q, "| math ") {
-			t.Fatalf("rate query lost its division — upstream query %q has no `| math` stage", q)
-		}
-	}
 	if len(gotQueries) == 0 {
 		t.Fatal("no upstream query issued")
+	}
+	var resp struct {
+		Data struct {
+			Result []struct {
+				Values [][]interface{} `json:"values"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, s := range resp.Data.Result {
+		for _, pt := range s.Values {
+			if fmt.Sprintf("%v", pt[1]) != "0.5" {
+				t.Fatalf("rate lost its division: point %v (upstream queries %q)", pt, gotQueries)
+			}
+		}
 	}
 }
 

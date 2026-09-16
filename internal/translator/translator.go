@@ -226,8 +226,8 @@ func walkDropKeepStages(logqlQuery string) dropKeepResult {
 			break
 		}
 		// Line filter operators: |= |~ |> — consume value and continue.
-		if strings.HasPrefix(remaining, "|= ") || strings.HasPrefix(remaining, "|=\"") ||
-			strings.HasPrefix(remaining, "|~ ") || strings.HasPrefix(remaining, "|~\"") ||
+		if strings.HasPrefix(remaining, "|= ") || strings.HasPrefix(remaining, "|=\"") || strings.HasPrefix(remaining, "|=`") ||
+			strings.HasPrefix(remaining, "|~ ") || strings.HasPrefix(remaining, "|~\"") || strings.HasPrefix(remaining, "|~`") ||
 			strings.HasPrefix(remaining, "|> ") || strings.HasPrefix(remaining, "|>\"") ||
 			strings.HasPrefix(remaining, "|>`") {
 			_, remaining = extractPipelineStage(remaining[2:])
@@ -386,7 +386,7 @@ func splitDropItems(s string) []string {
 			cur.Reset()
 			continue
 		}
-		cur.WriteRune(c)
+		cur.WriteByte(s[i])
 	}
 	if cur.Len() > 0 {
 		items = append(items, cur.String())
@@ -578,12 +578,6 @@ func translateLogQLFull(logql string, labelFn LabelTranslateFunc, streamFields m
 	// query as a metric one, fell through to the raw-log branch and emitted a
 	// LogsQL string that the backend then rejected.
 	logql = NormalizeCallWhitespace(logql)
-
-	// Detect subquery syntax: outer_func(inner_query[range:step])
-	// The proxy evaluates these by running the inner query at sub-step intervals.
-	if result, ok := tryTranslateSubquery(logql); ok {
-		return result, nil
-	}
 
 	// label_replace and label_join are transform wrappers around a complete metric
 	// expression. Handle them before the without/binary/metric path so the inner
@@ -785,6 +779,13 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 	// referencing the alias name can be rewritten to use the original JSON field name.
 	// VL's unpack_json always uses original field names; aliases are not preserved.
 	jsonAliases := make(map[string]string)
+	captureLabels := make(map[string]bool)
+	pipelineLabelFn := func(label string) string {
+		if captureLabels[label] || labelFn == nil {
+			return label
+		}
+		return labelFn(label)
+	}
 
 	// 2. Process pipeline stages: | operator ...
 	// LogQL line filters: |= "text", != "text", |~ "regexp", !~ "regexp"
@@ -799,8 +800,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 		// CRITICAL: Loki |= is SUBSTRING match, not word match.
 		// VL's "text" is word-only; VL's ~"text" is substring/regexp.
 		// We must use ~"text" to match Loki's substring semantics.
-		// The proxy's reconstructLogLine puts the full JSON into _msg, so
-		// searching _msg via ~"text" finds text in any original JSON field.
+		// Loki matches the raw line; VictoriaLogs stores that line in _msg.
 
 		// ip() line filter: Loki searches raw log text for IPs matching the pattern.
 		// VL has no native ip() support; translate to a regex approximation.
@@ -827,7 +827,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			continue
 		}
 
-		if strings.HasPrefix(remaining, "|= ") || strings.HasPrefix(remaining, "|=\"") {
+		if strings.HasPrefix(remaining, "|= ") || strings.HasPrefix(remaining, "|=\"") || strings.HasPrefix(remaining, "|=`") {
 			// Substring match: |= "text" → ~"text"; `|= "a" or "b"` → (~"a" OR ~"b")
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
@@ -835,7 +835,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			remaining = rest
 			continue
 		}
-		if strings.HasPrefix(remaining, "!= ") || strings.HasPrefix(remaining, "!=\"") {
+		if strings.HasPrefix(remaining, "!= ") || strings.HasPrefix(remaining, "!=\"") || strings.HasPrefix(remaining, "!=`") {
 			// Negative substring: != "text" → NOT ~"text"; an OR-list is negated whole
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
@@ -843,7 +843,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			remaining = rest
 			continue
 		}
-		if strings.HasPrefix(remaining, "|~ ") || strings.HasPrefix(remaining, "|~\"") {
+		if strings.HasPrefix(remaining, "|~ ") || strings.HasPrefix(remaining, "|~\"") || strings.HasPrefix(remaining, "|~`") {
 			// Regexp match: |~ "regexp" → ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
@@ -851,7 +851,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			remaining = rest
 			continue
 		}
-		if strings.HasPrefix(remaining, "!~ ") || strings.HasPrefix(remaining, "!~\"") {
+		if strings.HasPrefix(remaining, "!~ ") || strings.HasPrefix(remaining, "!~\"") || strings.HasPrefix(remaining, "!~`") {
 			// Negative regexp: !~ "regexp" → NOT ~"regexp"
 			remaining = strings.TrimSpace(remaining[2:])
 			values, rest := extractLineFilterValues(remaining)
@@ -913,6 +913,11 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 		// Determine the pipeline stage type
 		stage, rest := extractPipelineStage(remaining)
 		remaining = rest
+		for _, label := range regexpCaptureLabels(stage) {
+			if label != "" {
+				captureLabels[label] = true
+			}
+		}
 
 		// Populate json alias map when the stage uses alias="field" syntax.
 		if strings.HasPrefix(stage, "json ") {
@@ -926,7 +931,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 			stage = rewriteJSONAliasedFilter(stage, jsonAliases)
 		}
 
-		translated := translatePipelineStageM(stage, labelFn, caps, mapping.forStage(afterParser))
+		translated := translatePipelineStageM(stage, pipelineLabelFn, caps, mapping.forStage(afterParser))
 		if strings.HasPrefix(translated, errUnknownParser) {
 			parserName := strings.TrimPrefix(translated, errUnknownParser)
 			return "", fmt.Errorf("unknown pipeline stage %q — not a valid LogQL parser or label filter", parserName)
@@ -980,7 +985,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 					translated = "| filter " + translated
 				}
 			}
-			if _, baseKey, ok := canonicalLabelFilterStage(stage, labelFn); ok {
+			if _, baseKey, ok := canonicalLabelFilterStage(stage, pipelineLabelFn); ok {
 				if idx, exists := labelFilterLatest[baseKey]; exists {
 					// Latest action wins for the same field/value filter identity.
 					parts[idx] = translated
@@ -994,6 +999,7 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 		}
 	}
 
+	wrapBareFiltersAfterPipes(parts)
 	if mapping != nil && mapping.recordPipesText != "" {
 		// The stored line is measured BEFORE the user's stages: a parser adds
 		// fields, `drop`/`keep`/`line_format` remove or rewrite them, and
@@ -1068,6 +1074,27 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 		return "*", nil
 	}
 	return result, nil
+}
+
+// wrapBareFiltersAfterPipes gives every bare filter part (a line filter such as
+// ~"y", or -level:* for level="") that directly follows a non-filter pipe stage
+// (| unpack_json, | format, | fields, | delete, | decolorize, | extract, ...)
+// its own | filter stage. Left bare, every VictoriaLogs version rejects it with
+// "unexpected token after [<pipe>]" or reads it as the pipe's argument. | filter
+// is accepted by every supported VictoriaLogs version. A bare filter following a
+// | filter stage (including the "| unpack_logfmt | filter" part emitted for
+// detected_level) stays an implicit AND inside it.
+func wrapBareFiltersAfterPipes(parts []string) {
+	for i := 1; i < len(parts); i++ {
+		cur := strings.TrimSpace(parts[i])
+		if cur == "" || strings.HasPrefix(cur, "|") {
+			continue
+		}
+		prev := strings.TrimSpace(parts[i-1])
+		if strings.HasPrefix(prev, "|") && !strings.HasPrefix(prev, "| filter ") && !strings.HasPrefix(prev, "| unpack_logfmt | filter ") {
+			parts[i] = "| filter " + cur
+		}
+	}
 }
 
 // knownParsers is the set of bare-word LogQL parser names.
@@ -1498,9 +1525,13 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			// LogsQL. Stripping the quotes instead kept the LogQL escapes and
 			// the re-quote doubled them (round 12: `message=~"\\d{4}-…"` reached
 			// VictoriaLogs as `\\\\d`, a literal backslash, and matched nothing).
+			// ip("cidr") is a CALL only when the stage text says so; a quoted
+			// literal `"ip(\"10.0.0.1\")"` decodes to the same bytes and must stay
+			// an exact value, so the call is detected BEFORE decoding.
+			isIPCall := strings.HasPrefix(value, `ip("`) && strings.HasSuffix(value, `")`)
 			rawValue := unquoteLogQLValue(value)
 			value = rawValue
-			if entry.entry.isRe && !strings.HasPrefix(rawValue, `ip("`) {
+			if entry.entry.isRe && !isIPCall {
 				value = logsql.AnchorLabelMatcherRegex(rawValue)
 			}
 			// After a parser stage `level` names the PARSED field (absent → the
@@ -1532,7 +1563,9 @@ func translateSingleLabelFilterM(stage string, labelFn LabelTranslateFunc, caps 
 			}
 
 			// ip() CIDR filter: label = ip("cidr") or label != ip("cidr")
-			if strings.HasPrefix(value, `ip("`) && strings.HasSuffix(value, `")`) {
+			// Detect calls before decoding a quoted exact value which may itself
+			// contain the literal text ip("...").
+			if isIPCall {
 				cidr := value[4 : len(value)-2]
 				filter := logsql.NewBuilder(caps).BestIPv4Range(label, cidr)
 				if ff, ok := filter.(logsql.FieldFilter); ok && entry.entry.negate {
@@ -1815,7 +1848,7 @@ func translateLabelFormat(expr string) string {
 		// convertGoTemplate returns a quoted string like "<label>"; strip the
 		// outer quotes before passing to PipeFormat, which re-applies %q quoting.
 		converted := convertGoTemplate(template)
-		unquoted := strings.Trim(converted, `"`)
+		unquoted, _ := strconv.Unquote(converted)
 		pipes = append(pipes, logsql.PipeFormat{Template: unquoted, ResultField: labelName}.String())
 	}
 	if len(pipes) == 0 {
@@ -1826,35 +1859,17 @@ func translateLabelFormat(expr string) string {
 
 // splitLabelFormatAssignments splits "a=X, b=Y" respecting quoted values.
 func splitLabelFormatAssignments(s string) []string {
-	var result []string
-	inQuote := false
-	start := 0
-	for i, c := range s {
-		if c == '"' {
-			inQuote = !inQuote
-		}
-		if c == ',' && !inQuote {
-			part := strings.TrimSpace(s[start:i])
-			if part != "" {
-				result = append(result, part)
-			}
-			start = i + 1
-		}
-	}
-	part := strings.TrimSpace(s[start:])
-	if part != "" {
-		result = append(result, part)
-	}
-	return result
+	return splitDropItems(s)
 }
 
 // convertGoTemplate converts Go template syntax {{.label}} to LogsQL <label> syntax.
 // Handles dotted field names like {{.service.name}} → <service.name>.
 func convertGoTemplate(tmpl string) string {
-	// The parser re-serialises a backtick template with its backticks.
-	tmpl = strings.Trim(tmpl, "\"`")
+	if unquoted, err := strconv.Unquote(strings.TrimSpace(tmpl)); err == nil {
+		tmpl = unquoted
+	}
 	result := goTemplateRE.ReplaceAllString(tmpl, "<$1>")
-	return `"` + result + `"`
+	return strconv.Quote(result)
 }
 
 // splitFuncFirstArg splits the first argument from a parenthesised function arg list,
@@ -2276,14 +2291,14 @@ var rangeByClauseRE = regexp.MustCompile(`^by\s*\(([^)]*)\)`)
 
 // Package-level compiled regexes — compiled once at program start, not per-request.
 var (
-	withoutMarkerRE  = regexp.MustCompile(`\bwithout\s*\(([^)]+)\)`)
-	goTemplateRE     = regexp.MustCompile(`\{\{\s*\.([\w.]+)\s*\}\}`)
-	vectorMatchRE    = regexp.MustCompile(`\s+(on|ignoring|group_left|group_right)\s*\(([^)]*)\)`)
-	aggByBeforeRE    = regexp.MustCompile(`^(sum|avg|max|min|count|topk|bottomk|stddev|stdvar|sort|sort_desc|group|count_values)\s+(?:by|without)\s*\(([^)]*)\)\s*\(`)
-	aggFuncRE        = regexp.MustCompile(`^(sum|avg|max|min|count|topk|bottomk|stddev|stdvar|sort|sort_desc|group|count_values)\s*\(`)
-	aggByAfterRE     = regexp.MustCompile(`^(?:by|without)\s*\(([^)]+)\)`)
-	subqueryInlineRE = regexp.MustCompile(`\[(\d+[smhd]+):(\d+[smhd]+)\]`)
-	durationPartRE   = regexp.MustCompile(`([0-9]*\.?[0-9]+)(ns|us|µs|ms|s|m|h|d|w|y)`)
+	boolModifierRE  = regexp.MustCompile(`\s+bool\s+`)
+	withoutMarkerRE = regexp.MustCompile(`\bwithout\s*\(([^)]+)\)`)
+	goTemplateRE    = regexp.MustCompile(`\{\{\s*\.([\w.]+)\s*\}\}`)
+	vectorMatchRE   = regexp.MustCompile(`\s+(on|ignoring|group_left|group_right)\s*\(([^)]*)\)`)
+	aggByBeforeRE   = regexp.MustCompile(`^(sum|avg|max|min|count|topk|bottomk|stddev|stdvar|sort|sort_desc|group|count_values)\s+(?:by|without)\s*\(([^)]*)\)\s*\(`)
+	aggFuncRE       = regexp.MustCompile(`^(sum|avg|max|min|count|topk|bottomk|stddev|stdvar|sort|sort_desc|group|count_values)\s*\(`)
+	aggByAfterRE    = regexp.MustCompile(`^(?:by|without)\s*\(([^)]+)\)`)
+	durationPartRE  = regexp.MustCompile(`([0-9]*\.?[0-9]+)(ns|us|µs|ms|s|m|h|d|w|y)`)
 )
 
 // extractRangeByClause parses a trailing "by (...)" modifier that appears after
@@ -2495,6 +2510,8 @@ func IsScalar(s string) bool {
 
 // VectorMatchInfo holds vector matching modifiers for binary expressions.
 type VectorMatchInfo struct {
+	MatchOn    bool     // preserves an explicit empty on() modifier
+	GroupSide  string   // preserves group_left()/group_right() without extra labels
 	On         []string // on(labels) — match on these labels only
 	Ignoring   []string // ignoring(labels) — match ignoring these labels
 	GroupLeft  []string // group_left(extra_labels) — one-to-many, left side is "many"
@@ -2535,12 +2552,15 @@ func ParseBinaryMetricExprFull(s string) (op, left, right string, vm *VectorMatc
 			labels := splitLabels(parts[1])
 			switch modifier {
 			case "on":
+				vm.MatchOn = true
 				vm.On = labels
 			case "ignoring":
 				vm.Ignoring = labels
 			case "group_left":
+				vm.GroupSide = "group_left"
 				vm.GroupLeft = labels
 			case "group_right":
+				vm.GroupSide = "group_right"
 				vm.GroupRight = labels
 			}
 		}
@@ -3048,9 +3068,14 @@ func quoteLineFilterLiteral(quoted string) string {
 func extractQuotedValue(s string) (string, string) {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "\"") {
-		// Find the closing quote, skipping escaped quotes (\")
+		// Skip escape pairs so a quote after an even number of backslashes closes
+		// the literal, while a quote after an odd number remains part of it.
 		for i := 1; i < len(s); i++ {
-			if s[i] == '"' && (i == 1 || s[i-1] != '\\') {
+			if s[i] == '\\' {
+				i++
+				continue
+			}
+			if s[i] == '"' {
 				return s[:i+1], strings.TrimSpace(s[i+1:])
 			}
 		}
@@ -3152,7 +3177,12 @@ func splitStreamMatchers(s string) []string {
 	var matchers []string
 	var quote rune
 	start := 0
-	for i, c := range s {
+	for i := 0; i < len(s); i++ {
+		c := rune(s[i])
+		if c == '\\' && quote == '"' && i+1 < len(s) {
+			i++
+			continue
+		}
 		if (c == '"' || c == '`') && (quote == 0 || quote == c) {
 			if quote == 0 {
 				quote = c
@@ -3323,8 +3353,9 @@ var syntheticServiceNameFields = []string{
 	"k8s_job_name",
 }
 
+// serviceNameMatcherFilter fans a service_name matcher out over the synthetic
+// field chain. value is the DECODED literal (or the anchored regexp).
 func serviceNameMatcherFilter(op, value string, neg, isRegex bool) string {
-	value = strings.TrimSpace(strings.Trim(value, "\"`"))
 	parts := make([]string, 0, len(syntheticServiceNameFields))
 	for _, field := range syntheticServiceNameFields {
 		// Quote dotted field names so VL can parse them.
@@ -3410,7 +3441,7 @@ func translateBareFilter(s string) string {
 // with `<identifier> [op] "value"` (or backtick value). This avoids
 // false-positives on text-with-equals or expressions that contain matchers
 // nested inside parens (e.g. `sum(rate({app="x"}[5m])) by (app)` — those
-// reach this code path only after the metric/binary/subquery extractors
+// reach this code path only after the metric/binary extractors
 // declined them, but the leading char would be `s` followed by `u`, not an
 // identifier directly followed by `=`).
 //
@@ -3474,117 +3505,6 @@ func looksLikeBareLabelMatcher(s string) bool {
 	}
 	// Must be followed by an opening quote (`"` or `` ` ``).
 	return s[i] == '"' || s[i] == '`'
-}
-
-// =============================================================================
-// Subquery support: outer_func(inner_metric_query[range:step])
-// Proxy evaluates inner query at sub-step intervals and aggregates.
-// =============================================================================
-
-// SubqueryPrefix marks a translated subquery expression for proxy-side evaluation.
-const SubqueryPrefix = "__subquery__:"
-
-// tryTranslateSubquery detects and translates subquery syntax.
-// Output is a proxy-internal protocol string (__subquery__:func:innerQuery:range:step),
-// not a LogsQL expression — LogQL AST migration does not apply here.
-// The inner query is already translated via recursive TranslateLogQL.
-// Input: max_over_time(rate({app="nginx"}[5m])[1h:5m])
-// Output: __subquery__:max_over_time:<translated inner query>:1h:5m
-func tryTranslateSubquery(logql string) (string, bool) {
-	// Look for [range:step] pattern inside the expression
-	if !subqueryInlineRE.MatchString(logql) {
-		return "", false
-	}
-
-	// Extract the outer function: everything before the first "("
-	// E.g., "max_over_time(rate({app="nginx"}[5m])[1h:5m])" → "max_over_time"
-	parenIdx := strings.Index(logql, "(")
-	if parenIdx < 0 {
-		return "", false
-	}
-	outerFunc := strings.TrimSpace(logql[:parenIdx])
-
-	// Validate it's a known aggregation function
-	knownOuter := map[string]bool{
-		"max_over_time": true, "min_over_time": true,
-		"avg_over_time": true, "sum_over_time": true,
-		"count_over_time": true, "stddev_over_time": true,
-		"stdvar_over_time": true, "last_over_time": true,
-		"first_over_time": true, "quantile_over_time": true,
-	}
-	if !knownOuter[outerFunc] {
-		return "", false
-	}
-
-	// The body is everything inside the outer function's parens
-	body := logql[parenIdx+1:]
-	// Find the last closing paren
-	lastParen := strings.LastIndex(body, ")")
-	if lastParen < 0 {
-		return "", false
-	}
-	body = body[:lastParen]
-
-	// Find [range:step] at the end of body
-	loc := subqueryInlineRE.FindStringSubmatchIndex(body)
-	if loc == nil {
-		return "", false
-	}
-
-	// Check that this [range:step] is at the END of the body (after the inner query's closing paren)
-	// The inner query ends just before the [range:step]
-	rangeStepStart := loc[0]
-	rng := body[loc[2]:loc[3]]
-	step := body[loc[4]:loc[5]]
-
-	innerQuery := strings.TrimSpace(body[:rangeStepStart])
-
-	// The inner query should be a complete metric expression.
-	// Translate it as a normal metric query.
-	translatedInner, err := TranslateLogQL(innerQuery)
-	if err != nil {
-		return "", false
-	}
-
-	return fmt.Sprintf("%s%s:%s:%s:%s", SubqueryPrefix, outerFunc, translatedInner, rng, step), true
-}
-
-// ParseSubqueryExpr parses a "__subquery__:func:innerQuery:range:step" string.
-// Returns the outer function, inner translated query, range, step, and whether it's a subquery.
-func ParseSubqueryExpr(s string) (outerFunc, innerQuery, rng, step string, ok bool) {
-	if !strings.HasPrefix(s, SubqueryPrefix) {
-		return "", "", "", "", false
-	}
-	rest := s[len(SubqueryPrefix):]
-
-	// Format: "func:innerQuery:range:step"
-	// The innerQuery may contain colons (e.g., in field filters), so we parse from both ends.
-	// The last two colon-separated segments are range and step (simple duration strings).
-	// Find the step (last segment)
-	lastColon := strings.LastIndex(rest, ":")
-	if lastColon < 0 {
-		return "", "", "", "", false
-	}
-	step = rest[lastColon+1:]
-	rest = rest[:lastColon]
-
-	// Find the range (now last segment)
-	lastColon = strings.LastIndex(rest, ":")
-	if lastColon < 0 {
-		return "", "", "", "", false
-	}
-	rng = rest[lastColon+1:]
-	rest = rest[:lastColon]
-
-	// Find the outer function (first segment)
-	firstColon := strings.Index(rest, ":")
-	if firstColon < 0 {
-		return "", "", "", "", false
-	}
-	outerFunc = rest[:firstColon]
-	innerQuery = rest[firstColon+1:]
-
-	return outerFunc, innerQuery, rng, step, true
 }
 
 // extractIPFilterArg parses the argument from an ip("...") expression.

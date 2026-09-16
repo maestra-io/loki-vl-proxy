@@ -4,14 +4,33 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/cache"
 )
 
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestNew_RespectsConfiguredLogLevelOverDefaultLogger(t *testing.T) {
-	var buf bytes.Buffer
+	var buf lockedLogBuffer
 	orig := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	defer slog.SetDefault(orig)
@@ -30,7 +49,11 @@ func TestNew_RespectsConfiguredLogLevelOverDefaultLogger(t *testing.T) {
 	}
 
 	p.log.Info("suppressed info log")
-	if buf.Len() != 0 {
+	// Other tests in this package run proxies whose background probes log
+	// through slog.Default(), which this test temporarily points at buf. Only
+	// this proxy's own message proves the configured level took precedence;
+	// asserting an empty buffer races with those goroutines and flakes.
+	if strings.Contains(buf.String(), "suppressed info log") {
 		t.Fatalf("expected info log to be suppressed, got %q", buf.String())
 	}
 }
