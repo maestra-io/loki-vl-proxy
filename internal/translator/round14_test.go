@@ -76,15 +76,18 @@ func TestRound14_RecordPipes(t *testing.T) {
 	if got := round14Translate(t, m, `count_over_time({app="x"}[5m])`); strings.Contains(got, "pack_json") {
 		t.Fatalf("count without a filter must not pay for the record: %s", got)
 	}
+	if !queryScansRows(`{app="x"} | status="500"`) || !queryScansRows(`{app="x"} | latency > 1`) || queryScansRows(`{app="x", env!="prod"}`) {
+		t.Fatal("a label filter stage scans rows; a selector alone does not")
+	}
 
 	m.LokiMaxLineSize = 524288
-	if got := round14Translate(t, m, `sum by (tenant_id) (count_over_time({product="tenant"} |= "Message size too large" | json [1m]))`); !strings.Contains(got, `| unpack_json `+pipes+` | filter __lvp_bytes:<=524288 | delete __lvp_bytes | stats by (tenant_id) count()`) {
+	if got := round14Translate(t, m, `sum by (tenant_id) (count_over_time({product="tenant"} |= "Message size too large" | json [1m]))`); !strings.Contains(got, pipes+` | filter __lvp_bytes:<=524288 | delete __lvp_bytes | unpack_json | stats by (tenant_id) count()`) {
 		t.Fatalf("size filter on a scanning count: %s", got)
 	}
 	if got := round14Translate(t, m, `count_over_time({product="tenant"}[1m])`); strings.Contains(got, "pack_json") {
 		t.Fatalf("bare stream count must skip the size filter: %s", got)
 	}
-	if got := round14Translate(t, m, `bytes_over_time({product="tenant"} | json [1m])`); !strings.Contains(got, pipes+` | filter __lvp_bytes:<=524288 | stats sum(__lvp_bytes)`) {
+	if got := round14Translate(t, m, `bytes_over_time({product="tenant"} | json [1m])`); !strings.Contains(got, pipes+` | filter __lvp_bytes:<=524288 | unpack_json | stats sum(__lvp_bytes)`) {
 		t.Fatalf("bytes with the size filter keeps the field for the sum: %s", got)
 	}
 

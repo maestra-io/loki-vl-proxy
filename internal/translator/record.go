@@ -1,7 +1,6 @@
 package translator
 
 import (
-	"regexp"
 	"strconv"
 	"strings"
 )
@@ -79,10 +78,9 @@ func (m *MappingOptions) RecordPipes(isBytes bool, logql string) (string, bool) 
 	return m.recordPipes(isBytes, logql)
 }
 
-var rowScanRE = regexp.MustCompile(`\|=|\|~|!~|\|>|!>|!=\s*"|!=\s*` + "`" + `|\|\s*(json|logfmt|pattern|regexp|unpack)\b`)
-
-// queryScansRows reports whether the log query carries a line filter, a
-// label filter or a parser — anything VictoriaLogs evaluates per row.
+// queryScansRows reports whether the log query carries anything
+// VictoriaLogs evaluates per row: a line filter or any pipe stage (a parser,
+// a label filter, a format).
 func queryScansRows(logql string) bool {
 	q := strings.TrimSpace(logql)
 	if strings.HasPrefix(q, "{") {
@@ -90,5 +88,5 @@ func queryScansRows(logql string) bool {
 			q = q[end+1:]
 		}
 	}
-	return rowScanRE.MatchString(q)
+	return strings.ContainsAny(q, "|") || strings.Contains(q, "!=") || strings.Contains(q, "!~")
 }

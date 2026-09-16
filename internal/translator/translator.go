@@ -995,10 +995,21 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 	}
 
 	if mapping != nil && mapping.recordPipesText != "" {
-		if len(parts) == 0 && len(streamParts) == 0 {
-			parts = append(parts, "*")
+		// The stored line is measured BEFORE the user's stages: a parser adds
+		// fields, `drop`/`keep`/`line_format` remove or rewrite them, and
+		// pack_json would count the row as the stages left it.
+		at := len(parts)
+		for i, part := range parts {
+			if strings.HasPrefix(part, "|") {
+				at = i
+				break
+			}
 		}
-		parts = append(parts, mapping.recordPipesText)
+		if at == 0 && len(streamParts) == 0 {
+			parts = append([]string{"*"}, parts...)
+			at = 1
+		}
+		parts = append(parts[:at], append([]string{mapping.recordPipesText}, parts[at:]...)...)
 	}
 
 	if coalesce := mapping.chainCoalescePipes(); len(coalesce) > 0 {
