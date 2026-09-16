@@ -183,7 +183,8 @@ func (p *Proxy) preserveMetricStreamIdentity(originalLogQL, translatedLogsQL str
 		if bare {
 			// The translator's own default grouping for a bare rate(...) is the
 			// same `_stream, level` pair; key it the way Loki does (class G).
-			return strings.Replace(translatedLogsQL, "| stats by (_stream, level) ", "| stats "+p.streamIdentityByClause()+" ", 1)
+			pipes, by := p.streamIdentityStats()
+			return strings.Replace(translatedLogsQL, "| stats by (_stream, level) ", pipes+"| stats "+by+" ", 1)
 		}
 		return translatedLogsQL
 	}
@@ -193,24 +194,37 @@ func (p *Proxy) preserveMetricStreamIdentity(originalLogQL, translatedLogsQL str
 	return translatedLogsQL
 }
 
-// streamIdentityByClause is the LogsQL grouping of a bare range aggregation:
+// streamIdentityStats is the LogsQL grouping of a bare range aggregation:
 // the stream, the stored level unless the proxy derives it (then it is no
-// stream label of Loki's), and every field a mapped label reads, so the
-// response carries app/product/node_name the way Loki's stream labels do
-// (round 13, class G).
-func (p *Proxy) streamIdentityByClause() string {
+// stream label of Loki's), and every mapped label, so the response carries
+// app/product/node_name the way Loki's stream labels do (round 13, class G).
+// A fallback chain is materialised into its Loki name first — lowest priority
+// field first, each `format if` overwriting the last — so rows whose chains
+// resolve to one value are one series, not one per source field. The pipes
+// go before `| stats`, the by-clause replaces the translator's.
+func (p *Proxy) streamIdentityStats() (pipes, by string) {
 	parts := []string{"_stream"}
 	if !p.bareIdentityDropsLevel() {
 		parts = append(parts, "level")
 	}
+	var b strings.Builder
 	if p != nil {
 		for _, prom := range p.labelPromotions {
-			for _, f := range prom.fields {
-				parts = append(parts, translator.QuoteVLField(f))
+			switch len(prom.fields) {
+			case 0:
+				// A computed label is joined in the response.
+			case 1:
+				parts = append(parts, translator.QuoteVLField(prom.fields[0]))
+			default:
+				for i := len(prom.fields) - 1; i >= 0; i-- {
+					q := translator.QuoteVLField(prom.fields[i])
+					b.WriteString("| format if (" + q + ":*) \"<" + prom.fields[i] + ">\" as " + prom.label + " ")
+				}
+				parts = append(parts, prom.label)
 			}
 		}
 	}
-	return "by (" + strings.Join(parts, ", ") + ")"
+	return b.String(), "by (" + strings.Join(parts, ", ") + ")"
 }
 
 func isBareMetricFunctionQuery(logql string) bool {
@@ -243,8 +257,8 @@ func (p *Proxy) addStatsByStreamClause(logsqlQuery string) string {
 	if idx < 0 {
 		return logsqlQuery
 	}
-	statsStart := idx + len("| stats ")
-	return logsqlQuery[:statsStart] + p.streamIdentityByClause() + " " + logsqlQuery[statsStart:]
+	pipes, by := p.streamIdentityStats()
+	return logsqlQuery[:idx] + pipes + "| stats " + by + " " + logsqlQuery[idx+len("| stats "):]
 }
 
 func (p *Proxy) handleInstantMetricPostAggregation(w http.ResponseWriter, r *http.Request, start time.Time, originalQuery string, postAgg instantMetricPostAgg) {

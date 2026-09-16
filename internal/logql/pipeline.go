@@ -298,6 +298,9 @@ func (p *Pipeline) apply(s Stage, e *Entry) bool { //nolint:gocyclo // one branc
 			return true
 		}
 		e.Line = out
+		// The line is no longer the collector's source text: a later `| json`
+		// parses what the template produced and fails on it like Loki does.
+		e.SplitJSON = false
 
 	case *LabelFormatStage:
 		p.applyLabelFormat(st, e)
@@ -621,6 +624,7 @@ func parseUnpackInto(e *Entry, out map[string]string) {
 		if k == "_entry" {
 			if s, ok := v.(string); ok {
 				e.Line = s
+				e.SplitJSON = false
 			}
 			continue
 		}

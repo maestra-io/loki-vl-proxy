@@ -395,10 +395,23 @@ func (p *Proxy) promoteStreamIdentity(translated map[string]string, metricVal *f
 	if p == nil || len(p.labelPromotions) == 0 || metricVal == nil {
 		return false
 	}
-	for _, prom := range p.labelPromotions {
-		delete(translated, prom.label)
+	// A label the stats clause already materialised (a chain under its Loki
+	// name) or that only the _stream carried keeps its value; the promotion
+	// fills what is missing — a single-field mapping still under its VL name,
+	// and the computed joins — from the metric's own fields.
+	resolved := make(map[string]string, len(translated)+len(p.labelPromotions))
+	for k, v := range translated {
+		resolved[k] = v
 	}
-	return applyLabelPromotions(p.labelPromotions, translated, func(field string) string {
+	applyLabelPromotions(p.labelPromotions, resolved, func(field string) string {
 		return string(metricVal.GetStringBytes(field))
 	})
+	changed := false
+	for _, prom := range p.labelPromotions {
+		if v := resolved[prom.label]; v != "" && translated[prom.label] != v {
+			translated[prom.label] = v
+			changed = true
+		}
+	}
+	return changed
 }

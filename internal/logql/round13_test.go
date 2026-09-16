@@ -71,3 +71,20 @@ func TestRound13_JSONStageOnCollectorSplitLineIsNotAnError(t *testing.T) {
 		t.Fatalf("a plain-text line is still a parser error: %v", plain.Labels)
 	}
 }
+
+// A stage that replaces the line ends the collector-split exemption: Loki's
+// `| json` parses what `line_format` produced and fails on plain text.
+func TestRound13_LineFormatThenJSONIsStillAParserError(t *testing.T) {
+	expr, err := Parse(`{a="b"} | line_format "plain" | json | __error__ != ""`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := NewPipeline(expr.(*LogQuery).Pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Entry{TS: time.Now(), Line: "text", Labels: map[string]string{"Category": "x"}, SplitJSON: true}
+	if !p.Process(e) || e.Labels[errorLabel] != "JSONParserErr" {
+		t.Fatalf("want JSONParserErr after line_format, got %v", e.Labels)
+	}
+}

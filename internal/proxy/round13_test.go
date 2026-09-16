@@ -243,7 +243,7 @@ func TestRound13_BareRangeIdentity_NativePath(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.Contains(r.URL.Path, "stats_query_range") {
 			fmt.Fprint(w, `{"status":"success","data":{"resultType":"matrix","result":[`+
-				`{"metric":{"_stream":"{kubernetes.container_name=\"manager\",kubernetes.pod_name=\"helm-1\",kubernetes.pod_namespace=\"flux-system\"}","kubernetes.pod_namespace":"flux-system","kubernetes.container_name":"manager","kubernetes.pod_name":"helm-1","kubernetes.pod_node_name":"node1","kubernetes.pod_labels.app":"helm-controller","kubernetes.pod_labels.app.kubernetes.io/name":"","kubernetes.pod_labels.product":"","kubernetes.namespace_labels.product":"infra"},"values":[[1700003600.000001,"5"]]}`+
+				`{"metric":{"_stream":"{kubernetes.container_name=\"manager\",kubernetes.pod_name=\"helm-1\",kubernetes.pod_namespace=\"flux-system\"}","kubernetes.pod_namespace":"flux-system","kubernetes.container_name":"manager","kubernetes.pod_name":"helm-1","kubernetes.pod_node_name":"node1","app":"helm-controller","product":"infra"},"values":[[1700003600.000001,"5"]]}`+
 				`]}}`)
 			return
 		}
@@ -253,7 +253,7 @@ func TestRound13_BareRangeIdentity_NativePath(t *testing.T) {
 	rec := queryRange(t, p, `count_over_time({namespace="flux-system"}[1h])`, 1700000000, 1700007200, 3600)
 	grouped := false
 	for _, q := range seen() {
-		grouped = grouped || strings.Contains(q, `| stats by (_stream, "kubernetes.pod_namespace", "kubernetes.container_name", "kubernetes.pod_name", "kubernetes.pod_node_name", "kubernetes.pod_labels.app", "kubernetes.pod_labels.app.kubernetes.io/name", "kubernetes.pod_labels.product", "kubernetes.namespace_labels.product") count()`)
+		grouped = grouped || strings.Contains(q, `| format if ("kubernetes.pod_labels.app.kubernetes.io/name":*) "<kubernetes.pod_labels.app.kubernetes.io/name>" as app | format if ("kubernetes.pod_labels.app":*) "<kubernetes.pod_labels.app>" as app | format if ("kubernetes.namespace_labels.product":*) "<kubernetes.namespace_labels.product>" as product | format if ("kubernetes.pod_labels.product":*) "<kubernetes.pod_labels.product>" as product | stats by (_stream, "kubernetes.pod_namespace", "kubernetes.container_name", "kubernetes.pod_name", "kubernetes.pod_node_name", app, product) count()`)
 	}
 	if !grouped {
 		t.Fatalf("the bare aggregation must group by the stream and the mapped fields: %v", seen())
