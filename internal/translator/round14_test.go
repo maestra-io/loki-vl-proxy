@@ -79,6 +79,9 @@ func TestRound14_RecordPipes(t *testing.T) {
 	if !queryScansRows(`{app="x"} | status="500"`) || !queryScansRows(`{app="x"} | latency > 1`) || queryScansRows(`{app="x", env!="prod"}`) {
 		t.Fatal("a label filter stage scans rows; a selector alone does not")
 	}
+	if queryScansRows(`{label="}|"}`) || queryScansRows("{label=`}|`}") || queryScansRows(`{label="a\"}|"}`) || !queryScansRows(`{label="}"} |= "x"`) {
+		t.Fatal("a brace or pipe inside a quoted label value is not the selector's end")
+	}
 
 	m.LokiMaxLineSize = 524288
 	if got := round14Translate(t, m, `sum by (tenant_id) (count_over_time({product="tenant"} |= "Message size too large" | json [1m]))`); !strings.Contains(got, pipes+` | filter __lvp_bytes:<=524288 | delete __lvp_bytes | unpack_json | stats by (tenant_id) count()`) {

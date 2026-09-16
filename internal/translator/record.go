@@ -84,9 +84,29 @@ func (m *MappingOptions) RecordPipes(isBytes bool, logql string) (string, bool) 
 func queryScansRows(logql string) bool {
 	q := strings.TrimSpace(logql)
 	if strings.HasPrefix(q, "{") {
-		if end := strings.Index(q, "}"); end >= 0 {
-			q = q[end+1:]
-		}
+		q = q[selectorEnd(q):]
 	}
 	return strings.ContainsAny(q, "|") || strings.Contains(q, "!=") || strings.Contains(q, "!~")
+}
+
+// selectorEnd returns the index just past the stream selector's closing
+// brace, skipping braces and pipes inside quoted label values.
+func selectorEnd(q string) int {
+	var quote byte
+	for i := 0; i < len(q); i++ {
+		c := q[i]
+		switch {
+		case quote != 0:
+			if c == '\\' && quote != '`' {
+				i++
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '`':
+			quote = c
+		case c == '}':
+			return i + 1
+		}
+	}
+	return len(q)
 }
