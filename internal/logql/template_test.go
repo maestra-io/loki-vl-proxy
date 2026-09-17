@@ -210,3 +210,46 @@ func TestTemplateLabelFormatQuotingForms(t *testing.T) {
 		})
 	}
 }
+
+// TestTemplatePrintfBudget proves the per-line formatting budget is enforced by
+// this package, not only by the proxy's own line_format post-processor: the
+// pipeline engine compiles the template itself, so an unbounded printf width
+// would otherwise reach fmt with the whole width allocated per log line.
+func TestTemplatePrintfBudget(t *testing.T) {
+	// A constant width is refused at compile time, so the client gets a 400
+	// naming the limit instead of a per-line __error__.
+	_, err := ParseTemplate(`{{printf "%100000000s" .app}}`)
+	if err == nil {
+		t.Fatal("expected an error for an oversized printf width")
+	}
+	var budget *TemplateBudgetError
+	if !errors.As(err, &budget) {
+		t.Fatalf("expected *TemplateBudgetError, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "limit") {
+		t.Errorf("error should name the limit, got %q", err)
+	}
+
+	// A width assembled at runtime cannot escape it either.
+	tmpl, err := ParseTemplate(`{{printf .fmt .app}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	if _, err := tmpl.Exec(map[string]string{"fmt": "%100000000s", "app": "web"}, "", time.Time{}, &buf); err == nil {
+		t.Fatal("expected a runtime printf budget error")
+	}
+
+	// An ordinary format still works.
+	tmpl, err = ParseTemplate(`{{printf "%s-%03d" .app 7}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := tmpl.Exec(map[string]string{"app": "web"}, "", time.Time{}, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "web-007" {
+		t.Fatalf("got %q", out)
+	}
+}

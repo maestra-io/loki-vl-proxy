@@ -6,6 +6,8 @@ import (
 	"strings"
 	"text/template"
 	"text/template/parse"
+
+	logqlpkg "github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
 )
 
 const maxFormattedLineBytes = 64 << 10
@@ -30,29 +32,10 @@ func boundedTemplatePrintf(format string, args ...any) (string, error) {
 	if len(format) > maxFormattedLineBytes || !templateArgsWithinBudget(args) {
 		return "", fmt.Errorf("line_format printf limit exceeded")
 	}
-	// Bounds numeric widths/precisions and argument indexes before fmt allocates.
-	number := 0
-	inDirective := false
-	for _, c := range format {
-		if !inDirective {
-			if c == '%' {
-				inDirective = true
-			}
-			continue
-		}
-		if c == '%' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
-			inDirective = false
-			number = 0
-			continue
-		}
-		if c >= '0' && c <= '9' {
-			number = number*10 + int(c-'0')
-			if number > maxFormattedLineBytes {
-				return "", fmt.Errorf("line_format printf width limit exceeded")
-			}
-		} else {
-			number = 0
-		}
+	// Bounds numeric widths/precisions before fmt allocates. Shared with the
+	// logql pipeline's own `printf` so the two engines cannot drift apart.
+	if err := logqlpkg.CheckPrintfFormatBudget(format, maxFormattedLineBytes); err != nil {
+		return "", err
 	}
 	for _, arg := range args {
 		if n, ok := arg.(int); ok && strings.Contains(format, "*") && (n > maxFormattedLineBytes || n < -maxFormattedLineBytes) {

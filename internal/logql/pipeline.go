@@ -242,6 +242,12 @@ func compileStageTemplate(src string) (*Template, error) {
 	if errors.As(err, &unknown) {
 		return nil, err
 	}
+	//   - a BUDGET overflow is fatal too: evaluating it per line is the denial
+	//     of service the budget exists to refuse, so it becomes a 400.
+	var budget *TemplateBudgetError
+	if errors.As(err, &budget) {
+		return nil, err
+	}
 	return nil, nil //nolint:nilnil // a malformed template is a runtime no-op, not a query error
 }
 
