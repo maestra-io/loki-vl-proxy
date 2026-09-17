@@ -499,8 +499,18 @@ func TestTumblingRangeMetric_BucketsLabelledAtLokiEvaluationTime(t *testing.T) {
 
 // From two hours on a grouped count is answered in two phases (a global top-N,
 // then per-step counts for those values). The relabelled path keeps Loki's
-// windows there too: anchored Phase 2 buckets, and the lines without the
-// grouped label as the unlabelled series.
+// windows there too: anchored buckets carrying the 1ns edge shift.
+//
+// Fork scope: a Grafana Logs Drilldown request does NOT reach this path. The
+// fork routes a Drilldown single-field count through its own /hits fast paths
+// (statsRateRangeEqualsStepShift's carve-out, locked by TestLock_* in
+// drilldown_regression_lock_test.go) because the direct stats response for a
+// high-cardinality field overflows VictoriaLogs' 16 MB cap and comes back
+// empty. So this test asks as a plain client, which is the one upstream serves
+// exactly. The `field:in(...)` restriction of phase 2 appears only when the
+// ranking is CUT by -max-stats-query-series, which
+// TestShortRangeMetric_TooManySeriesKeepsBusiestValues covers; with two pod
+// values every value ranks and phase 2 needs no filter.
 func TestTumblingRangeMetric_LongRangeTwoPhaseKeepsLokiWindows(t *testing.T) {
 	base := time.Unix(1700000400, 0).UTC()
 	lines := tumblingFixture(base)
@@ -510,12 +520,12 @@ func TestTumblingRangeMetric_LongRangeTwoPhaseKeepsLokiWindows(t *testing.T) {
 	p := newSlidingTestProxy(t, srv.URL)
 	// The two-phase top-N is a SELECTION, which only a Drilldown request gets;
 	// a plain client is served exactly (round 12).
-	got := runTumblingQuery(t, p, "/loki/api/v1/query_range", tumblingRangeParams(query, start, end, step), drilldownHeaders)
+	got := runTumblingQuery(t, p, "/loki/api/v1/query_range", tumblingRangeParams(query, start, end, step))
 	assertTumblingEqual(t, query, lokiTumblingReference(lines, "count_over_time", []string{"pod"}, start, end, step, 5*time.Minute), got)
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if len(fake.statsCalls) != 2 || !strings.Contains(fake.statsCalls[1].query, `or pod:"")`) || fake.statsCalls[1].offset == "" {
-		t.Fatalf("expected a top-N phase and an anchored phase 2 keeping unlabelled lines, got %+v", fake.statsCalls)
+	if len(fake.statsCalls) != 1 || !strings.Contains(fake.statsCalls[0].query, "| stats by (pod) count()") || fake.statsCalls[0].offset == "" {
+		t.Fatalf("expected one anchored bucket phase keeping Loki's windows, got %+v", fake.statsCalls)
 	}
 }
 
@@ -560,9 +570,11 @@ func TestShortRangeMetric_TooManySeriesKeepsBusiestValues(t *testing.T) {
 			srv, fake := newTumblingFakeVL(t, lines)
 			p := newSlidingTestProxy(t, srv.URL)
 			p.maxStatsQuerySeries = 150 // -max-stats-query-series
-			// Loki answers a plain client over the cap with 400; a Drilldown
-			// request gets the busiest N and a Warning header.
-			got := runTumblingQuery(t, p, "/loki/api/v1/query_range", tumblingRangeParams(query, start, end, step), drilldownHeaders)
+			// The ranking phase keeps the busiest -max-stats-query-series values
+			// and the bucket query restricted to them is exact, so no cap error
+			// is raised and a plain client is served (the fork's Drilldown
+			// carve-out routes a Drilldown request to its own /hits paths).
+			got := runTumblingQuery(t, p, "/loki/api/v1/query_range", tumblingRangeParams(query, start, end, step))
 			want := lokiTumblingReference(lines, "count_over_time", []string{"pod"}, start, end, step, time.Minute)
 			if want := p.resolvedMaxStatsQuerySeries(); len(got) != want {
 				t.Fatalf("expected the %d busiest series (-max-stats-query-series), got %d", want, len(got))
