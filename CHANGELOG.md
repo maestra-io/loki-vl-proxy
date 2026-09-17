@@ -33,6 +33,25 @@ Fork of [ReliablyObserve/loki-vl-proxy](https://github.com/ReliablyObserve/loki-
 - #26 fix: level after a parser, `-bytes-over-time-source`, `-loki-max-line-size`, `-dedupe-exact-duplicates`, Loki names for bare `| json` identity.
 - Also fork-only: `-tenant-map`, `-log-translated-queries`, `keep_original_fields` on injected unpack pipes, manual scan budget (`internal/proxy/manual_scan_budget.go`).
 
+The fork's own range-metric engine (bucket-by-END grid with a 1 µs epsilon,
+`range_window.go`, `step_grid.go`) is retired: upstream's engine (ordered-JSON
+manual scan, anchored tumbling/sliding windows, backend-version-gated offset)
+is now the one engine, and every round-8..14 behaviour above was ported onto it.
+Loki-parity defects found on that engine while porting, each verified against a
+real Loki 3.7.1 in `test/e2e-compat`:
+
+- A LogQL range vector is `(start, end]` for **every** function, not only the
+  log-range ones (`aggregateManualWindow`).
+- An instant aggregation whose window legitimately evaluates to zero keeps the
+  sample; the empty-input guard no longer swallows it.
+- The exact (raw-row) evaluator enforces Loki's series cap, so a query over the
+  cap answers Loki's 400 instead of silently trimming.
+- `-loki-max-line-size` stays honest when the pushdown cannot carry it.
+- The printf budget is enforced in the LogQL pipeline engine, so a quoted format
+  literal reaches `text/template` intact.
+- A template log query splits its range the way the windowed path does.
+- `-bytes-over-time-source` defaults to the LINE, matching Loki's accounting.
+
 
 ### Security
 
