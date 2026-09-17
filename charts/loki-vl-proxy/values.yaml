@@ -245,7 +245,7 @@ extraArgs:
   # line-filter-fields: "_msg"        # fields a line filter (|=, !=, |~, !~) reads; list split-out JSON keys, e.g. "_msg,Scopes,Exception,Category,State.*"
   # dedupe-exact-duplicates: "true"   # collapse (stream, timestamp, line) duplicates like Loki's ingester
   # align-queries-with-step: "true"  # truncate metric range bounds to the step grid (Loki query_range.align_queries_with_step, on in the Loki Helm chart)
-  # bytes-over-time-source: "record"  # "record" = the line Loki stored (non-stream fields JSON + vector http_server wrapper); "line" = len(_msg)
+  # bytes-over-time-source: "record"  # set ONLY when the collector wraps the line (vector http_server sink): "record" = the line Loki stored (non-stream fields JSON + wrapper); default "line" = len(_msg), which matches Loki for an as-is collector
   # record-exclude-fields: "kubernetes.*"  # VL fields that are not part of the Loki line (collector metadata)
   # loki-max-line-size: "524288"      # drop rows Loki rejected at ingest (limits_config.max_line_size); 0 = off
   # Derived fields (trace linking)
