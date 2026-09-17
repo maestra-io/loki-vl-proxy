@@ -21,12 +21,12 @@ func (p *Proxy) manualMetricRowBudget() (int, error) {
 	return limit, nil
 }
 
-func checkManualMetricRead(ctx context.Context, limited *io.LimitedReader) error {
+func checkManualMetricRead(ctx context.Context, limited *io.LimitedReader, maxBytes int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if limited.N <= 0 {
-		return fmt.Errorf("manual metric response exceeds %d bytes", maxBufferedBackendBodyBytes)
+		return fmt.Errorf("manual metric raw rows exceed %d bytes", maxBytes)
 	}
 	return nil
 }
