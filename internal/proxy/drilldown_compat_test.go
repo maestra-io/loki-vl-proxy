@@ -2328,7 +2328,7 @@ func TestDrilldownLogCountUnderscokeProxyLokiPushData(t *testing.T) {
 							"service.name": "",                // OTel field not found
 							"service_name": "payment-service", // stream label found
 						},
-						"values": [][]interface{}{{float64(1775642400), "13920"}},
+						"values": [][]interface{}{{float64(1712538000), "13920"}}, // 2024-04-08T01:00:00Z, inside the requested range
 					},
 				},
 			},
