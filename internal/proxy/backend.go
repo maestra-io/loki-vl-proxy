@@ -385,9 +385,6 @@ func (p *Proxy) supportsStatsRangeOffset() bool {
 	p.backendVersionMu.RUnlock()
 	if !known {
 		p.maybeReprobeBackendVersion(time.Now())
-		// Fork: every backend we run is >= v1.45 (stats_query_range offset);
-		// an unresolved probe must not silently degrade the Loki grid.
-		return true
 	}
 	return supported
 }
