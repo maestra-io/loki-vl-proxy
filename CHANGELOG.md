@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- fix(translator): `| json alias="field"` now reaches templates and keeps its
+  filter off the stream labels. VL has no alias — `| unpack_json` extracts under
+  the field's own name — so `| line_format "{{.alias}}"` rendered an EMPTY line,
+  and a filter on the alias was resolved to the source name and then mapped by
+  the stream-label translator, which pointed it at the wrong field and dropped
+  every row. Measured on us-omega over 16.09 12:00 UTC: Loki answered `reco` for
+  all 27 lines of `{namespace="vault-secrets-operator"} |= "Vault request
+  failed" | json vss_ns="namespace" | line_format "{{.vss_ns}}"`, the proxy
+  answered 27 empty bodies, and adding `| vss_ns=~".+"` took the proxy to 0
+  lines against Loki's 27. A later filter on a genuine stream label is still
+  mapped, and a longer field name is no longer eaten by a shorter alias.
+
 - fix(range): the manual raw-row scan reads under `-ordered-json-metric-max-bytes`
   (1 GiB by default) instead of the 64 MiB ceiling on the response the proxy
   builds. The rows stream line by line and what is retained is bounded by the
