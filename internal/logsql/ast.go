@@ -810,11 +810,11 @@ func (p PipeCopy) pipe() {}
 
 // PipeCoalesce returns the first non-empty value across the listed fields.
 //
-// WARNING: VictoriaLogs has no `coalesce` PIPE — v1.52.0 answers
-// `unexpected pipe "coalesce"` (verified 09.09.2026). Do not emit this into a
-// generated query; chain `| format if (<field>:*) "<<field>>" as <result>` from
-// the lowest-priority field to the highest instead, so the highest-priority
-// non-empty field wins.
+// v1.52.0 DOES accept this pipe: `* | limit 1 | coalesce(nosuchfield,
+// _stream_id) as r | keep r` answers `{"r":"<stream id>"}`, while an unknown
+// name answers `unexpected pipe name` (re-measured 17.09.2026, correcting a
+// 09.09.2026 note that claimed the opposite). The translator still does not
+// emit it — nothing has been proven at parity against Loki yet.
 // Syntax: | coalesce(f1, f2, ...) [default "val"] as result
 type PipeCoalesce struct {
 	Fields  []string
