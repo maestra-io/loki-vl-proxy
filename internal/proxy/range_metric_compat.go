@@ -1632,14 +1632,21 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 
 	// Stream the response line by line — avoids io.ReadAll + bytes.Split which
 	// would buffer the entire configured row budget plus overflow probe in memory.
-	limited := &io.LimitedReader{R: resp.Body, N: maxBufferedBackendBodyBytes + 1}
+	// The rows STREAM through line by line and what is retained is bounded by
+	// the manual-scan sample budget, so this read follows the configurable
+	// -ordered-json-metric-max-bytes (the other raw-row evaluator's cap) and
+	// not the 64 MiB ceiling on the response we build. A wide scan whose rows
+	// carry no unwrap field retains nothing and must not be refused for the
+	// bytes it walked past (issues-maestra#1031, omicron traefik quantile).
+	rawRowsMaxBytes := p.orderedJSONMetricMaxBytes()
+	limited := &io.LimitedReader{R: resp.Body, N: rawRowsMaxBytes + 1}
 	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 
 	rows := 0
 	dedup := p.newRowDedup()
 	for scanner.Scan() {
-		if err := checkManualMetricRead(ctx, limited); err != nil {
+		if err := checkManualMetricRead(ctx, limited, rawRowsMaxBytes); err != nil {
 			return nil, err
 		}
 		line := scanner.Bytes()
@@ -1760,7 +1767,7 @@ func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string,
 	if scanErr := scanner.Err(); scanErr != nil {
 		return nil, fmt.Errorf("scanning VL response: %w", scanErr)
 	}
-	if err := checkManualMetricRead(ctx, limited); err != nil {
+	if err := checkManualMetricRead(ctx, limited, rawRowsMaxBytes); err != nil {
 		return nil, err
 	}
 
