@@ -386,42 +386,44 @@ test.describe("@regression Pipeline stages — exact Loki parity", () => {
 // The cap itself is locked by the dedicated test below.
 const PROXY_STATS_SERIES_CAP = 500;
 
-// Documented proxy deviation, not Loki parity: Loki (as configured for this
-// stack) returns every stream, the proxy caps raw per-stream stats series at
-// -max-stats-query-series like Drilldown's own cap.
+// Fork deviation from upstream, deliberate (maestra rounds 11 and 14):
+//
+//  * Upstream emits one (zero-filled) series per stream in Loki's SERIES INDEX.
+//    This fork emits only the streams Loki's own query engine returns, because
+//    the campaign these builds serve compares a Loki panel against a
+//    VictoriaLogs panel — a series Loki's panel does not draw must not appear
+//    in ours. Measured on this stack while the index and the engine disagreed:
+//    upstream 495 with index 495 and `rate()` 457; this fork 114 with index 141
+//    and `rate()` 114.
+//  * Over `-max-stats-query-series` upstream trims to the cap and answers 200;
+//    this fork answers Loki's own `400 maximum of series (N) reached for a
+//    single query`, because a silently trimmed panel is worse than an error.
+//
+// So the reference here is Loki's `rate()` output, not its index.
+
 test.describe("@regression Proxy series cap", () => {
-  test("raw per-stream series honour the documented proxy cap @regression", async ({
+  test("raw per-stream series follow Loki's engine and stop at the cap @regression", async ({
     page,
   }) => {
     const { proxyUID, lokiUID } = await uids(page);
-    // One series per stream. The reference is Loki's series index rather than
-    // its rate() output: the generator rotates pod names, and Loki's sharded
-    // range path only sees a stream once its head block is cut, so the newest
-    // streams are always missing there while the index (served from the
-    // ingesters) and the proxy both list them immediately.
     const query = `rate({app="api-gateway"}[5m])`;
     await ensureStackWarm(page);
     const end = windowEnd();
-    // 15 minutes is enough to reach the cap on a stack older than a few
-    // minutes and keeps both the proxy's zero-filled matrix and Loki's series
-    // listing bounded on a long-running stack.
     const windowSec = 15 * 60;
-    const [proxy, indexed] = await Promise.all([
+    const [proxy, loki] = await Promise.all([
       queryRange(page, proxyUID, query, { step: "60", windowSec, endSec: end }),
-      lokiIndexedStreamCount(page, lokiUID, `{app="api-gateway"}`, end - windowSec, end),
+      queryRange(page, lokiUID, query, { step: "60", windowSec, endSec: end }),
     ]);
-    expect(proxy.statusCode, "raw rate: status code").toBe(200);
-    const proxySeries = seriesCount(proxy.body);
-    expect(proxySeries, "raw rate: proxy never exceeds its series cap").toBeLessThanOrEqual(
-      PROXY_STATS_SERIES_CAP
-    );
-    if (indexed <= PROXY_STATS_SERIES_CAP) {
-      expect(proxySeries, "raw rate: one series per indexed stream below the cap").toBe(
-        indexed
-      );
-    } else {
-      expect(proxySeries, "raw rate: cap reached").toBe(PROXY_STATS_SERIES_CAP);
+    const lokiSeries = seriesCount(loki.body);
+    if (lokiSeries > PROXY_STATS_SERIES_CAP) {
+      expect(proxy.statusCode, "over the cap: Loki's own 400").toBe(400);
+      return;
     }
+    expect(proxy.statusCode, "raw rate: status code").toBe(200);
+    expect(
+      seriesCount(proxy.body),
+      "raw rate: one series per stream Loki's engine returns"
+    ).toBe(lokiSeries);
   });
 });
 
