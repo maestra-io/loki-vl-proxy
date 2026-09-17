@@ -3730,11 +3730,21 @@ func (p *Proxy) proxyStatsQuery(w http.ResponseWriter, r *http.Request, logsqlQu
 		return
 	}
 
+	// Was the row count actually answered? The guard is only authoritative when
+	// VictoriaLogs echoed the row back; without it the value heuristic below is
+	// all we have.
+	answered := guarded && bytes.Contains(body, []byte(emptyInputGuardAlias))
 	if guarded {
 		body = dropEmptyInputGuard(body)
 	}
 	body = p.translateStatsResponseLabelsWithContext(r.Context(), body, r.FormValue("query"))
-	body = dropEmptyAggregateInstantVector(body, originalLogql)
+	if !answered {
+		// Only guess from the VALUE when the row count is unavailable: the
+		// guard already answered "was the input empty?" authoritatively, and
+		// the heuristic below cannot tell a genuine 0 (a window of empty lines
+		// under bytes_over_time) from VictoriaLogs' empty-input placeholder.
+		body = dropEmptyAggregateInstantVector(body, originalLogql)
+	}
 	body = wrapAsLokiResponse(body, "vector")
 	if topK, topKDesc, hasTopK := parseTopKWrapper(r.FormValue("query")); hasTopK {
 		body = applyTopKToVector(body, topK, topKDesc)
