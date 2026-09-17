@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	logqlpkg "github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
@@ -518,7 +519,7 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 			limit = n
 		}
 	}
-	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false, !backward, limit)
+	entries, err := p.fetchTemplatePipelineEntriesSplit(r, plan, start, end, backward, limit)
 	if err != nil {
 		p.writeError(w, templateFetchErrorStatus(err), err.Error())
 		return true
@@ -540,6 +541,72 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 	emitStructuredMetadata := p.shouldEmitStructuredMetadata(r)
 	writeLokiStreamQueryResponse(w, groupTemplateEntriesIntoStreams(entries, categorizedLabels, emitStructuredMetadata), categorizedLabels)
 	return true
+}
+
+// fetchTemplatePipelineEntriesSplit reads the range the way proxyLogQueryWindowed
+// does when query-range windowing is configured: one bounded read per split
+// window, in the request's direction, stopping as soon as the limit is filled.
+// A template pipeline is claimed by this path INSTEAD of the windowed one (
+// VictoriaLogs would emit the template text as the log line), so without this
+// the whole range would be a single unsplit read — no window-level cache reuse
+// and the memory of the full range in one scan.
+//
+// Windows are disjoint and inclusive on both ends, and the caller sorts and
+// truncates afterwards, so merging is a concatenation: entries from a later
+// window are all older (backward) or newer (forward) than the limit already
+// collected.
+func (p *Proxy) fetchTemplatePipelineEntriesSplit(r *http.Request, plan *templatePlan, start, end time.Time, backward bool, limit int) ([]templateEntry, error) {
+	forward := !backward
+	var windows []queryRangeWindow
+	if p.queryRangeWindowing && !p.streamResponse {
+		windows = splitQueryRangeWindowsWithOptions(
+			start.UnixNano(), end.UnixNano(),
+			p.queryRangeSplitInterval, r.FormValue("direction"), p.queryRangeAlignWindows,
+		)
+	}
+	if len(windows) <= 1 {
+		return p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false, forward, limit)
+	}
+	parallel := max(p.queryRangeMaxParallel, 1)
+	collected := make([]templateEntry, 0, queryRangeCollectedInitialCap)
+	remaining := limit
+	for i := 0; i < len(windows) && remaining > 0; i += parallel {
+		batch := windows[i:min(i+parallel, len(windows))]
+		results := make([][]templateEntry, len(batch))
+		errs := make([]error, len(batch))
+		var wg sync.WaitGroup
+		for j, window := range batch {
+			// A Pipeline is single-goroutine (per-entry template state and a
+			// reused buffer), so every parallel window evaluates its own.
+			windowPlan := plan
+			if j > 0 {
+				cloned, err := plan.pipeline.Clone()
+				if err != nil {
+					return nil, err
+				}
+				copied := *plan
+				copied.pipeline = cloned
+				windowPlan = &copied
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[j], errs[j] = p.fetchTemplatePipelineEntries(r.Context(), windowPlan,
+					time.Unix(0, window.startNs), time.Unix(0, window.endNs), false, forward, remaining)
+			}()
+		}
+		wg.Wait()
+		for j := range batch {
+			if errs[j] != nil {
+				return nil, errs[j]
+			}
+			collected = append(collected, results[j]...)
+		}
+		if limit > 0 {
+			remaining = limit - len(collected)
+		}
+	}
+	return collected, nil
 }
 
 // groupTemplateEntriesIntoStreams collapses entries sharing a label set into one

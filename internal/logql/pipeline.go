@@ -224,6 +224,19 @@ func NewPipeline(stages []Stage) (*Pipeline, error) {
 	return p, nil
 }
 
+// Clone returns an independent Pipeline over the same stages, safe to evaluate
+// on another goroutine: a Pipeline holds per-entry state (the format buffer and
+// its templates' __line__/__timestamp__) and so is single-goroutine by design.
+func (p *Pipeline) Clone() (*Pipeline, error) {
+	c, err := NewPipeline(p.stages)
+	if err != nil {
+		return nil, err
+	}
+	c.LineFilterFields = p.LineFilterFields
+	c.DerivedLevelFields = p.DerivedLevelFields
+	return c, nil
+}
+
 // compileStageTemplate compiles a format stage's template, distinguishing the
 // two failure modes Loki treats differently:
 //
