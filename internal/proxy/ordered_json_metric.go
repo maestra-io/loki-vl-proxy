@@ -32,6 +32,12 @@ const defaultOrderedJSONMetricMaxBytes = 1 << 30
 // the raw rows response read and the response built by the raw evaluator.
 func (p *Proxy) orderedJSONMetricMaxBytes() int64 {
 	if p.orderedJSONMaxBytes > 0 {
+		// Every reader of this cap adds one byte for the overflow probe, so
+		// math.MaxInt64 would wrap to a negative limit and refuse the scan
+		// before it read a single row.
+		if p.orderedJSONMaxBytes == math.MaxInt64 {
+			return math.MaxInt64 - 1
+		}
 		return p.orderedJSONMaxBytes
 	}
 	return defaultOrderedJSONMetricMaxBytes

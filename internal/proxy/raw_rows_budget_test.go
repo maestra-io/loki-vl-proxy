@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"io"
+	"math"
 	"strings"
 	"testing"
 )
@@ -30,5 +31,26 @@ func TestRawRowsReadFollowsTheConfigurableCap(t *testing.T) {
 	}
 	if err := checkManualMetricRead(context.Background(), small, 2); err == nil {
 		t.Fatal("a read that exhausts its own cap must still be refused")
+	}
+}
+
+// Every reader of -ordered-json-metric-max-bytes adds one byte for the overflow
+// probe, so the accessor must never hand back math.MaxInt64: `cap + 1` would
+// wrap negative, exhaust the io.LimitedReader on contact and refuse the scan
+// before it read a row.
+func TestOrderedJSONMetricMaxBytesLeavesRoomForTheOverflowProbe(t *testing.T) {
+	p := &Proxy{orderedJSONMaxBytes: math.MaxInt64}
+	got := p.orderedJSONMetricMaxBytes()
+	if got != math.MaxInt64-1 {
+		t.Fatalf("cap = %d, want %d", got, int64(math.MaxInt64-1))
+	}
+	if got+1 <= 0 {
+		t.Fatalf("cap+1 = %d must stay positive", got+1)
+	}
+	if p := (&Proxy{orderedJSONMaxBytes: 4096}).orderedJSONMetricMaxBytes(); p != 4096 {
+		t.Fatalf("a configured cap must pass through: %d", p)
+	}
+	if p := (&Proxy{}).orderedJSONMetricMaxBytes(); p != defaultOrderedJSONMetricMaxBytes {
+		t.Fatalf("unset cap must fall back to the default: %d", p)
 	}
 }
