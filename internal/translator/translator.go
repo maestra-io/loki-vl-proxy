@@ -925,13 +925,27 @@ func translateLogQuery(logql string, labelFn LabelTranslateFunc, caps logsql.Cap
 				jsonAliases[alias] = orig
 			}
 		}
-		// Rewrite filter stages that reference json-aliased field names so they
-		// use the original JSON field name that VL's unpack_json actually extracts.
+		// Rewrite stages that reference json-aliased field names so they use the
+		// original JSON field name that VL's unpack_json actually extracts —
+		// filters and line_format/label_format templates alike.
+		aliasResolved := map[string]bool{}
 		if afterParser && len(jsonAliases) > 0 {
-			stage = rewriteJSONAliasedFilter(stage, jsonAliases)
+			stage = rewriteJSONAliasedFilter(stage, jsonAliases, aliasResolved)
+			stage = rewriteJSONAliasedTemplate(stage, jsonAliases)
+		}
+		stageLabelFn := pipelineLabelFn
+		if len(aliasResolved) > 0 {
+			// A name this stage resolved out of an alias is a JSON BODY field,
+			// never a stream label, so the stream-label mapper must not touch it.
+			stageLabelFn = func(label string) string {
+				if aliasResolved[label] {
+					return label
+				}
+				return pipelineLabelFn(label)
+			}
 		}
 
-		translated := translatePipelineStageM(stage, pipelineLabelFn, caps, mapping.forStage(afterParser))
+		translated := translatePipelineStageM(stage, stageLabelFn, caps, mapping.forStage(afterParser))
 		if strings.HasPrefix(translated, errUnknownParser) {
 			parserName := strings.TrimPrefix(translated, errUnknownParser)
 			return "", fmt.Errorf("unknown pipeline stage %q — not a valid LogQL parser or label filter", parserName)
@@ -3696,16 +3710,72 @@ func resolveJSONBracketPath(orig string) string {
 // json-aliased field name to use the original JSON field name, so that VL's
 // unpack_json (which preserves original names) can match it.
 // E.g., "http_code=\"200\"" with alias {"http_code":"status"} → "status=\"200\""
-func rewriteJSONAliasedFilter(stage string, aliases map[string]string) string {
+func rewriteJSONAliasedFilter(stage string, aliases map[string]string, resolved map[string]bool) string {
 	for alias, orig := range aliases {
 		if strings.HasPrefix(stage, alias) {
 			after := stage[len(alias):]
 			if len(after) > 0 && isLabelFilterOpByte(after[0]) {
+				resolved[orig] = true
 				return orig + after
 			}
 		}
 	}
 	return stage
+}
+
+// goTemplateSpanRE matches one {{ ... }} action of a Go template.
+var goTemplateSpanRE = regexp.MustCompile(`{{[^{}]*}}`)
+
+// rewriteJSONAliasedTemplate rewrites `.alias` field references inside
+// line_format / label_format templates to the original JSON field name.
+//
+// Same reason as rewriteJSONAliasedFilter: `| json vss_ns="namespace"` makes VL
+// emit `| unpack_json`, which extracts the field under its own name, so a
+// template referencing the alias renders EMPTY. Loki answered `reco` for
+// `| json vss_ns="namespace" | line_format "{{.vss_ns}}"` on us-omega while the
+// proxy answered an empty body for all 27 lines (measured 17.09.2026).
+func rewriteJSONAliasedTemplate(stage string, aliases map[string]string) string {
+	if !strings.HasPrefix(stage, "line_format ") && !strings.HasPrefix(stage, "label_format ") {
+		return stage
+	}
+	return goTemplateSpanRE.ReplaceAllStringFunc(stage, func(span string) string {
+		for alias, orig := range aliases {
+			if alias == orig {
+				continue
+			}
+			span = replaceTemplateField(span, alias, orig)
+		}
+		return span
+	})
+}
+
+// replaceTemplateField swaps `.from` for `.to` inside one template action,
+// only where `.from` is a whole field token (so `.a` never eats `.abc`).
+func replaceTemplateField(span, from, to string) string {
+	needle := "." + from
+	var b strings.Builder
+	for i := 0; i < len(span); {
+		if strings.HasPrefix(span[i:], needle) && !isTemplateFieldByte(byteAt(span, i+len(needle))) {
+			b.WriteString("." + to)
+			i += len(needle)
+			continue
+		}
+		b.WriteByte(span[i])
+		i++
+	}
+	return b.String()
+}
+
+func byteAt(s string, i int) byte {
+	if i < 0 || i >= len(s) {
+		return 0
+	}
+	return s[i]
+}
+
+func isTemplateFieldByte(c byte) bool {
+	return c == '_' || c == '.' ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 }
 
 func isLabelFilterOpByte(c byte) bool {
