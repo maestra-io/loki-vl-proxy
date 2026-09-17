@@ -167,6 +167,12 @@ func TestCollectRangeMetricSamples_FoldsFarMoreThanTenThousandRows(t *testing.T)
 // and the difference only showed at the edges of a series, where just one of the
 // two exists: `sum(count_over_time({…}[30m]))` at step=900 returned 36 on its
 // last point where Loki returned 35.
+//
+// setSlidingStatsRangeParams fixes it by shifting the bucket edges back by 1ns
+// (negative `offset`), which needs the stats_query_range offset arg of
+// VictoriaLogs v1.45+ — so the proxy must know the backend version. The bucket
+// LABELS then stop being integer seconds, and the fold grid only matches after
+// snapSlidingBucketTimestamp rounds them back to the nearest edge.
 func TestCollectRangeMetricHits_RequestsTheLokiGrid(t *testing.T) {
 	var mu sync.Mutex
 	var gotOffset, gotStep string
@@ -184,7 +190,7 @@ func TestCollectRangeMetricHits_RequestsTheLokiGrid(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	p := newGapTestProxy(t, backend.URL)
+	p := newSlidingTestProxy(t, backend.URL)
 	base := time.Unix(1700000040, 0).UTC()
 	series, err := p.collectRangeMetricHits(context.Background(), `app:="a"`, nil, nil, false, "count()",
 		base, base.Add(2*time.Minute), time.Minute)
@@ -195,8 +201,8 @@ func TestCollectRangeMetricHits_RequestsTheLokiGrid(t *testing.T) {
 	mu.Lock()
 	offset, step := gotOffset, gotStep
 	mu.Unlock()
-	if offset == "" || !strings.HasPrefix(offset, "-") {
-		t.Fatalf("offset = %q, want the negative epsilon that makes VL's buckets right-closed", offset)
+	if offset != "-1ns" {
+		t.Fatalf("offset = %q, want the negative nanosecond that makes VL's buckets right-closed", offset)
 	}
 	if step != "60s" {
 		t.Fatalf("step = %q, want 60s", step)
