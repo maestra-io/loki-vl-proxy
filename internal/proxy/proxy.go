@@ -2347,10 +2347,6 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if p.handleOrderedJSONMetric(w, r, start, logqlQuery, true) {
-		return
-	}
-
 	logqlQuery = p.preferWorkingParser(r.Context(), logqlQuery, r.FormValue("start"), r.FormValue("end"))
 
 	if spec, ok := parseBareParserMetricCompatSpec(logqlQuery); ok {
@@ -2361,6 +2357,13 @@ func (p *Proxy) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.proxyBareParserMetricQueryRange(w, r, start, logqlQuery, resolvedSpec)
+		return
+	}
+
+	// Fork: the bare-parser stats path above owns `| json` metrics it can
+	// serve (field mapping, derived level); upstream's ordered-JSON scan is
+	// the fallback, not the first claim.
+	if p.handleOrderedJSONMetric(w, r, start, logqlQuery, true) {
 		return
 	}
 
@@ -2599,10 +2602,6 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if p.handleOrderedJSONMetric(w, r, start, logqlQuery, false) {
-		return
-	}
-
 	logqlQuery = p.preferWorkingParser(r.Context(), logqlQuery, r.FormValue("start"), r.FormValue("end"))
 
 	if spec, ok := parseBareParserMetricCompatSpec(logqlQuery); ok {
@@ -2615,6 +2614,13 @@ func (p *Proxy) handleQuery(w http.ResponseWriter, r *http.Request) {
 		p.proxyBareParserMetricQuery(w, r, start, logqlQuery, resolvedSpec)
 		return
 	}
+	// Fork: the bare-parser stats path above owns `| json` metrics it can
+	// serve (field mapping, derived level); upstream's ordered-JSON scan is
+	// the fallback, not the first claim.
+	if p.handleOrderedJSONMetric(w, r, start, logqlQuery, false) {
+		return
+	}
+
 	if spec, ok := parseAbsentOverTimeCompatSpec(logqlQuery); ok {
 		p.proxyAbsentOverTimeQuery(w, r, start, logqlQuery, spec)
 		return
