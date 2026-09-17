@@ -573,8 +573,29 @@ func TestTemplate_UnknownFunctionIsRejected(t *testing.T) {
 	if !strings.Contains(string(body), "totallyNotALokiFunc") {
 		t.Errorf("the 400 must name the unsupported function, got: %s", tplTruncate(string(body)))
 	}
-	if strings.Contains(string(body), "{{") {
-		t.Errorf("the error must not carry the template text: %s", tplTruncate(string(body)))
+	// Loki is the parity target, and Loki 3.7.1 answers this query with
+	//   parse error : stage '| line_format "…"' : invalid line template:
+	//   template: line:1: function "totallyNotALokiFunc" not defined
+	// template text included. The fork used to sanitise the text out; matching
+	// Loki verbatim is the stronger contract, so assert it against Loki itself.
+	lokiResp, err := http.Get(lokiURL + "/loki/api/v1/query_range?" + params.Encode())
+	if err != nil {
+		t.Fatalf("Loki request failed: %v", err)
+	}
+	defer lokiResp.Body.Close()
+	lokiBody, _ := io.ReadAll(lokiResp.Body)
+	if lokiResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("Loki fixture drifted: want 400, got %d: %s", lokiResp.StatusCode, tplTruncate(string(lokiBody)))
+	}
+	// Loki answers the plain message, the proxy the Loki JSON error envelope.
+	var envelope struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("proxy error is not a Loki error envelope: %v (%s)", err, tplTruncate(string(body)))
+	}
+	if envelope.Error != strings.TrimSpace(string(lokiBody)) {
+		t.Errorf("the 400 must carry Loki's message verbatim.\nproxy: %s\nloki:  %s", envelope.Error, tplTruncate(string(lokiBody)))
 	}
 }
 

@@ -217,6 +217,9 @@ func translateMatcher(m LabelMatcher, opts TranslateOptions) (string, error) {
 // Loki |= is a substring match; VL's ~"text" is the closest equivalent.
 // Pattern filters (|> and !>) fall through to the string translator.
 func translateLineFilter(s *LineFilterStage) (string, error) {
+	if s.IP {
+		return "", errFallthrough
+	}
 	// An OR-list (`|= "a" or "b"`) becomes one parenthesised alternation so the
 	// single NOT of a negative filter covers every alternative.
 	//

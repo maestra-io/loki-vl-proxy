@@ -95,9 +95,12 @@ func TestBuildStatsQueryRangeParams_EndIsSeconds(t *testing.T) {
 }
 
 // TestProxyStatsQuery_SendsSecondBoundsToVL verifies that proxyStatsQuery
-// sends start/end in seconds to VL when the original LogQL contains a range window.
-// The root bug: without this fix, VL received nanosecond timestamps and scanned
-// all historical data (O(all_time) instead of O(window)).
+// sends start/end bounds VL parses as times (never raw nanosecond integers)
+// when the original LogQL contains a range window. The root bug: without this
+// fix, VL received nanosecond timestamps and scanned all historical data
+// (O(all_time) instead of O(window)). The bounds are RFC3339 with nanoseconds,
+// both one nanosecond late: VictoriaLogs filters [start, end) and Loki's
+// instant window is (time-range, time].
 func TestProxyStatsQuery_SendsSecondBoundsToVL(t *testing.T) {
 	var capturedStart, capturedEnd string
 
@@ -130,17 +133,9 @@ func TestProxyStatsQuery_SendsSecondBoundsToVL(t *testing.T) {
 	if capturedStart == "" {
 		t.Fatal("expected start to be sent to VL for windowed LogQL query")
 	}
-	// Both must be in seconds (≤12 digits), never 19-digit nanoseconds
-	if len(capturedStart) > 12 {
-		t.Errorf("start param %q looks like nanoseconds — VL expects Unix seconds", capturedStart)
-	}
-	if len(capturedEnd) > 12 {
-		t.Errorf("end param %q looks like nanoseconds — VL expects Unix seconds", capturedEnd)
-	}
-
-	// end = eval time, start = eval time minus 5m window
-	wantEnd := strconv.FormatInt(evalTimeUnix, 10)
-	wantStart := strconv.FormatInt(evalTimeUnix-300, 10)
+	// end = eval time + 1ns, start = eval time minus 5m window + 1ns
+	wantEnd := time.Unix(evalTimeUnix, 1).UTC().Format(time.RFC3339Nano)
+	wantStart := time.Unix(evalTimeUnix-300, 1).UTC().Format(time.RFC3339Nano)
 
 	if capturedEnd != wantEnd {
 		t.Errorf("end: got %q, want %q", capturedEnd, wantEnd)
@@ -226,14 +221,10 @@ func TestTranslateStatsResponseLabels_LevelPreservedWithStream(t *testing.T) {
 }
 
 // TestTranslateStatsResponseLabels_LevelRemovedWithoutStream checks the complementary
-// case: when _stream is absent (VL returned only explicit by-group keys), the
-// response must carry the label the client GROUPED BY.
-//
-// Updated 10.09.2026: this asserted that `sum by (level)` comes back as
-// detected_level. Real Loki returns `level` for `sum by (level)` and
-// `detected_level` for `sum by (detected_level)` — measured side by side on the
-// same data (panel-compare S4/S5). Both translate to VL's `level` column, so the
-// original query is the only thing that distinguishes them.
+// case: when _stream is absent (VL returned only explicit by-group keys) and the
+// query grouped by detected_level, which VL answers with its level field, level
+// must be replaced by detected_level. A query grouping by level keeps level, as
+// Loki 3.7.1 answers it (TestStatsResponseKeepsRequestedLevelLabel).
 func TestTranslateStatsResponseLabels_LevelRemovedWithoutStream(t *testing.T) {
 	p := newTestProxy(t, "http://unused")
 	p.labelTranslator = NewLabelTranslator(LabelStyleUnderscores, nil)
@@ -241,7 +232,7 @@ func TestTranslateStatsResponseLabels_LevelRemovedWithoutStream(t *testing.T) {
 	body := []byte(`{"results":[{"metric":{"level":"error"}}]}`)
 	got := p.translateStatsResponseLabelsWithContext(
 		context.Background(), body,
-		`sum by (level) (count_over_time({app="api"}[5m]))`,
+		`sum by (detected_level) (count_over_time({app="api"}[5m]))`,
 	)
 
 	var resp struct {
@@ -254,13 +245,12 @@ func TestTranslateStatsResponseLabels_LevelRemovedWithoutStream(t *testing.T) {
 	}
 	metric := resp.Results[0].Metric
 
-	// The query grouped by `level`, so `level` is what comes back — and the
-	// synthetic twin must not be added alongside it.
-	if metric["level"] != "error" {
-		t.Errorf("level must be preserved for `sum by (level)`; got %#v", metric)
+	// Without _stream, level came from VL grouping and must be replaced by detected_level
+	if _, ok := metric["level"]; ok {
+		t.Errorf("level must be removed when _stream is absent; got %#v", metric)
 	}
-	if _, ok := metric["detected_level"]; ok {
-		t.Errorf("detected_level must not be added for `sum by (level)`; got %#v", metric)
+	if metric["detected_level"] == "" {
+		t.Errorf("detected_level must be synthesised from level; got %#v", metric)
 	}
 }
 

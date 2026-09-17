@@ -49,7 +49,6 @@ flowchart TD
             STATS["stats_query_range<br/>rate, count_over_time, topK"]
             BINARY["Binary metric ops<br/>sum(rate) / sum(rate)"]
             VECM["Vector matching<br/>on/ignoring, group_left/right"]
-            SUBQ["Subquery expansion"]
         end
         subgraph StreamP["Stream Processing"]
             STREAM["VL → Loki streams<br/>label shaping, dedup, sorting"]
@@ -63,11 +62,12 @@ flowchart TD
             PATTERN["Pattern mining<br/>Drain-like clustering<br/>autodetect from queries"]
             PATSNAP["Pattern persistence<br/>disk snapshot + peer sync<br/>cross-window merge"]
             DRILLDOWN["Drilldown metadata<br/>detected labels, field values<br/>service_name synthesis"]
-            VOLUME["Volume / index stats<br/>hits estimation"]
+            VOLUME["Volume / index stats<br/>sum_len bytes, hits estimation"]
         end
     end
 
-    subgraph CacheTiers["Cache Tiers (L1 / L2 / L3)"]
+    subgraph CacheTiers["Cache Tiers (L0 / L1 / L2 / L3)"]
+        L0["L0 hot-key index<br/>bounded hotness sidecar<br/>drives peer read-ahead (not a lookup tier)"]
         L1["L1 in-memory<br/>sync.Map + atomic counters"]
         L2["L2 disk (bbolt)<br/>gzip, survives restarts"]
         L3["L3 peer cache<br/>consistent hash ring<br/>zstd, write-through"]
@@ -102,7 +102,7 @@ flowchart TD
     end
 
     subgraph Obs["Observability"]
-        PROM["100+ Prometheus metrics<br/>per-endpoint, per-tenant,<br/>per-client, cache, windowing"]
+        PROM["100+ Prometheus metrics<br/>per-endpoint, per-tenant,<br/>per-client, cache, windowing<br/>/metrics opt-in"]
         OTLP["OTLP metrics push<br/>lightweight JSON, no SDK"]
         QT["Query tracker<br/>top-N freq, top-N latency,<br/>recent errors"]
         LOGS["Structured JSON logs<br/>route-aware, semconv"]
@@ -111,8 +111,8 @@ flowchart TD
     subgraph Infra["Infrastructure"]
         HEALTH["Health / ready / alive probes<br/>VL health + CB state"]
         BUILD["buildinfo version gate"]
-        ADMIN["Admin endpoints<br/>pprof, cache flush,<br/>query analytics"]
-        PEERE["Peer endpoints<br/>/_cache/* (get/set/hot/has/peers)"]
+        ADMIN["Admin endpoints<br/>pprof, cache flush (?peers=1 ring purge),<br/>query analytics<br/>loopback :3101 unless admin token set"]
+        PEERE["Peer endpoints<br/>/_cache/* (get/set/hot/has/peers/purge)<br/>shared X-Peer-Token"]
         CONNR["Connection rotation<br/>max-age, jitter, overload shed"]
     end
 
@@ -135,6 +135,8 @@ flowchart TD
     L2 -->|miss| L3
     WARM --> L1
     WARM --> L3
+    L1 -. key hotness .-> L0
+    L0 -. hot read-ahead .-> L3
 
     L3 -->|miss| COLD
     COLD -->|hot| HOT --> CB --> VL
@@ -199,14 +201,19 @@ flowchart TD
 | Layer | Purpose | Default Config |
 |---|---|---|
 | Tenant validation | Enforce Loki-style tenant header policy and mapping rules before backend access | Enabled on tenant-scoped routes |
-| Per-client rate limiter | Prevent individual client abuse | Built-in default `50 req/s`, burst `100` |
-| Global concurrent limit | Cap total backend load | Built-in default `100` concurrent backend queries |
+| Per-client rate limiter | Prevent individual client abuse | `-rate-limit-per-second=50`, `-rate-limit-burst=100` |
+| Global concurrent limit | Cap in-flight requests and backend operations (including fanout, until response bodies are consumed) | `-max-concurrent=100` (Helm chart default `64`) |
 | Request coalescing | Deduplicate identical queries | Automatic (singleflight) |
 | Query normalization | Improve cache hit rate | Sort matchers, collapse whitespace |
 | Tier0 response cache | Short-circuit repeated safe GET reads after tenant validation | Enabled, 10% of L1 memory budget, safe GET read endpoints only |
 | Tiered cache | Reduce backend calls with local, disk, and peer reuse | L1 memory, optional L2 disk, optional L3 peer cache |
 | Query-length enforcement | Reject requests whose time range exceeds the configured maximum | `-default-max-query-length=0` (disabled); per-tenant override via limits config; tenant limit takes precedence |
-| Circuit breaker | Protect VL from cascading failure | Built-in default: opens after `5` failures, `10s` backoff |
+| Stats series and concurrency caps | Bound stats responses and parallel `stats_query_range` calls | `-max-stats-query-series=0` (built-in `500`), `-stats-query-range-concurrency=0` (built-in `4`) |
+| Metadata lookback | Bound `/labels`, `/label/{name}/values` and `/series` when the client omits `start`/`end` | `-metadata-default-lookback=12h` |
+| Execution budgets | Reject oversized raw metric scans, binary expressions and `line_format` output with explicit errors instead of partial results | `-manual-range-metric-row-limit=1000000` plus fixed budgets; see [Security hardening migration](security-hardening-migration.md) |
+| Circuit breaker | Protect VL from cascading failure | `-cb-fail-threshold=5` failures within `-cb-window-duration=30s`, `-cb-open-duration=10s` |
+| Backend error redaction | Strip query-like content (selectors, long quoted literals, long hex ids) from VictoriaLogs error bodies and transport errors before logging or returning them | Enabled; disabled only by `-debug-log-raw-queries=true` |
+| Admin and peer exposure | Keep admin/debug routes off the public listener and authenticate peer cache traffic | Admin routes on `-admin-listen=127.0.0.1:3101` unless `-server.admin-auth-token` is set; `/metrics` requires `-server.register-instrumentation=true`; peer cache refuses to start without `-peer-auth-token` unless `-peer-insecure-ip-allowlist=true` |
 | Tail origin allowlist | Reject browser websocket origins unless explicitly trusted | Deny browser origins by default |
 
 ### How Coalescing Works
@@ -227,7 +234,7 @@ flowchart LR
     R --> CN
 ```
 
-Only **1** request reaches VictoriaLogs. All clients get the same response. Coalescing keys include the tenant header to prevent cross-tenant data leaks.
+Only **1** request reaches VictoriaLogs. All clients get the same response. Coalescing and cache keys include a scope fingerprint derived from the resolved tenant routing, backend identity, field mappings and forwarded identity, so requests from different tenants or authorization scopes never share a backend response.
 
 ## Query And Metadata Flow
 
@@ -271,7 +278,7 @@ When `-cold-enabled=true` and `-cold-backend` is set, the proxy time-splits quer
 
 The boundary is configured via `-cold-boundary` (default `168h` = 7 days). The overlap window (`-cold-overlap`, default `1h`) ensures no gaps around the boundary by querying both backends in that zone.
 
-For backward-direction queries spanning both backends, the proxy reads the cold response into memory to reverse it before merging — avoid very large backward time ranges when cold storage is enabled.
+For backward-direction queries spanning both backends, the proxy keeps at most `limit` cold lines (up to 5,000) in a ring buffer to reverse them before merging. Hot and forward-cold responses are buffered up to 64 MiB each; overflow or a read failure returns an error instead of a partial result.
 
 ## Tail Flow
 
@@ -316,6 +323,8 @@ flowchart LR
 | Parsed labels | Fields from `| unpack_json` / `| unpack_logfmt` |
 
 VictoriaLogs treats all fields equally, while Loki 3.x distinguishes stream labels, structured metadata, and parsed labels. In practice, Grafana Explore handles both transparently.
+
+Log query responses group entries into streams the way Loki does: by stream labels plus the labels extracted by `| json` / `| logfmt`. With the `categorize-labels` encoding (and `-emit-structured-metadata`), extracted labels stay out of the stream object and are returned in each entry's `parsed` metadata; a `level` field returned by VictoriaLogs still adds `level` and `detected_level` to the stream labels. Single-request, windowed (`-query-range-windowing`) and `-stream-response` log queries share this stream resolution.
 
 ### Label Translation
 
@@ -364,7 +373,7 @@ flowchart LR
 Typed recursive-descent parser for LogQL. Produces a fully-typed AST (`Expr` interface with concrete node types: `*LogQuery`, `*RangeAggregation`, `*VectorAggregation`, `*BinOpExpr`, `*OpaqueMetricExpr`, …) that drives three subsystems:
 
 - **Validation** — `ValidateLogQL(query)` returns Loki-compatible error strings for invalid queries before any work is done.
-- **Routing** — `proxy.go` type-switches on the parsed AST to dispatch subqueries, binary metric expressions, and stream queries to separate execution paths (more reliable than regex-based marker injection).
+- **Routing** — `proxy.go` type-switches on the parsed AST to dispatch binary metric expressions, range aggregations and stream queries to separate execution paths (more reliable than regex-based marker injection).
 - **Drop/Keep extraction** — `stream_processing.go` extracts `| drop`/`| keep` matchers from the AST for VL response post-processing.
 
 The parser includes a semantic pass for structural constraints (missing `| unwrap` inside `rate_counter`, `__error__` inside `rate()`, malformed `ip()` filters, quantile phi bounds, line-format template validity). All error messages are formatted to match Loki 3.x exactly so Grafana clients receive the expected error shape.
@@ -374,7 +383,7 @@ See [LogQL Parser deep dive](logql-parser.md) for grammar, data flow diagrams, a
 ### Translator (`internal/translator/`)
 LogQL→LogsQL converter. Receives canonical LogQL (produced by `Expr.String()` after AST normalisation). Translation uses two tiers: stable string operations for well-understood paths (stream selectors, line filters, label format) and typed `logsql` builder calls for complex paths (stats aggregations, IP filters).
 
-Typed errors in `internal/translator/errors.go` replace bare `fmt.Errorf` for two failure classes: `ParseError` (invalid LogQL input) and `UnsupportedError` (LogQL constructs with no LogsQL equivalent). Callers can type-assert to distinguish parse failures from unsupported-feature fallbacks.
+Typed errors in `internal/translator/errors.go` replace bare `fmt.Errorf` for two failure classes: `ParseError` (invalid LogQL input) and `UnsupportedError` (LogQL constructs with no LogsQL equivalent). Callers can type-assert to distinguish parse failures from unsupported constructs; the query handlers return both as HTTP 400 with `errorType: bad_data`.
 
 `internal/logql/translate.go` adds a second, typed translation path alongside the string-based translator: `Translate(expr Expr, opts TranslateOptions) (string, error)`. For `*LogQuery` nodes it performs a direct AST-to-AST mapping — stream selector → `logsql.FilterExpr`, pipeline stages → `[]logsql.Pipe` — without a `String()` roundtrip. Metric nodes (`*RangeAggregation`, `*VectorAggregation`, `*BinOpExpr`, `*OpaqueMetricExpr`) return an `errFallthrough` sentinel that routes to the existing string translator unchanged. `TranslateOptions` carries `LabelFn`, `StreamFields`, and `Caps`; the `Caps` field gates VL version-specific features. The proxy's main translation path (`translator.TranslateLogQLWithCapabilities`) is unchanged — `logql.Translate` is wired but not yet called by handlers.
 
@@ -399,7 +408,7 @@ flowchart LR
         T1["Tier 1 — String ops\nstream selectors · line filters\nlabel format · json/logfmt parsers\n(current proxy main path)"]
         T2["Tier 2 — AST-driven\nbuildStatsQuery → logsql.PipeStats\nipv4_range via logsql.Builder"]
         T3["Tier 3 — AST-to-AST (new)\nlogql.Translate(*LogQuery)\nStreamSelector → FilterExpr\n[]Stage → []logsql.Pipe\nLabelFn · Caps gating\n(metric nodes → errFallthrough → T1)"]
-        UNSUP["UnsupportedError → 501"]
+        UNSUP["UnsupportedError → 400 bad_data"]
         RAW["OpaqueMetricExpr\nraw pass-through"]
     end
 
@@ -472,7 +481,7 @@ The `Proxy` struct is decomposed into three explicit types (migration in progres
 | `telemetry.go` | Per-route Prometheus instrumentation, OTLP push, request duration histograms |
 | `time_utils.go` | Timestamp parsing, range normalization, step alignment helpers |
 | `http_utils.go` | HTTP error helpers, response header forwarding, Accept-Encoding negotiation |
-| `subquery.go` | Subquery expansion and execution planning |
+| `metric_eval_limits.go` | Evaluation point/sample bounds and numeric helpers shared by proxy-side metric evaluation |
 | `range_metric_compat.go` | Range metric compatibility shims for Loki 2.x vs 3.x divergences |
 | `vector_matching.go` | Vector matching logic for binary metric operations |
 | `unwrap_convert.go` | `unwrap` expression conversion between LogQL and LogsQL forms |
@@ -480,12 +489,12 @@ The `Proxy` struct is decomposed into three explicit types (migration in progres
 | `safety.go` | Query safety checks: cardinality limits, expression complexity guards |
 
 ### Middleware (`internal/middleware/`)
-- **Rate limiter**: per-client token bucket + global semaphore (current defaults are built in, not user-exposed flags)
+- **Rate limiter**: per-client token bucket + global semaphore (`-rate-limit-per-second`, `-rate-limit-burst`, `-max-concurrent`)
 - **Coalescer**: singleflight-based request deduplication
-- **Circuit breaker**: 3-state (closed/open/half-open) with current built-in defaults
+- **Circuit breaker**: 3-state (closed/open/half-open) with a sliding failure window (`-cb-fail-threshold`, `-cb-window-duration`, `-cb-open-duration`)
 
 ### Cache (`internal/cache/`)
-Three-tier: L1 in-memory (sync.Map + atomic counters), optional L2 on-disk (bbolt with gzip compression), and optional L3 peer cache (consistent hash ring, `zstd`/`gzip` on larger peer transfers). Disk encryption is delegated to cloud provider (EBS, PD, etc.).
+Three lookup tiers: L1 in-memory (sync.Map + atomic counters), optional L2 on-disk (bbolt with gzip compression), and optional L3 peer cache (consistent hash ring, `zstd`/`gzip` on larger peer transfers). L0 is a bounded hot-key index beside L1 that drives peer hot read-ahead; it is reported as `tier="l0"` in cache metrics but is not a lookup tier. `POST /admin/cache/flush` clears L0, L1 and L2 locally; with `?peers=1` it also fans out to every peer's `/_cache/purge`. Disk encryption is delegated to cloud provider (EBS, PD, etc.).
 
 ### Metrics (`internal/metrics/`)
-Prometheus text exposition at `/metrics` plus OTLP push. Route-aware downstream and upstream request metrics, tenant/client breakdowns, cache and windowing metrics, peer-cache state, circuit-breaker state, and prefixed process/runtime health.
+Prometheus text exposition at `/metrics` (served only with `-server.register-instrumentation=true`, optionally on a dedicated `-metrics-listen` address) plus OTLP push. Route-aware downstream and upstream request metrics, tenant/client breakdowns, cache and windowing metrics, peer-cache state, circuit-breaker state, and prefixed process/runtime health.

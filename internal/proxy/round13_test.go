@@ -31,17 +31,20 @@ func newMaestraProxy(t *testing.T, backend string) *Proxy {
 			{VLFields: []string{"kubernetes.pod_labels.app", "kubernetes.pod_labels.app.kubernetes.io/name"}, LokiLabel: "app"},
 			{VLFields: []string{"kubernetes.pod_labels.product", "kubernetes.namespace_labels.product"}, LokiLabel: "product"},
 		},
-		ComputedLabels:      []ComputedLabel{{LokiLabel: "job", Join: []string{"namespace", "app"}, Sep: "/"}},
-		DerivedLevelFields:  []string{"loglevel", "LogLevel", "level", "Level", "severity", "severity_text", "lvl"},
-		DerivedLevelGroupBy: true,
-		MsgFieldAliases:     []string{"message", "Message", "msg", "log"},
-		LineField:           "_msg",
-		LineFilterFields:    []string{"_msg", "Scopes", "Exception", "Category", "State.*"},
+		ComputedLabels:       []ComputedLabel{{LokiLabel: "job", Join: []string{"namespace", "app"}, Sep: "/"}},
+		DerivedLevelFields:   []string{"loglevel", "LogLevel", "level", "Level", "severity", "severity_text", "lvl"},
+		DerivedLevelGroupBy:  true,
+		MsgFieldAliases:      []string{"message", "Message", "msg", "log"},
+		LineField:            "_msg",
+		BytesOverTimeSource:  "record",
+		AlignQueriesWithStep: true,
+		LineFilterFields:     []string{"_msg", "Scopes", "Exception", "Category", "State.*"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	p.maxStatsQuerySeries = 10000
+	p.storeBackendVersion("v1.50.0", "v1.50.0") // stats_query_range offset (v1.45+)
 	return p
 }
 
@@ -207,6 +210,12 @@ func TestRound13_BareRangeIdentity_RawPath(t *testing.T) {
 		fluxRow("2023-11-14T22:13:31Z", "helm-1", "helm-controller", "error"),
 		fluxRow("2023-11-14T22:13:32Z", "src-1", "source-controller", "info"))
 	p := newMaestraProxy(t, vl.URL)
+	// A max_line_size the pushdown cannot carry (a bare stream count skips the
+	// pack_json cost) routes a bare aggregation to the ROW evaluator, which is
+	// the path under test here; the limit is far above every fixture row, so it
+	// selects the path without dropping anything. The same identity on the
+	// bucket path is TestRound13_BareRangeIdentity_NativePath.
+	p.lokiMaxLineSize = 1 << 20
 	rec := queryRange(t, p, `count_over_time({namespace="flux-system"}[1h])`, 1699996500, 1700003600, 900)
 	series := seriesLabels(t, rec.Body.Bytes())
 	if len(series) != 2 {

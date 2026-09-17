@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +25,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sync/errgroup"
 
+	logqlpkg "github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/logsql"
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/translator"
 )
@@ -61,14 +64,65 @@ type queryRangeWindowEntry struct {
 	Key    string // canonicalLabelsKey(Stream), pre-computed to avoid per-entry recomputation
 	Ts     string
 	Msg    string
-	// SM and Parsed are non-nil only when both categorizedLabels and
-	// emitStructuredMetadata are true for the request that produced this entry.
+	// SM and Parsed are kept only when the request emits categorize-labels
+	// metadata (categorizedLabels and emitStructuredMetadata) or has named
+	// regexp captures.
 	SM     map[string]string
 	Parsed map[string]string
 }
 
 type queryRangeWindowCacheEntry struct {
 	Entries []queryRangeWindowEntry
+}
+
+// logQueryShape holds what a log query's LogQL pipeline decides about turning
+// VictoriaLogs rows into Loki stream entries. It is derived once per request
+// and shared by every window fetch, background warm and window cache key.
+type logQueryShape struct {
+	classifyAsParsed bool
+	captureFields    map[string]bool
+	// lineFields are the fields the pipeline writes, left out of rebuilt lines.
+	lineFields     map[string]bool
+	dropConditions []translator.DropCondition
+	keepConditions []translator.DropCondition
+	bareDropFields []string
+	bareKeepFields []string
+	// fingerprint identifies the LogQL pipeline in window cache keys. Cached
+	// fragments hold resolved stream labels, and some stages that change them
+	// (conditional | drop / | keep) emit no LogsQL.
+	fingerprint string
+}
+
+func newLogQueryShape(query string) logQueryShape {
+	lq, err := logqlpkg.ParseLogQuery(query)
+	if err != nil {
+		// Each helper keeps its own fallback for queries the parser rejects.
+		shape := logQueryShape{
+			classifyAsParsed: hasLabelParserStage(query),
+			captureFields:    regexpCaptureFields(query),
+			lineFields:       logQueryLineFields(query),
+			fingerprint:      logQueryShapeFingerprint(query),
+		}
+		shape.dropConditions, shape.keepConditions, shape.bareDropFields, shape.bareKeepFields = extractDropKeepFromAST(query)
+		return shape
+	}
+	stages := make([]string, 0, len(lq.Pipeline))
+	for _, stage := range lq.Pipeline {
+		stages = append(stages, stage.String())
+	}
+	shape := logQueryShape{
+		classifyAsParsed: pipelineHasParserStageOf(lq.Pipeline, true, true),
+		captureFields:    pipelineRegexpCaptureFields(lq.Pipeline),
+		lineFields:       pipelineLineFields(lq.Pipeline),
+		fingerprint:      logQueryShapeFingerprint(strings.Join(stages, "\n")),
+	}
+	shape.dropConditions, shape.keepConditions, shape.bareDropFields, shape.bareKeepFields = dropKeepFromPipeline(lq.Pipeline)
+	return shape
+}
+
+func logQueryShapeFingerprint(pipeline string) string {
+	sum := sha256.Sum256([]byte(pipeline))
+	return hex.EncodeToString(sum[:16])
 }
 
 // snapshotEntriesForPatterns returns a shallow copy of entries with a 2-key
@@ -138,6 +192,7 @@ func (p *Proxy) proxyLogQueryWindowed(w http.ResponseWriter, r *http.Request, lo
 	categorizedLabels := requestWantsCategorizedLabels(r)
 	emitStructuredMetadata := p.shouldEmitStructuredMetadata(r)
 	p.metrics.RecordTupleMode(tupleModeForRequest(categorizedLabels, emitStructuredMetadata))
+	shape := newLogQueryShape(r.FormValue("query"))
 
 	filteredWindows, windowHitEstimate, prefilterErr := p.prefilterQueryRangeWindowsByHits(r.Context(), r, logsqlQuery, windows)
 	if prefilterErr != nil {
@@ -172,7 +227,7 @@ func (p *Proxy) proxyLogQueryWindowed(w http.ResponseWriter, r *http.Request, lo
 		for {
 			batch := windows[i : i+batchSize]
 			limitForBatch := remaining
-			results, err = p.fetchQueryRangeWindowBatch(r, logsqlQuery, queryLimit, batch, limitForBatch, batchSize, categorizedLabels, emitStructuredMetadata)
+			results, err = p.fetchQueryRangeWindowBatch(r, logsqlQuery, queryLimit, batch, limitForBatch, batchSize, shape, categorizedLabels, emitStructuredMetadata)
 			if err == nil {
 				break
 			}
@@ -226,7 +281,7 @@ func (p *Proxy) proxyLogQueryWindowed(w http.ResponseWriter, r *http.Request, lo
 				p.metrics.RecordQueryRangeWindowPartialResponse()
 				w.Header().Set("X-Loki-VL-Partial-Response", "true")
 				if p.queryRangeBackgroundWarm {
-					p.warmQueryRangeWindowsAsync(r.Clone(context.Background()), logsqlQuery, queryLimit, windows[i:], categorizedLabels, emitStructuredMetadata)
+					p.warmQueryRangeWindowsAsync(r.Clone(context.WithoutCancel(r.Context())), logsqlQuery, queryLimit, windows[i:], shape, categorizedLabels, emitStructuredMetadata)
 				}
 				p.log.Warn("query_range returning partial response after retryable batch failure",
 					"error", err,
@@ -234,7 +289,7 @@ func (p *Proxy) proxyLogQueryWindowed(w http.ResponseWriter, r *http.Request, lo
 				)
 				break
 			}
-			status := statusFromQueryRangeWindowErr(err)
+			status := statusFromBackendErr(err)
 			p.log.Warn("query_range windowed fetch failed",
 				"error", err,
 				"window_count", len(windows),
@@ -261,8 +316,8 @@ func (p *Proxy) proxyLogQueryWindowed(w http.ResponseWriter, r *http.Request, lo
 	}
 
 	mergeStart := time.Now()
-	// applyStreamLabelMutations returns desc.translatedLabels as an alias when
-	// no drop/keep change applies, so multiple entries from the same _stream
+	// resolveLogQueryStream returns desc.translatedLabels as an alias when
+	// no drop/keep or extracted-label change applies, so entries from one _stream
 	// share one map (the descriptor cache's). The main thread then calls
 	// applyDerivedFields which WRITES into that map via streamStringMap. If we
 	// hand `collected` to the autodetect goroutine, its read of
@@ -290,7 +345,10 @@ func (p *Proxy) proxyLogQueryWindowed(w http.ResponseWriter, r *http.Request, lo
 		decolorizeStreams(streams)
 	}
 	if tmpl := extractLineFormatTemplate(originalQuery); tmpl != "" {
-		applyLineFormatTemplate(streams, tmpl)
+		if err := applyLineFormatTemplateWithContext(r.Context(), streams, tmpl); err != nil {
+			p.writeError(w, http.StatusBadRequest, err.Error())
+			return true
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -303,6 +361,7 @@ func (p *Proxy) warmQueryRangeWindowsAsync(
 	logsqlQuery string,
 	queryLimit string,
 	windows []queryRangeWindow,
+	shape logQueryShape,
 	categorizedLabels bool,
 	emitStructuredMetadata bool,
 ) {
@@ -315,7 +374,7 @@ func (p *Proxy) warmQueryRangeWindowsAsync(
 	}
 	toWarm := append([]queryRangeWindow(nil), windows[:maxWarm]...)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
 		defer cancel()
 		for _, window := range toWarm {
 			select {
@@ -323,7 +382,7 @@ func (p *Proxy) warmQueryRangeWindowsAsync(
 				return
 			default:
 			}
-			_, _ = p.fetchQueryRangeWindow(ctx, r, logsqlQuery, queryLimit, 1000, window, categorizedLabels, emitStructuredMetadata)
+			_, _ = p.fetchQueryRangeWindow(ctx, r, logsqlQuery, queryLimit, 1000, window, shape, categorizedLabels, emitStructuredMetadata)
 		}
 	}()
 }
@@ -335,6 +394,7 @@ func (p *Proxy) fetchQueryRangeWindowBatch(
 	windows []queryRangeWindow,
 	limitForBatch int,
 	maxParallel int,
+	shape logQueryShape,
 	categorizedLabels bool,
 	emitStructuredMetadata bool,
 ) ([]queryRangeWindowCacheEntry, error) {
@@ -359,6 +419,7 @@ func (p *Proxy) fetchQueryRangeWindowBatch(
 				queryLimit,
 				limitForBatch,
 				window,
+				shape,
 				categorizedLabels,
 				emitStructuredMetadata,
 			)
@@ -384,6 +445,7 @@ func (p *Proxy) fetchQueryRangeWindow(
 	queryLimit string,
 	windowLimit int,
 	window queryRangeWindow,
+	shape logQueryShape,
 	categorizedLabels bool,
 	emitStructuredMetadata bool,
 ) (queryRangeWindowCacheEntry, error) {
@@ -394,7 +456,7 @@ func (p *Proxy) fetchQueryRangeWindow(
 	}
 	defer cancel()
 
-	cacheKey := p.queryRangeWindowCacheKey(r, logsqlQuery, queryLimit, window, categorizedLabels, emitStructuredMetadata)
+	cacheKey := p.queryRangeWindowCacheKey(r, logsqlQuery, queryLimit, window, shape, categorizedLabels, emitStructuredMetadata)
 	if cached, ok := p.cache.Get(cacheKey); ok {
 		if decompressed, err := windowCacheDec.DecodeAll(cached, make([]byte, 0, len(cached)*4)); err == nil {
 			var entry queryRangeWindowCacheEntry
@@ -434,7 +496,7 @@ func (p *Proxy) fetchQueryRangeWindow(
 		if err == nil && resp.StatusCode < 400 {
 			p.breaker.RecordSuccess()
 			p.observeQueryRangeWindowFetch(fetchDuration, false)
-			entries := p.vlLogsToLokiWindowEntriesStream(resp.Body, r.FormValue("query"), categorizedLabels, emitStructuredMetadata)
+			entries := p.vlLogsToLokiWindowEntriesStream(resp.Body, shape, categorizedLabels, emitStructuredMetadata)
 			_ = resp.Body.Close()
 			cacheEntry := queryRangeWindowCacheEntry{Entries: entries}
 			if ttl := p.queryRangeWindowTTL(window.endNs); ttl > 0 {
@@ -455,8 +517,7 @@ func (p *Proxy) fetchQueryRangeWindow(
 		} else {
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
-			msg := p.redactedBackendErrorMessage(resp.StatusCode, errBody)
-			fetchErr = &queryRangeWindowHTTPError{status: resp.StatusCode, msg: msg}
+			fetchErr = p.redactedBackendStatusError("", resp.StatusCode, errBody)
 		}
 		lastFetchErr = fetchErr
 
@@ -482,8 +543,10 @@ func (p *Proxy) fetchQueryRangeWindow(
 	}
 
 	// Record exactly one circuit-breaker outcome for the entire window fetch attempt.
-	// Transport failures (connection refused, EOF) count; HTTP errors do not.
-	if shouldRecordBreakerFailure(lastFetchErr) {
+	// Transport failures (connection refused, EOF) count; HTTP errors do not, and
+	// neither does a fetch aborted by its own context (a failing sibling window
+	// cancels the batch errgroup, which must not count as N backend failures).
+	if shouldRecordBreakerFailure(fetchCtx, lastFetchErr) {
 		p.breaker.RecordFailure()
 	}
 	return queryRangeWindowCacheEntry{}, lastFetchErr
@@ -585,8 +648,7 @@ func (p *Proxy) queryRangeWindowHitEstimate(
 			return hitEstimate, nil
 		}
 		if err == nil {
-			msg := p.redactedBackendErrorMessage(status, body)
-			err = &queryRangeWindowHTTPError{status: status, msg: msg}
+			err = p.redactedBackendStatusError("", status, body)
 		}
 		if attempt >= queryRangePrefilterAttempts || !shouldRetryQueryRangeWindow(err) {
 			return 0, err
@@ -671,19 +733,6 @@ func queryRangePrefilterQuery(logsqlQuery string) string {
 	return query
 }
 
-type queryRangeWindowHTTPError struct {
-	status int
-	msg    string
-}
-
-func (e *queryRangeWindowHTTPError) Error() string {
-	return e.msg
-}
-
-func (e *queryRangeWindowHTTPError) StatusCode() int {
-	return e.status
-}
-
 func shouldRetryQueryRangeWindow(err error) bool {
 	if err == nil {
 		return false
@@ -720,14 +769,6 @@ func shouldRetryQueryRangeWindow(err error) bool {
 		strings.Contains(lower, "temporarily unavailable")
 }
 
-func statusFromQueryRangeWindowErr(err error) int {
-	var httpErr interface{ StatusCode() int }
-	if errors.As(err, &httpErr) {
-		return httpErr.StatusCode()
-	}
-	return statusFromUpstreamErr(err)
-}
-
 func queryRangeWindowRetryBackoff(attempt int) time.Duration {
 	if attempt < 1 {
 		attempt = 1
@@ -752,12 +793,14 @@ func (p *Proxy) queryRangeWindowCacheKey(
 	logsqlQuery string,
 	queryLimit string,
 	window queryRangeWindow,
+	shape logQueryShape,
 	categorizedLabels bool,
 	emitStructuredMetadata bool,
 ) string {
 	parts := []string{
 		"query_range_window",
 		r.Header.Get("X-Scope-OrgID"),
+		logLineCacheKeyVersion,
 		logsqlQuery,
 		r.FormValue("direction"),
 		queryLimit,
@@ -765,6 +808,9 @@ func (p *Proxy) queryRangeWindowCacheKey(
 		strconv.FormatInt(window.endNs, 10),
 		strconv.FormatBool(categorizedLabels),
 		strconv.FormatBool(emitStructuredMetadata),
+		// Fragments store resolved stream labels, which depend on the whole
+		// LogQL pipeline and not only on the translated LogsQL.
+		"shape=" + shape.fingerprint,
 	}
 	if fp := p.fingerprintFromCtx(r.Context(), r); fp != "" {
 		parts = append(parts, "auth:"+fp)
@@ -777,7 +823,7 @@ func (p *Proxy) queryRangeWindowCacheKey(
 // Hot-path callers should use vlLogsToLokiWindowEntriesStream to avoid the
 // io.ReadAll allocation entirely.
 func (p *Proxy) vlLogsToLokiWindowEntries(body []byte, originalQuery string, categorizedLabels bool, emitStructuredMetadata bool) []queryRangeWindowEntry {
-	return p.vlLogsToLokiWindowEntriesStream(bytes.NewReader(body), originalQuery, categorizedLabels, emitStructuredMetadata)
+	return p.vlLogsToLokiWindowEntriesStream(bytes.NewReader(body), newLogQueryShape(originalQuery), categorizedLabels, emitStructuredMetadata)
 }
 
 // vlLogsToLokiWindowEntriesStream streams a VL NDJSON response line-by-line,
@@ -785,7 +831,7 @@ func (p *Proxy) vlLogsToLokiWindowEntries(body []byte, originalQuery string, cat
 // Uses fastjson (no map[string]interface{} allocation per line) and the same
 // stream descriptor cache as vlReaderToLokiStreams to amortize label parsing
 // and translation across entries from the same stream.
-func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery string, categorizedLabels bool, emitStructuredMetadata bool) []queryRangeWindowEntry {
+func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, shape logQueryShape, categorizedLabels bool, emitStructuredMetadata bool) []queryRangeWindowEntry {
 	entries := make([]queryRangeWindowEntry, 0, 64)
 	exposureCache := make(map[string][]metadataFieldExposure, 16)
 	streamDescriptorCache := make(map[string]cachedLogQueryStreamDescriptor, 16)
@@ -803,11 +849,16 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 		metadataMapPool.Put(pfBuf)
 	}()
 
-	skipLogLineReconstruction := hasTextExtractionParser(originalQuery)
-	classifyAsParsed := hasParserStage(originalQuery, "json") || hasParserStage(originalQuery, "logfmt")
-	forceParsedFields := namedCaptureFields(originalQuery)
-	needsClassification := categorizedLabels && emitStructuredMetadata
-	dropConditions, keepConditions, bareDropFields, bareKeepFields := extractDropKeepFromAST(originalQuery)
+	classifyAsParsed := shape.classifyAsParsed
+	mergeParsed := mergesParsedStreamLabels(classifyAsParsed, categorizedLabels, emitStructuredMetadata)
+	captureFields := shape.captureFields
+	emitTupleMetadata := categorizedLabels && emitStructuredMetadata
+	// Entries keep SM/Parsed only when the tuple metadata is emitted or regexp
+	// captures need them; parser labels are otherwise folded into the stream.
+	keepEntryMetadata := emitTupleMetadata || len(captureFields) > 0
+	needsClassification := keepEntryMetadata || mergeParsed
+	dropConditions, keepConditions := shape.dropConditions, shape.keepConditions
+	bareDropFields, bareKeepFields := shape.bareDropFields, shape.bareKeepFields
 	labelMutations := streamLabelMutations{dropConditions, keepConditions, bareDropFields, bareKeepFields}
 
 	scanBufPtr := scannerBufPool.Get().(*[]byte)
@@ -853,20 +904,17 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 			vlFJParserPool.Put(fjParser)
 			continue
 		}
-		msg := string(fjVal.GetStringBytes("_msg"))
-		// Level detection must read the ORIGINAL message: after reconstruction msg is
-		// the whole VL record as JSON, where a pod label containing "warn" would be
-		// mistaken for a level.
-		rawMsg := msg
+		// Level detection reads the stored message, not the (possibly rebuilt) line.
+		rawMsg := string(fjVal.GetStringBytes("_msg"))
 		desc := p.logQueryStreamDescriptorBytes(
 			fjVal.GetStringBytes("_stream"),
 			fjVal.GetStringBytes("level"),
 			streamLabelCache, streamDescriptorCache,
 		)
+		msg := storedLogLineFromFJ(fjVal, desc.streamLabels, shape.lineFields, p.defaultMsgValue())
 
-		needsObject := needsClassification || !skipLogLineReconstruction
 		var fjObj *fj.Object
-		if needsObject {
+		if needsClassification {
 			obj, fjErr := fjVal.Object()
 			if fjErr != nil {
 				vlFJParserPool.Put(fjParser)
@@ -875,68 +923,39 @@ func (p *Proxy) vlLogsToLokiWindowEntriesStream(r io.Reader, originalQuery strin
 			fjObj = obj
 		}
 
-		if fjObj != nil && !p.lineFieldSkip(msg, skipLogLineReconstruction) {
-			msg = reconstructLogLineWithFlagFJ(msg, fjObj, desc.rawLabels, false)
-		}
-
-		var sm, parsed map[string]string
+		var structuredMetadata, parsedFields map[string]string
 		if needsClassification {
-			structuredMetadata, parsedFields := p.classifyEntryMetadataFieldsFJ(fjObj, desc.rawLabels, classifyAsParsed, exposureCache, smBuf, pfBuf, forceParsedFields)
-			sm = metadataFieldMap(structuredMetadata)
-			parsed = metadataFieldMap(parsedFields)
+			structuredMetadata, parsedFields = p.classifyEntryMetadataFieldsFJ(fjObj, desc.rawLabels, classifyAsParsed, exposureCache, smBuf, pfBuf)
+			parsedFields = promoteRegexpCaptureFields(captureFields, structuredMetadata, parsedFields)
 			if len(dropConditions) > 0 {
-				applyDropConditions(dropConditions, sm, parsed)
+				applyDropConditions(dropConditions, structuredMetadata, parsedFields)
 			}
 			if len(keepConditions) > 0 {
-				applyKeepConditions(keepConditions, sm, parsed)
+				applyKeepConditions(keepConditions, structuredMetadata, parsedFields)
 			}
 		}
 
-		streamKey, streamLabels := applyStreamLabelMutations(
-			desc, dropConditions, keepConditions, bareDropFields, bareKeepFields, p.labelTranslator,
+		streamKey, streamLabels := resolveLogQueryStream(
+			desc, dropConditions, keepConditions, bareDropFields, bareKeepFields,
+			parsedFields, mergeParsed, captureFields, p.labelTranslator,
 		)
 		streamKey, streamLabels = p.withPromotedLabels(streamKey, streamLabels, rawMsg, desc.rawLabels, fjVal, labelMutations)
 
-		entries = append(entries, queryRangeWindowEntry{
+		entry := queryRangeWindowEntry{
 			Stream: streamLabels,
 			Key:    streamKey,
 			Ts:     tsNanos,
 			Msg:    msg,
-			SM:     sm,
-			Parsed: parsed,
-		})
+		}
+		if keepEntryMetadata {
+			// smBuf/pfBuf are reused per line: copy before the next classify call.
+			entry.SM = metadataFieldMap(structuredMetadata)
+			entry.Parsed = metadataFieldMap(parsedFields)
+		}
+		entries = append(entries, entry)
 		vlFJParserPool.Put(fjParser)
 	}
 	return entries
-}
-
-func applyStreamLabelMutations(
-	desc cachedLogQueryStreamDescriptor,
-	dropConditions, keepConditions []translator.DropCondition,
-	bareDropFields, bareKeepFields []string,
-	lt *LabelTranslator,
-) (string, map[string]string) {
-	streamKey := desc.translatedKey
-	streamLabels := desc.translatedLabels
-	if len(dropConditions) > 0 {
-		if newKey, newLabels, changed := applyDropConditionsToStreamLabels(dropConditions, desc.rawLabels, streamLabels, lt); changed {
-			streamKey = newKey
-			streamLabels = newLabels
-		}
-	}
-	if len(keepConditions) > 0 {
-		if newKey, newLabels, changed := applyKeepConditionsToStreamLabels(keepConditions, desc.rawLabels, streamLabels, lt); changed {
-			streamKey = newKey
-			streamLabels = newLabels
-		}
-	}
-	if len(bareDropFields) > 0 || len(bareKeepFields) > 0 {
-		if newKey, newLabels, changed := applyBareFieldMutationToStreamLabels(bareDropFields, bareKeepFields, desc.rawLabels, streamLabels, lt); changed {
-			streamKey = newKey
-			streamLabels = newLabels
-		}
-	}
-	return streamKey, streamLabels
 }
 
 func groupQueryRangeWindowEntries(entries []queryRangeWindowEntry, direction string, emitSM, categorizedLabels bool) []map[string]interface{} {
@@ -979,6 +998,10 @@ func groupQueryRangeWindowEntries(entries []queryRangeWindowEntry, direction str
 		sort.SliceStable(stream.entries, func(i, j int) bool {
 			ti := stream.entries[i].Ts
 			tj := stream.entries[j].Ts
+			if ti == tj {
+				// Same tie-break as vlReaderToLokiStreams for identical timestamps.
+				return stream.entries[i].Msg < stream.entries[j].Msg
+			}
 			if forward {
 				return ti < tj
 			}

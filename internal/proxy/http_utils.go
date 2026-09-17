@@ -25,12 +25,12 @@ import (
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
 	"github.com/ReliablyObserve/Loki-VL-proxy/internal/metrics"
 	mw "github.com/ReliablyObserve/Loki-VL-proxy/internal/middleware"
+	"github.com/ReliablyObserve/Loki-VL-proxy/internal/translator"
 	"github.com/klauspost/compress/zstd"
-	fj "github.com/valyala/fastjson"
 )
 
-// jsonBuilderPool recycles strings.Builder values used by reconstructLogLine to
-// avoid per-entry heap allocations when building the flat JSON log body.
+// jsonBuilderPool recycles strings.Builder values used to build JSON bodies
+// without per-call heap allocations.
 var jsonBuilderPool = sync.Pool{New: func() interface{} { return new(strings.Builder) }}
 
 // gzipReaderPool reuses gzip decompression readers across VL responses to avoid
@@ -67,13 +67,13 @@ var (
 // validateQuery checks query string length and returns a sanitized version.
 // It also rewrites queries that Loki accepts but VL would reject (e.g. phi>1).
 func (p *Proxy) validateQuery(w http.ResponseWriter, query string, endpoint string) (string, bool) {
-	if len(query) > maxQueryLength {
-		p.writeError(w, http.StatusBadRequest, fmt.Sprintf("query exceeds max length (%d > %d)", len(query), maxQueryLength))
+	if msg := queryLengthError(query); msg != "" {
+		p.writeError(w, http.StatusBadRequest, msg)
 		p.metrics.RecordRequest(endpoint, http.StatusBadRequest, 0)
 		return "", false
 	}
 	if err := validateLogQLSyntax(query); err != "" {
-		p.writeError(w, http.StatusBadRequest, err)
+		p.writeError(w, http.StatusBadRequest, truncateQueryError(err))
 		p.metrics.RecordRequest(endpoint, http.StatusBadRequest, 0)
 		return "", false
 	}
@@ -93,6 +93,11 @@ var quantileOverTimePhiRE = regexp.MustCompile(`\bquantile_over_time\(\s*(-?[\d]
 // unbounded growth from uniquely-parameterized queries.
 const validationCacheMaxSize = 1024
 
+// validationCacheMaxQueryBytes is the longest query whose validation result is
+// cached; longer queries are validated on every request so the cache memory
+// stays bounded by validationCacheMaxSize small entries.
+const validationCacheMaxQueryBytes = 4096
+
 var (
 	validationCache     sync.Map
 	validationCacheSize atomic.Int32
@@ -103,16 +108,25 @@ var (
 // Results are cached by query string to avoid repeated AST allocations for
 // identical queries (the common case in real workloads and benchmarks).
 func validateLogQLSyntax(query string) string {
+	if len(query) > validationCacheMaxQueryBytes {
+		return logql.ValidateLogQL(query)
+	}
 	if v, ok := validationCache.Load(query); ok {
 		return v.(string)
 	}
 	result := logql.ValidateLogQL(query)
+	storeValidationResult(query, result)
+	return result
+}
+
+// storeValidationResult adds a validation result while the cache is below
+// validationCacheMaxSize entries.
+func storeValidationResult(key, result string) {
 	if validationCacheSize.Load() < validationCacheMaxSize {
-		if _, loaded := validationCache.LoadOrStore(query, result); !loaded {
+		if _, loaded := validationCache.LoadOrStore(key, result); !loaded {
 			validationCacheSize.Add(1)
 		}
 	}
-	return result
 }
 
 // rewriteQuantilePhiGT1 replaces phi > 1 in quantile_over_time() with 1.0.
@@ -244,6 +258,13 @@ func (p *Proxy) writeError(w http.ResponseWriter, code int, msg string) {
 }
 
 func statusFromUpstreamErr(err error) int {
+	if isUpstreamQueryRejected(err) {
+		return http.StatusBadRequest
+	}
+	var matchingErr vectorMatchError
+	if errors.As(err, &matchingErr) {
+		return http.StatusInternalServerError
+	}
 	if err == nil {
 		return http.StatusBadGateway
 	}
@@ -278,6 +299,22 @@ func statusFromUpstreamErr(err error) int {
 	return http.StatusBadGateway
 }
 
+// upstreamErrorStatus maps a failed backend call to the status recorded in
+// upstream metrics and logs. A call aborted by its own context is 499 (or 504
+// when the context hit its deadline), whatever error the transport returned,
+// so proxy-side cancellations are not reported as 502 backend failures.
+func upstreamErrorStatus(ctx context.Context, err error) int {
+	if ctx != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if errors.Is(ctxErr, context.DeadlineExceeded) {
+				return http.StatusGatewayTimeout
+			}
+			return 499
+		}
+	}
+	return statusFromUpstreamErr(err)
+}
+
 func isCanceledErr(err error) bool {
 	if err == nil {
 		return false
@@ -289,12 +326,261 @@ func isCanceledErr(err error) bool {
 }
 
 // httpStatusCoder is implemented by errors that carry an upstream HTTP status
-// (e.g. queryRangeWindowHTTPError). An HTTP-level error from VL proves the
+// (e.g. upstreamStatusError). An HTTP-level error from VL proves the
 // backend is reachable and therefore must not trip the circuit breaker.
 type httpStatusCoder interface{ StatusCode() int }
 
-func shouldRecordBreakerFailure(err error) bool {
+// upstreamStatusError is a completed VictoriaLogs HTTP response with an error
+// status. msg is already redacted (redactedBackendStatusError) so it is safe to
+// log and to return to clients; class comes from the raw message.
+type upstreamStatusError struct {
+	status int
+	msg    string
+	class  vlErrorClass
+}
+
+// vlErrorClass tells apart the failures VictoriaLogs reports with the same
+// status: 400 from httpserver.Errorf, 422 from httpserver.SendPrometheusError
+// on stats_query and stats_query_range.
+type vlErrorClass uint8
+
+const (
+	vlErrorUnclassified vlErrorClass = iota
+	// vlErrorQueryRejected: the query or an argument is invalid (Loki: 400).
+	vlErrorQueryRejected
+	// vlErrorResourceLimit: the query parsed but hit a limit or failed while
+	// executing; Loki answers Drilldown limit hits with partial results.
+	vlErrorResourceLimit
+	// vlErrorUnsupportedPath: an older VictoriaLogs lacks the endpoint.
+	vlErrorUnsupportedPath
+)
+
+// vlQueryRejectedPrefixes start VictoriaLogs messages for invalid queries and
+// arguments (source references: VictoriaLogs v1.50.0). They are prefixes
+// because VictoriaLogs writes the message verbatim, and parsing fails before
+// execution, so a user literal echoed later in the text cannot fake one.
+// Backticks are stripped before matching so redacted text classifies the same.
+var vlQueryRejectedPrefixes = []string{
+	// app/vlselect/logsql/logsql.go:117 wraps every LogsQL parser error, e.g.
+	// "unexpected token" (lib/logstorage/pipe.go:130), "unexpected pipe"
+	// (pipe.go:164), "missing ')'" (parser.go:1891), "invalid regexp"
+	// (parser.go:2675), "cannot parse 'pattern'" (pipe_extract.go:244).
+	// VictoriaLogs v1.52.0 moved the query echo in front of the reason; see
+	// stripVLParseEcho, which normalizes that form to this prefix.
+	"cannot parse query arg:",
+	"query arg cannot be empty",          // logsql.go:110
+	"missing 'field' query arg",          // logsql.go:472, 554
+	"'step' must be bigger than zero",    // logsql.go:230, 891
+	"cannot parse duration from the arg", // logsql.go:1837 (step, offset)
+	"cannot parse start=",                // logsql.go:1650
+	"cannot parse end=",                  // logsql.go:1650
+	"cannot parse time=",                 // logsql.go:1650
+}
+
+// vlProxyGapMarkers are parse errors only proxy-built LogsQL can cause: users
+// send LogQL, and the translator alone picks pipes and stats functions. They
+// mean a translation or fast-path gap (for example a stats function
+// VictoriaLogs lacks), not an invalid user query (VictoriaLogs v1.50.0).
+var vlProxyGapMarkers = []string{
+	"unknown stats func", // lib/logstorage/pipe_stats.go:1549, pipe_running_stats.go:461
+	"unexpected pipe ",   // lib/logstorage/pipe.go:164
+}
+
+// vlResourceLimitMarkers occur in VictoriaLogs messages for queries that parsed
+// but exceeded a limit or failed during execution (VictoriaLogs v1.50.0).
+var vlResourceLimitMarkers = []string{
+	// lib/logstorage/pipe_stats.go:1123, pipe_sort.go:478, pipe_sort_topk.go:383,
+	// pipe_top.go:300, pipe_uniq.go:268, pipe_facets.go:355,
+	// pipe_running_stats.go:224, pipe_stream_context.go:638
+	"since it requires more than",
+	"of memory is needed",           // pipe_stream_context.go:181, 335
+	"because they occupy more than", // storage_search.go:427
+	"passed to 'stream_context'",    // pipe_stream_context.go:669, 683
+	// -search.maxQueryDuration / maxQueueDuration / maxConcurrentRequests
+	// (app/vlselect/main.go:237, 268-272), -search.maxQueryLen (logsql.go:113),
+	// -search.maxQueryTimeRange (logsql.go:1577)
+	"-search.max",
+	"cannot execute query [", // logsql.go:194, 302, 1011, 1147: any failure after parsing
+	"cannot obtain ",         // logsql.go:445, 493, 527, 575, 613, 651, 1466
+}
+
+// classifyVLError classifies a raw (unredacted) VictoriaLogs error message.
+func classifyVLError(status int, rawMsg string) vlErrorClass {
+	if status != http.StatusBadRequest && status != http.StatusUnprocessableEntity {
+		return vlErrorUnclassified
+	}
+	msg := strings.TrimSpace(rawMsg)
+	if reason, ok := stripVLParseEcho(msg); ok {
+		msg = "cannot parse query arg:" + reason
+	}
+	msg = strings.ReplaceAll(msg, "`", "")
+	switch {
+	case strings.HasPrefix(msg, "unsupported path requested"): // app/vlselect/main.go:373
+		return vlErrorUnsupportedPath
+	case containsAny(reErrQueryEcho.ReplaceAllString(msg, ""), vlProxyGapMarkers):
+		// Checked on the message without its query echo, so a user literal
+		// quoting a marker cannot change the class.
+		return vlErrorUnclassified
+	case hasAnyPrefix(msg, vlQueryRejectedPrefixes):
+		return vlErrorQueryRejected
+	case containsAny(msg, vlResourceLimitMarkers):
+		return vlErrorResourceLimit
+	}
+	return vlErrorUnclassified
+}
+
+// vlParseEchoPrefixes start VictoriaLogs' parse-error wrapper from v1.52.0:
+// "cannot parse `query` arg [<query>]: <reason>" (app/vlselect/logsql/logsql.go:117).
+// Up to v1.51.1 the query followed the reason as "; query=<query>".
+var vlParseEchoPrefixes = []string{"cannot parse `query` arg [", "cannot parse query arg ["}
+
+// stripVLParseEcho removes the leading query echo of a VictoriaLogs v1.52+
+// parse error and returns the text after it: ": <reason>", with the parser
+// context still attached. ok is false for any other message.
+// The echoed LogsQL can hold "]: " inside quoted literals and the reason can
+// hold "[...]: " ("unexpected token after [fields a]: ..."), so the end of the
+// echo is the first "]: " outside quotes with balanced brackets. When no such
+// end exists the reason is dropped: the whole message may be user text. The
+// scan assumes brackets outside quoted literals are balanced in proxy-built
+// LogsQL; an unbalanced one also drops the reason, which still classifies as a
+// rejected query and never exposes the echo.
+func stripVLParseEcho(msg string) (string, bool) {
+	for _, prefix := range vlParseEchoPrefixes {
+		rest, found := strings.CutPrefix(msg, prefix)
+		if !found {
+			continue
+		}
+		depth := 0
+		var quote byte
+		for i := 0; i < len(rest); i++ {
+			c := rest[i]
+			switch {
+			case quote != 0:
+				if c == '\\' && quote != '`' {
+					i++
+				} else if c == quote {
+					quote = 0
+				}
+			case c == '"' || c == '\'' || c == '`':
+				quote = c
+			case c == '[':
+				depth++
+			case c == ']' && depth > 0:
+				depth--
+			case c == ']' && strings.HasPrefix(rest[i+1:], ": "):
+				return rest[i+1:], true
+			}
+		}
+		return ":", true
+	}
+	return "", false
+}
+
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAny(s string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *upstreamStatusError) Error() string { return e.msg }
+
+func (e *upstreamStatusError) StatusCode() int { return e.status }
+
+// isUpstreamQueryRejected reports whether err is certainly the query's fault, a
+// client mistake Loki answers with 400 bad_data for every client: a VictoriaLogs
+// parse or argument error (vlErrorQueryRejected) or a translator parse error.
+// translator.UnsupportedError is excluded: it marks valid LogQL (for example
+// count_values) that Loki accepts. A rejected query fails on every tenant and
+// every retry, so callers must not retry it, fall back to another backend path,
+// or mask it with a stale answer. VictoriaLogs also answers resource limits and
+// execution failures with 400/422; those, and unrecognised messages, are not
+// rejections and keep the backend-failure handling (fallbacks, stale reads,
+// partial results, per-tenant skipping, 5xx mapping).
+func isUpstreamQueryRejected(err error) bool {
+	var statusErr *upstreamStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.class == vlErrorQueryRejected
+	}
+	var parseErr *translator.ParseError
+	return errors.As(err, &parseErr)
+}
+
+// statusFromBackendErr maps an error for a client: a rejected query is 400, a
+// completed backend response keeps its status, anything else goes through
+// statusFromUpstreamErr.
+func statusFromBackendErr(err error) int {
+	if isUpstreamQueryRejected(err) {
+		return http.StatusBadRequest
+	}
+	var hsc httpStatusCoder
+	if errors.As(err, &hsc) {
+		return hsc.StatusCode()
+	}
+	return statusFromUpstreamErr(err)
+}
+
+// writeBackendError answers a completed VictoriaLogs error response and returns
+// the status written: 400 bad_data for a rejected query (including VL's 422 from
+// stats endpoints), the backend status otherwise.
+func (p *Proxy) writeBackendError(w http.ResponseWriter, status int, body []byte) int {
+	err := p.redactedBackendStatusError("", status, body)
+	code := statusFromBackendErr(err)
+	p.writeError(w, code, err.Error())
+	return code
+}
+
+// writeGrafanaStatsFailure answers a failed stats call for Grafana-sourced
+// traffic: a rejected query is Loki's 400, every other failure keeps the
+// partial-results reply (writeDrilldownPartialFromUpstream).
+func (p *Proxy) writeGrafanaStatsFailure(w http.ResponseWriter, err error) {
+	if isUpstreamQueryRejected(err) {
+		p.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	status := statusFromUpstreamErr(err)
+	var hsc httpStatusCoder
+	if errors.As(err, &hsc) {
+		status = hsc.StatusCode()
+	}
+	p.writeDrilldownPartialFromUpstream(w, status, err.Error())
+}
+
+// badRequestStatusOr returns 400 for a rejected query and fallback otherwise, for
+// call sites that map every other backend failure to one fixed status.
+func badRequestStatusOr(err error, fallback int) int {
+	if isUpstreamQueryRejected(err) {
+		return http.StatusBadRequest
+	}
+	return fallback
+}
+
+// shouldRecordBreakerFailure reports whether a failed backend call is evidence
+// that the backend is unavailable. ctx is the context the call ran with; nil
+// means none is known.
+//
+// A call whose own context is already done was aborted on the proxy side: a
+// client disconnect, a deadline, or an internal cancellation such as an
+// errgroup sibling error or an evaluation budget. None of these say anything
+// about backend health. Go's http.Client reports such a request with
+// context.Cause(ctx), so the error need not wrap context.Canceled and may carry
+// an arbitrary message; checking the context itself is the only reliable test.
+func shouldRecordBreakerFailure(ctx context.Context, err error) bool {
 	if err == nil {
+		return false
+	}
+	if ctx != nil && ctx.Err() != nil {
 		return false
 	}
 	// HTTP responses from VL (even 4xx/5xx) prove the backend is up.
@@ -351,8 +637,32 @@ var (
 	reErrQuoted         = regexp.MustCompile(`"[^"]{12,}"`)
 	reErrSingleQuoted   = regexp.MustCompile(`'[^']{12,}'`)
 	reErrBacktickQuoted = regexp.MustCompile("`[^`]{12,}`")
+	// Short backticked identifiers such as VL's "cannot parse `query` arg" are
+	// unquoted first so they cannot shift backtick pairing and expose the long
+	// literal that follows. At most 11 characters, so anything reErrBacktickQuoted
+	// hides stays hidden.
+	reErrBacktickIdent = regexp.MustCompile("`([A-Za-z_][A-Za-z0-9_.]{0,10})`")
 	// Long hex/id runs (request ids, hashes).
 	reErrLongHex = regexp.MustCompile(`\b[0-9a-fA-F]{16,}\b`)
+	// VictoriaLogs parse errors end with the whole query echoed back
+	// ("; context: [...]; query=...", app/vlselect/logsql/logsql.go:117). Quote
+	// pairing cannot be trusted across that echo, so it is dropped entirely.
+	reErrQueryEcho = regexp.MustCompile(`(?s);\s*(?:context: \[|query=).*$`)
+	// Bracketed echoes of the query or a pipe in execution errors: "cannot execute
+	// query [<LogsQL>]: …", "cannot execute tail query [...]: …" and "the query
+	// [...] cannot be used in live tailing" (app/vlselect/logsql/logsql.go:194,
+	// 302, 678, 733, 738, 1011, 1147), "cannot calculate [<pipe>], since …"
+	// (lib/logstorage/pipe_stats.go:1123 and the other pipe memory limits) and
+	// "cannot load rows for [<LogsQL>] because …" (storage_search.go:427).
+	// The echoed LogsQL can itself contain "]:", "]," or "] because" (a line
+	// filter such as "[ERROR]: "), so the span is greedy: from the first echo
+	// keyword to the LAST "]" followed by a terminator. Over-redacting part of
+	// the reason is safe; the reason after that terminator is kept.
+	reErrBracketEcho = regexp.MustCompile(`(?s)\b(query|calculate|rows for) \[.*\](:|,| because| cannot)`)
+	// Quoted filters in metadata errors: "with filter=%q:" and "with filter %q:"
+	// (logsql.go:445, 493, 527, 575); %q escapes inner quotes, which defeats
+	// the quote pairing of reErrQuoted.
+	reErrFilterEcho = regexp.MustCompile(`filter[= ]"(?:[^"\\]|\\.)*"`)
 )
 
 // redactBackendError extracts a VictoriaLogs error message and strips query-like
@@ -365,10 +675,17 @@ func (p *Proxy) redactBackendError(body []byte) string {
 	if msg == "" || p.debugLogRawQueries {
 		return msg
 	}
+	if reason, ok := stripVLParseEcho(msg); ok {
+		msg = "cannot parse `query` arg […]" + reason
+	}
 	msg = RedactSecrets(msg)
+	msg = reErrQueryEcho.ReplaceAllString(msg, "")
+	msg = reErrBracketEcho.ReplaceAllString(msg, "$1 […]$2")
+	msg = reErrFilterEcho.ReplaceAllString(msg, `filter="…"`)
 	msg = reErrSelector.ReplaceAllString(msg, "{…}")
 	msg = reErrQuoted.ReplaceAllString(msg, `"…"`)
 	msg = reErrSingleQuoted.ReplaceAllString(msg, `'…'`)
+	msg = reErrBacktickIdent.ReplaceAllString(msg, "$1")
 	msg = reErrBacktickQuoted.ReplaceAllString(msg, "`…`")
 	msg = reErrLongHex.ReplaceAllString(msg, "…")
 	if len(msg) > 500 {
@@ -387,10 +704,10 @@ func (p *Proxy) redactedBackendErrorMessage(status int, body []byte) string {
 
 func (p *Proxy) redactedBackendStatusError(prefix string, status int, body []byte) error {
 	msg := p.redactedBackendErrorMessage(status, body)
-	if prefix == "" {
-		return errors.New(msg)
+	if prefix != "" {
+		msg = fmt.Sprintf("%s %d: %s", prefix, status, msg)
 	}
-	return fmt.Errorf("%s %d: %s", prefix, status, msg)
+	return &upstreamStatusError{status: status, msg: msg, class: classifyVLError(status, extractVLErrorMsg(body))}
 }
 
 // lokiErrorType returns the Loki/Prometheus-style errorType for an HTTP status code.
@@ -489,145 +806,6 @@ var trustedProxyForwardHeaders = []string{
 // that should never be exposed in Loki-compatible responses.
 func isVLInternalField(name string) bool {
 	return name == "_time" || name == "_msg" || name == "_stream" || name == "_stream_id"
-}
-
-// reconstructLogLine returns a Loki-compatible log line for a VL entry.
-//
-// streamLabels is the pre-parsed set of stream label keys for this entry (from
-// the caller's logQueryStreamDescriptor cache). Passing them in avoids
-// re-parsing the _stream value and avoids allocating a fresh map per call.
-//
-// When VL auto-parses a JSON log at ingestion time it stores all JSON fields as
-// top-level VL fields while keeping only the _msg value as the log-line string.
-// Loki, by contrast, stores the original raw JSON bytes and returns them as-is.
-// This causes |= text-filter and | json parser mismatches: a user who pushes
-// {"method":"GET","status":401} expects |= "method=GET" to match, but the proxy
-// would return only the _msg string.
-//
-// Detection: if any top-level VL field is neither a VL internal (_time/_msg/…)
-// nor a stream label (from _stream), it was extracted from the original JSON log
-// body at ingestion time → the original log was JSON-formatted.
-//
-// When reconstruction applies, a flat JSON object is returned with _msg and the
-// extra non-stream fields. Stream label fields (app, namespace, pod, …) are
-// excluded because they were part of the Loki stream metadata, not the log line
-// body — matching Loki's native format. Values are always strings because VL
-// does not preserve original JSON types (numbers, booleans become strings).
-//
-// originalQuery is the raw Loki LogQL query string. Reconstruction is skipped
-// when the query contains text-extraction parsers other than | json: the
-// extracted fields in the VL response would come from logfmt/regexp/pattern
-// parsing at query time rather than from JSON ingestion, so wrapping the
-// original text line in JSON would be incorrect.
-func reconstructLogLine(msg string, entry map[string]interface{}, streamLabels map[string]string, originalQuery string) string {
-	return reconstructLogLineWithFlag(msg, entry, streamLabels, hasTextExtractionParser(originalQuery))
-}
-
-// reconstructLogLineWithFlag is the hot-path variant of reconstructLogLine for
-// use in tight per-entry loops where the hasTextExtractionParser result is
-// constant for the entire response and can be precomputed once by the caller.
-//
-// Uses appendJSONStringToBuilder for zero-allocation JSON string escaping and
-// the startLen trick (mirroring reconstructLogLineWithFlagFJ) to avoid a
-// separate hasExtra scan pass over the map.
-func reconstructLogLineWithFlag(msg string, entry map[string]interface{}, streamLabels map[string]string, skipReconstruction bool) string {
-	if skipReconstruction {
-		return msg
-	}
-	// Key-only pre-scan: avoids pool allocation for the common case where all
-	// fields are stream labels or VL internals. Value work happens in the
-	// write loop below, with startLen as a safety net for empty/invalid values.
-	hasExtra := false
-	for key := range entry {
-		if isVLInternalField(key) || key == "_stream_id" || key == "level" {
-			continue
-		}
-		if _, ok := streamLabels[key]; !ok {
-			hasExtra = true
-			break
-		}
-	}
-	if !hasExtra {
-		return msg
-	}
-	b := jsonBuilderPool.Get().(*strings.Builder)
-	b.Reset()
-	// Pre-grow to msg length + overhead so growSlice is not called on typical entries.
-	// Pool reuse means this is free once the builder reaches steady-state capacity.
-	if need := len(msg) + 64; b.Cap() < need {
-		b.Grow(need)
-	}
-	b.WriteString(`{"_msg":`)
-	appendJSONStringToBuilder(b, msg)
-	startLen := b.Len()
-	for key, value := range entry {
-		if isVLInternalField(key) || key == "_stream_id" || key == "level" {
-			continue
-		}
-		if _, ok := streamLabels[key]; ok {
-			continue
-		}
-		sv, ok := stringifyEntryValue(value)
-		if !ok || strings.TrimSpace(sv) == "" {
-			continue
-		}
-		b.WriteByte(',')
-		appendJSONStringToBuilder(b, key)
-		b.WriteByte(':')
-		appendJSONStringToBuilder(b, sv)
-	}
-	if b.Len() == startLen {
-		jsonBuilderPool.Put(b)
-		return msg
-	}
-	b.WriteByte('}')
-	result := b.String()
-	jsonBuilderPool.Put(b)
-	return result
-}
-
-// reconstructLogLineWithFlagFJ is the fastjson variant of reconstructLogLineWithFlag.
-// obj must be the parsed fastjson Object for the current VL NDJSON entry.
-// It avoids map[string]interface{} allocations by visiting fields directly via Object.Visit.
-func reconstructLogLineWithFlagFJ(msg string, obj *fj.Object, streamLabels map[string]string, skipReconstruction bool) string {
-	if skipReconstruction {
-		return msg
-	}
-	b := jsonBuilderPool.Get().(*strings.Builder)
-	b.Reset()
-	// Pre-grow to msg length + overhead so growSlice is not called on typical entries.
-	// Pool reuse means this is free once the builder reaches steady-state capacity.
-	if need := len(msg) + 64; b.Cap() < need {
-		b.Grow(need)
-	}
-	b.WriteString(`{"_msg":`)
-	appendJSONStringToBuilder(b, msg)
-	startLen := b.Len()
-	obj.Visit(func(k []byte, v *fj.Value) {
-		key := string(k)
-		if isVLInternalField(key) || key == "_stream_id" {
-			return
-		}
-		if _, isStreamLabel := streamLabels[key]; isStreamLabel {
-			return
-		}
-		sv, ok := stringifyFJValue(v)
-		if !ok || strings.TrimSpace(sv) == "" {
-			return
-		}
-		b.WriteByte(',')
-		appendJSONStringToBuilder(b, key)
-		b.WriteByte(':')
-		appendJSONStringToBuilder(b, sv)
-	})
-	if b.Len() == startLen {
-		jsonBuilderPool.Put(b)
-		return msg
-	}
-	b.WriteByte('}')
-	result := b.String()
-	jsonBuilderPool.Put(b)
-	return result
 }
 
 // appendJSONStringToBuilder writes s as a JSON-encoded string into a strings.Builder.
@@ -760,25 +938,8 @@ func (p *Proxy) applyBackendHeaders(vlReq *http.Request) {
 			vlReq.Header[hdrVLAuthUser] = []string{authUser}
 			vlReq.Header[hdrVLAuthSource] = []string{authSource}
 		}
-		if p.metricsTrustProxyHeaders {
-			for _, headerName := range trustedIdentityHeaders {
-				if value := strings.TrimSpace(origReq.Header.Get(headerName)); value != "" {
-					vlReq.Header.Set(headerName, value)
-				}
-			}
-			for _, headerName := range trustedProxyForwardHeaders {
-				if value := strings.TrimSpace(origReq.Header.Get(headerName)); value != "" {
-					vlReq.Header.Set(headerName, value)
-				}
-			}
-		}
-		// Forward configured client headers from the original request
-		if len(p.forwardHeaders) > 0 {
-			for _, hdr := range p.forwardHeaders {
-				if val := origReq.Header.Get(hdr); val != "" {
-					vlReq.Header.Set(hdr, val)
-				}
-			}
+		for name, values := range p.forwardedIdentityHeaders(origReq) {
+			vlReq.Header[name] = values
 		}
 		for _, cookie := range origReq.Cookies() {
 			if p.forwardCookies["*"] || p.forwardCookies[cookie.Name] {
@@ -788,37 +949,27 @@ func (p *Proxy) applyBackendHeaders(vlReq *http.Request) {
 	}
 }
 
-// forwardedAuthFingerprint returns a short hash (16 hex chars) of the
-// per-user auth context forwarded with a request (configured forward headers
-// and cookies). Returns "" when no forwarding is configured, so callers can
-// skip the extra allocation when the cache namespace is already user-agnostic.
+// forwardedAuthFingerprint includes immutable routing and all forwarded identity.
 func (p *Proxy) forwardedAuthFingerprint(r *http.Request) string {
-	if len(p.forwardHeaders) == 0 && len(p.forwardCookies) == 0 {
-		return ""
+	// Use the canonical spelling to avoid allocating a normalized header key.
+	scope := p.scopeFingerprint(r.Context(), r.Header.Get("X-Scope-Orgid"))
+	if len(r.Header) == 0 || (!p.metricsTrustProxyHeaders && len(p.forwardHeaders) == 0 && len(p.forwardCookies) == 0) {
+		return scope
 	}
-	var b strings.Builder
-	for _, hdr := range p.forwardHeaders {
-		if val := r.Header.Get(hdr); val != "" {
-			b.WriteString(hdr)
-			b.WriteByte('=')
-			b.WriteString(val)
-			b.WriteByte(';')
-		}
-	}
+	identity := p.forwardedIdentityHeaders(r)
+	cookies := make([][2]string, 0)
 	for _, cookie := range r.Cookies() {
 		if p.forwardCookies["*"] || p.forwardCookies[cookie.Name] {
-			b.WriteString("cookie:")
-			b.WriteString(cookie.Name)
-			b.WriteByte('=')
-			b.WriteString(cookie.Value)
-			b.WriteByte(';')
+			cookies = append(cookies, [2]string{cookie.Name, cookie.Value})
 		}
 	}
-	if b.Len() == 0 {
-		return ""
+	if len(identity) == 0 && len(cookies) == 0 {
+		return scope
 	}
-	sum := sha256.Sum256([]byte(b.String()))
-	return hex.EncodeToString(sum[:])[:16]
+	// JSON encoding is unambiguous even when header values contain delimiters.
+	data, _ := json.Marshal([]any{scope, identity, cookies})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // injectAuthFingerprint precomputes the forwardedAuthFingerprint for r and

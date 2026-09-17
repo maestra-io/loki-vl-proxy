@@ -70,7 +70,7 @@ func TestStatsRange_WideGroupingKeepsEverySeriesAtRangeEqualsStep(t *testing.T) 
 	target := "/loki/api/v1/query_range?query=" + url.QueryEscape(`sum by (pod) (count_over_time({namespace=~".+"}[1h]))`) +
 		fmt.Sprintf("&start=%d&end=%d&step=%d", start, end, step)
 
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	p.maxStatsQuerySeries = 10000
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, target, nil))
@@ -93,7 +93,7 @@ func TestStatsRange_WideGroupingKeepsEverySeriesAtRangeEqualsStep(t *testing.T) 
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	req.Header.Set("X-Query-Tags", "Source=grafana-lokiexplore-app")
 	rec = httptest.NewRecorder()
-	newGapTestProxy(t, vl.URL).handleQueryRange(rec, req)
+	newSlidingTestProxy(t, vl.URL).handleQueryRange(rec, req)
 	phase1 := false
 	for _, q := range seen() {
 		phase1 = phase1 || strings.Contains(q, "| sort by (_c desc)")
@@ -115,7 +115,7 @@ func TestStatsLabels_EmptyGroupValueIsNoLabel(t *testing.T) {
 		}
 		fmt.Fprint(w, statsMatrixBody([]string{`{"strimzi_io_cluster":""}`, `{"strimzi_io_cluster":"","x":"a"}`}, start, start+step))
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	rec := httptest.NewRecorder()
 	p.handleQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?query="+
 		url.QueryEscape(`sum by (strimzi_io_cluster, x) (count_over_time({a="b"}[1h]))`)+
@@ -131,14 +131,27 @@ func TestStatsLabels_EmptyGroupValueIsNoLabel(t *testing.T) {
 	}
 }
 
-// Round 12 (c), grouping: `sum by (ExceptionDetails_Topic)` after `| json`
-// groups by the dotted VictoriaLogs spelling too, and the response coalesces
-// the pair into the Loki label.
+// Round 12 (c), grouping: `sum by (ExceptionDetails_Topic)` after `| json` must
+// answer with the Loki label even though VictoriaLogs stores the field under the
+// dotted spelling.
+//
+// Mechanism under the upstream engine: the ordered-JSON evaluator claims a
+// `| json` metric, and setStatsPushdown refuses to push an underscore-bearing
+// group-by down (unpack_json would group by the dotted field, which no VL
+// group-by can coalesce), so it reads the rows and groups locally — the
+// label-translator resolution happens in the proxy, not in the pushed query.
+// Upstream locks that route in TestOrderedJSONDrilldownKeepsTranslatedFieldGrouping.
+// The outcome is what it always was: ONE series named by the Loki label.
 func TestStatsRange_UnderscoreGroupingAfterParserGroupsByDottedToo(t *testing.T) {
 	const start, end, step = int64(1700000000), int64(1700007200), int64(3600)
-	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, statsMatrixBody([]string{`{"ExceptionDetails_Topic":"","ExceptionDetails.Topic":"orders"}`}, start, start+step))
+	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, r *http.Request, _ string) {
+		if strings.Contains(r.URL.Path, "stats_query") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"status":"success","data":{"resultType":"matrix","result":[]}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, "{\"_time\":\"2023-11-14T22:14:00Z\",\"_msg\":\"{\\\"ExceptionDetails.Topic\\\":\\\"orders\\\"}\",\"_stream\":\"{a=\\\"b\\\"}\",\"a\":\"b\"}\n")
 	})
 	p, err := New(Config{BackendURL: vl.URL, Cache: cache.New(60, 100), LogLevel: "error", LabelStyle: LabelStyleUnderscores})
 	if err != nil {
@@ -151,12 +164,10 @@ func TestStatsRange_UnderscoreGroupingAfterParserGroupsByDottedToo(t *testing.T)
 	if got := metricNames(t, rec.Body.Bytes()); rec.Code != http.StatusOK || len(got) != 1 || got[0] != `{"ExceptionDetails_Topic":"orders"}` {
 		t.Fatalf("HTTP %d metrics %v (%.300s)", rec.Code, got, rec.Body.String())
 	}
-	grouped := false
 	for _, q := range seen() {
-		grouped = grouped || strings.Contains(q, "stats by (ExceptionDetails_Topic, `ExceptionDetails.Topic`)")
-	}
-	if !grouped {
-		t.Fatalf("dotted grouping missing: %v", seen())
+		if strings.Contains(q, "stats by (ExceptionDetails_Topic)") {
+			t.Fatalf("an underscore group-by must not be pushed down alone — VictoriaLogs stores the dotted field: %v", seen())
+		}
 	}
 
 	// The manual (raw-row) instant path groups by the same field: a row VL
@@ -232,7 +243,7 @@ func TestInstant_EmptyAggregateIsEmptyVector(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"count(*)"},"value":[1700007200,%q]}]}}`, value)
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 	run := func(logql string) string {
 		rec := httptest.NewRecorder()
 		p.handleQuery(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query="+url.QueryEscape(logql)+"&time=1700007200", nil))
@@ -279,7 +290,7 @@ func TestOffset_ReportsAtClientTimestamps(t *testing.T) {
 		}
 		fmt.Fprint(w, statsMatrixBody([]string{`{}`}, start-2*step, start-step, start, start+step))
 	})
-	p := newGapTestProxy(t, vl.URL)
+	p := newSlidingTestProxy(t, vl.URL)
 
 	timestamps := func(logql string, s, e int64) []int64 {
 		rec := httptest.NewRecorder()
@@ -351,8 +362,8 @@ func TestBareRangeOverTemplate_IdentityIsWhatLokiProduces(t *testing.T) {
 			fmt.Fprintf(w, `{"_time":"2023-11-14T22:13:%02dZ","_msg":"response sent duration_ms=%d","Message":"response sent duration_ms=%d","Category":"c%d","kubernetes.pod_labels.tier":"t","_stream":"{app=\"a\"}","app":"a"}`+"\n", 30+i, v, v, i)
 		}
 	})
-	p := newGapTestProxy(t, vl.URL)
-	q := `quantile_over_time(0.5, {app="a"} | json message="message" | line_format "{{ or .message __line__ }}" | drop message | regexp "duration_ms=(?P<duration_ms>\d+)" | unwrap duration_ms [1m])`
+	p := newSlidingTestProxy(t, vl.URL)
+	q := `quantile_over_time(0.5, {app="a"} | json message="message" | line_format "{{ or .message __line__ }}" | drop message | regexp "duration_ms=(?P<duration_ms>\\d+)" | unwrap duration_ms [1m])`
 	for _, tc := range []struct{ logql, want string }{
 		{q, `{"metric":{"app":"a"},"value":[1700000060,"20"]}`},
 		{"max(" + q + ")", `{"metric":{},"value":[1700000060,"20"]}`},
@@ -366,7 +377,7 @@ func TestBareRangeOverTemplate_IdentityIsWhatLokiProduces(t *testing.T) {
 	// A broad parser keeps the body fields, as Loki's `| json` would.
 	rec := httptest.NewRecorder()
 	p.handleQuery(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query="+
-		url.QueryEscape(`quantile_over_time(0.5, {app="a"} | json | line_format "{{ or .message __line__ }}" | regexp "duration_ms=(?P<duration_ms>\d+)" | unwrap duration_ms [1m])`)+"&time=1700000060", nil))
+		url.QueryEscape(`quantile_over_time(0.5, {app="a"} | json | line_format "{{ or .message __line__ }}" | regexp "duration_ms=(?P<duration_ms>\\d+)" | unwrap duration_ms [1m])`)+"&time=1700000060", nil))
 	if rec.Code != http.StatusOK || countLokiVectorSeries(rec.Body.Bytes()) != 3 {
 		t.Fatalf("broad parser: HTTP %d %s", rec.Code, rec.Body.String())
 	}

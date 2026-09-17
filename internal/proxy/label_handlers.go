@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -8,6 +9,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	logqlpkg "github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
 )
 
 // handleLabels returns label names.
@@ -29,7 +33,7 @@ func (p *Proxy) handleLabels(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(cached)
 		p.metrics.RecordRequest("labels", http.StatusOK, time.Since(start))
 		p.metrics.RecordCacheHit()
-		if p.shouldRefreshLabelsInBackground(remaining, labelsTTL) {
+		if !metadataListPayloadEmpty(cached) && p.shouldRefreshLabelsInBackground(remaining, labelsTTL) {
 			search := strings.TrimSpace(r.FormValue("search"))
 			if search == "" {
 				search = strings.TrimSpace(r.FormValue("q"))
@@ -39,7 +43,7 @@ func (p *Proxy) handleLabels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.metrics.RecordCacheMiss()
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 
 	search := strings.TrimSpace(r.FormValue("search"))
 	if search == "" {
@@ -48,6 +52,11 @@ func (p *Proxy) handleLabels(w http.ResponseWriter, r *http.Request) {
 
 	labels, err := p.fetchScopedLabelNames(r.Context(), r.FormValue("query"), r.FormValue("start"), r.FormValue("end"), search, true)
 	if err != nil {
+		// Last known-good full-range answer, if any; otherwise the error, never a
+		// capped partial list.
+		if p.serveStaleReadCacheOnError(w, "labels", cacheKey, start, err) {
+			return
+		}
 		status := statusFromUpstreamErr(err)
 		p.writeError(w, status, err.Error())
 		p.metrics.RecordRequest("labels", status, time.Since(start))
@@ -68,18 +77,17 @@ func (p *Proxy) handleLabels(w http.ResponseWriter, r *http.Request) {
 	labels = appendSyntheticLabels(labels)
 	labels = p.appendComputedLabelNames(labels)
 
+	// The fetch above covers the full requested [start, end] range, so this first
+	// response is already complete; no follow-up refresh is needed.
 	result := lokiLabelsResponse(labels)
-	p.mergeLabelsIntoCache("labels", cacheKey, labels, labelsTTL)
+	if len(labels) == 0 {
+		p.setMetadataListCache("labels", cacheKey, result, 0, labelsTTL)
+	} else {
+		p.mergeLabelsIntoCache("labels", cacheKey, labels, labelsTTL)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(result)
 	p.metrics.RecordRequest("labels", http.StatusOK, time.Since(start))
-
-	// The synchronous fetch above caps VL to 1h for fast initial response. If the
-	// user selected a wider range (e.g. 2d, 7d), trigger a background full-range
-	// refresh so subsequent requests return complete historical label data.
-	if rangeExceedsWindow(r.FormValue("start"), r.FormValue("end"), metadataMaxFieldNamesWindow) {
-		p.refreshLabelsCacheAsync(orgID, cacheKey, r.FormValue("query"), r.FormValue("start"), r.FormValue("end"), search, p.snapshotForwardedAuth(r))
-	}
 }
 
 // handleLabelValues returns values for a specific label.
@@ -129,7 +137,7 @@ func (p *Proxy) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(cached)
 		p.metrics.RecordRequest("label_values", http.StatusOK, time.Since(start))
 		p.metrics.RecordCacheHit()
-		if p.shouldRefreshLabelsInBackground(remaining, labelValuesTTL) {
+		if !metadataListPayloadEmpty(cached) && p.shouldRefreshLabelsInBackground(remaining, labelValuesTTL) {
 			p.refreshLabelValuesCacheAsync(
 				orgID,
 				cacheKey,
@@ -145,17 +153,12 @@ func (p *Proxy) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.metrics.RecordCacheMiss()
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 
 	if p.labelValuesBrowseMode(rawQuery) {
-		if indexedValues, ok := p.selectLabelValuesFromIndex(orgID, labelName, search, offset, limit); ok {
+		if indexedValues, ok := p.selectLabelValuesFromIndex(p.scopedIndexOrg(r, orgID), labelName, search, offset, limit); ok {
 			result := lokiLabelsResponse(indexedValues)
-			// Never cache empty results — caching an empty list freezes
-			// Drilldown/Explore label selectors on "No data" for the full
-			// TTL even after backend data appears.
-			if len(indexedValues) > 0 {
-				p.setEndpointReadCacheWithTTL("label_values", cacheKey, result, labelValuesTTL)
-			}
+			p.setMetadataListCache("label_values", cacheKey, result, len(indexedValues), labelValuesTTL)
 			w.Header().Set("Content-Type", "application/json")
 			w.Write(result)
 			p.metrics.RecordRequest("label_values", http.StatusOK, time.Since(start))
@@ -166,23 +169,24 @@ func (p *Proxy) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 	if labelName == "service_name" {
 		values, err := p.serviceNameValues(r.Context(), r.FormValue("query"), r.FormValue("start"), r.FormValue("end"))
 		if err != nil {
+			if p.serveStaleReadCacheOnError(w, "label_values", cacheKey, start, err) {
+				return
+			}
 			status := statusFromUpstreamErr(err)
 			p.writeError(w, status, err.Error())
 			p.metrics.RecordRequest("label_values", status, time.Since(start))
 			return
 		}
-		p.updateLabelValuesIndex(orgID, labelName, values)
+		p.updateLabelValuesIndex(p.scopedIndexOrg(r, orgID), labelName, values)
 		if p.labelValuesBrowseMode(rawQuery) {
-			if indexedValues, ok := p.selectLabelValuesFromIndex(orgID, labelName, search, offset, limit); ok {
+			if indexedValues, ok := p.selectLabelValuesFromIndex(p.scopedIndexOrg(r, orgID), labelName, search, offset, limit); ok {
 				values = indexedValues
 			} else {
 				values = selectLabelValuesWindow(values, search, offset, limit)
 			}
 		}
 		result := lokiLabelsResponse(values)
-		if len(values) > 0 {
-			p.setEndpointReadCacheWithTTL("label_values", cacheKey, result, labelValuesTTL)
-		}
+		p.setMetadataListCache("label_values", cacheKey, result, len(values), labelValuesTTL)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(result)
 		p.metrics.RecordRequest("label_values", http.StatusOK, time.Since(start))
@@ -191,15 +195,19 @@ func (p *Proxy) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 
 	values, err := p.fetchScopedLabelValues(r.Context(), labelName, rawQuery, r.FormValue("start"), r.FormValue("end"), r.FormValue("limit"), search)
 	if err != nil {
+		// Last known-good full-range answer, if any; otherwise the error.
+		if p.serveStaleReadCacheOnError(w, "label_values", cacheKey, start, err) {
+			return
+		}
 		status := statusFromUpstreamErr(err)
 		p.writeError(w, status, err.Error())
 		p.metrics.RecordRequest("label_values", status, time.Since(start))
 		return
 	}
 
-	p.updateLabelValuesIndex(orgID, labelName, values)
+	p.updateLabelValuesIndex(p.scopedIndexOrg(r, orgID), labelName, values)
 	if p.labelValuesBrowseMode(rawQuery) {
-		if indexedValues, ok := p.selectLabelValuesFromIndex(orgID, labelName, search, offset, limit); ok {
+		if indexedValues, ok := p.selectLabelValuesFromIndex(p.scopedIndexOrg(r, orgID), labelName, search, offset, limit); ok {
 			values = indexedValues
 		} else {
 			values = selectLabelValuesWindow(values, search, offset, limit)
@@ -209,12 +217,65 @@ func (p *Proxy) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := lokiLabelsResponse(values)
-	if len(values) > 0 {
-		p.setEndpointReadCacheWithTTL("label_values", cacheKey, result, labelValuesTTL)
-	}
+	p.setMetadataListCache("label_values", cacheKey, result, len(values), labelValuesTTL)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(result)
 	p.metrics.RecordRequest("label_values", http.StatusOK, time.Since(start))
+}
+
+// metadataNegativeCacheTTL is the floor of the TTL for an empty /labels or
+// /label/{name}/values answer (and an empty VictoriaLogs field-name list). It
+// absorbs repeated polling of idle tenants or selectors without data (Grafana
+// autocomplete) without full-range backend scans on every request, while data
+// that arrives later becomes visible within this TTL. The TTL actually used is
+// effectiveMetadataNegativeTTL.
+const metadataNegativeCacheTTL = 30 * time.Second
+
+// effectiveMetadataNegativeTTL returns max(metadataNegativeCacheTTL, minimums).
+// Callers pass the disk minimum write TTL (-disk-cache-min-ttl) and the peer
+// write-through minimum TTL (-peer-write-through-min-ttl). Both gates are
+// inclusive, so an empty answer with this TTL goes through the same write paths
+// as a non-empty one and overwrites an earlier non-empty copy of the key in
+// memory, on disk and on the owner peer. A shorter TTL would be skipped by those
+// tiers, and their older non-empty copy would be served again once the empty
+// entry expired.
+func effectiveMetadataNegativeTTL(minimums ...time.Duration) time.Duration {
+	ttl := metadataNegativeCacheTTL
+	for _, minimum := range minimums {
+		if minimum > ttl {
+			ttl = minimum
+		}
+	}
+	return ttl
+}
+
+// metadataNegativeTTL returns the TTL for empty label lists derived at
+// construction, or the floor for a Proxy built without New.
+func (p *Proxy) metadataNegativeTTL() time.Duration {
+	if p == nil || p.metadataNegativeCacheTTL <= 0 {
+		return metadataNegativeCacheTTL
+	}
+	return p.metadataNegativeCacheTTL
+}
+
+// setMetadataListCache caches a /labels or /label/{name}/values response body
+// holding n items through the endpoint's normal write path: for ttl when
+// non-empty, for the negative TTL (metadataNegativeTTL) when empty.
+func (p *Proxy) setMetadataListCache(endpoint, cacheKey string, body []byte, n int, ttl time.Duration) {
+	if n == 0 {
+		ttl = p.metadataNegativeTTL()
+	}
+	p.setEndpointReadCacheWithTTL(endpoint, cacheKey, body, ttl)
+}
+
+// metadataListPayloadEmpty reports whether a Loki label-list body carries no
+// items ({"data":[]} or {"data":null}). Such negative entries are short-lived
+// and are never refreshed in the background.
+func metadataListPayloadEmpty(body []byte) bool {
+	if len(body) > 64 {
+		return false
+	}
+	return bytes.Contains(body, []byte(`"data":[]`)) || bytes.Contains(body, []byte(`"data":null`))
 }
 
 // handleSeries returns stream/series metadata.
@@ -225,14 +286,18 @@ func (p *Proxy) handleSeries(w http.ResponseWriter, r *http.Request) {
 	if p.handleMultiTenantFanout(w, r, "series") {
 		return
 	}
-	r = withOrgID(r)
-	matchQueries := r.Form["match[]"]
+	r = p.withRequestScope(r)
+	// Loki reads both match and match[] (loghttp.ParseSeriesQuery).
+	matchQueries := append(append([]string(nil), r.Form["match[]"]...), r.Form["match"]...)
 	query := "*"
 	if len(matchQueries) > 0 {
 		translated, err := p.translateQueryWithContext(r.Context(), matchQueries[0])
-		if err == nil {
-			query = translated
+		if err != nil {
+			p.writeError(w, http.StatusBadRequest, err.Error())
+			p.metrics.RecordRequest("series", http.StatusBadRequest, time.Since(start))
+			return
 		}
+		query = translated
 	}
 
 	params := url.Values{}
@@ -261,8 +326,8 @@ func (p *Proxy) handleSeries(w http.ResponseWriter, r *http.Request) {
 
 	// Propagate VL error status
 	if status >= 400 {
-		p.writeError(w, status, p.redactBackendError(body))
-		p.metrics.RecordRequest("series", status, time.Since(start))
+		code := p.writeBackendError(w, status, body)
+		p.metrics.RecordRequest("series", code, time.Since(start))
 		return
 	}
 
@@ -271,9 +336,10 @@ func (p *Proxy) handleSeries(w http.ResponseWriter, r *http.Request) {
 	//
 	// Use fastjson to parse the VL response and write the Loki response directly
 	// to avoid encoding/json reflection overhead (mapEncoder + sorting per entry).
+	// fjRoot and every value read from it live in fjp's buffers, so the parser
+	// goes back to the pool only after the response has been built.
 	fjp := vlFJParserPool.Get()
 	fjRoot, err := fjp.ParseBytes(body)
-	vlFJParserPool.Put(fjp)
 
 	sb := jsonBuilderPool.Get().(*strings.Builder)
 	sb.Reset()
@@ -324,6 +390,7 @@ func (p *Proxy) handleSeries(w http.ResponseWriter, r *http.Request) {
 		*kp = keys
 		seriesKeysPool.Put(kp)
 	}
+	vlFJParserPool.Put(fjp)
 	sb.WriteString(`]}`)
 	result := sb.String()
 	jsonBuilderPool.Put(sb)
@@ -351,7 +418,7 @@ func (p *Proxy) handleIndexStats(w http.ResponseWriter, r *http.Request) {
 	}
 	p.metrics.RecordCacheMiss()
 
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 	result, err := p.computeIndexStatsResult(r.Context(), r.FormValue("query"), r.FormValue("start"), r.FormValue("end"))
 	if err != nil {
 		if p.serveStaleReadCacheOnError(w, "index_stats", cacheKey, start, err) {
@@ -372,7 +439,10 @@ func (p *Proxy) computeIndexStatsResult(ctx context.Context, query, start, end s
 	if query == "" {
 		query = "*"
 	}
-	logsqlQuery, _ := p.translateQueryWithContext(ctx, query)
+	logsqlQuery, err := p.translateQueryWithContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
 
 	params := url.Values{}
 	params.Set("query", logsqlQuery)
@@ -508,7 +578,7 @@ func (p *Proxy) handleDetectedFields(w http.ResponseWriter, r *http.Request) {
 	}
 	p.metrics.RecordCacheMiss()
 
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 	lineLimit := parseDetectedLineLimit(r)
 	query := r.FormValue("query")
 	// Bound the slow log-scan path so a single Drilldown panel never blocks
@@ -567,7 +637,7 @@ func (p *Proxy) handleDetectedFieldValues(w http.ResponseWriter, r *http.Request
 		return
 	}
 	orgID := r.Header.Get("X-Scope-OrgID")
-	r = withOrgID(r)
+	r = p.withRequestScope(r)
 	// Extract field name from URL: /loki/api/v1/detected_field/{name}/values
 	path := r.URL.Path
 	parts := strings.Split(path, "/")
@@ -691,4 +761,151 @@ func (p *Proxy) appendComputedLabelNames(labels []string) []string {
 	}
 	sort.Strings(labels)
 	return labels
+}
+
+// lokiQueryParamRule describes how Loki v3.7 parses the selector parameter of a
+// read endpoint before doing any work.
+type lokiQueryParamRule int
+
+const (
+	// syntax.ParseMatchers(query, true) when query is set (/labels,
+	// /label/<name>/values, /detected_labels).
+	lokiMatchersOptional lokiQueryParamRule = iota + 1
+	// syntax.ParseMatchers(query, true); a missing query is a parse error
+	// (/index/stats, /patterns).
+	lokiMatchersRequired
+	// Like lokiMatchersRequired, but the literal "{}" means every stream
+	// (seriesvolume.MatchAny on /index/volume and /index/volume_range).
+	lokiVolumeMatchers
+	// Every match[] value is a bare selector; {} selects all series (/series).
+	lokiSeriesMatchers
+	// syntax.ParseLogSelector(query, true) plus pipeline construction; a missing
+	// query is a parse error (/detected_fields, /detected_field/<name>/values).
+	lokiLogSelectorRequired
+	// syntax.ParseExpr(query) before the websocket upgrade (/tail).
+	lokiTailQuery
+)
+
+var lokiQueryParamRules = map[string]lokiQueryParamRule{
+	"labels":                lokiMatchersOptional,
+	"label_values":          lokiMatchersOptional,
+	"detected_labels":       lokiMatchersOptional,
+	"index_stats":           lokiMatchersRequired,
+	"patterns":              lokiMatchersRequired,
+	"volume":                lokiVolumeMatchers,
+	"volume_range":          lokiVolumeMatchers,
+	"series":                lokiSeriesMatchers,
+	"detected_fields":       lokiLogSelectorRequired,
+	"detected_field_values": lokiLogSelectorRequired,
+	"tail":                  lokiTailQuery,
+}
+
+// lokiEmptyQueryError is what Loki's parser reports for a missing query.
+const lokiEmptyQueryError = "parse error : syntax error: unexpected $end"
+
+// cachedSelectorValidation memoizes a deterministic selector validation in the
+// bounded validationCache shared with validateLogQLSyntax. The NUL-delimited
+// kind prefix keeps each validator's results apart from raw query keys. Only
+// short queries are cached (validationCacheMaxQueryBytes), so the cache holds
+// at most validationCacheMaxSize small entries.
+func cachedSelectorValidation(kind, query string, validate func(string) string) string {
+	if len(query) > validationCacheMaxQueryBytes {
+		return validate(query)
+	}
+	key := "\x00" + kind + "\x00" + query
+	if v, ok := validationCache.Load(key); ok {
+		return v.(string)
+	}
+	result := validate(query)
+	storeValidationResult(key, result)
+	return result
+}
+
+// queryLengthError rejects an oversized query before it is parsed or cached:
+// Loki's "input size too long" at or above syntax.maxInputSize, the proxy's
+// maxQueryLength message for anything longer than that limit.
+func queryLengthError(query string) string {
+	if msg := logqlpkg.InputSizeError(query); msg != "" {
+		return msg
+	}
+	if len(query) > maxQueryLength {
+		return fmt.Sprintf("query exceeds max length (%d > %d)", len(query), maxQueryLength)
+	}
+	return ""
+}
+
+// maxEchoedErrorBytes bounds how much of a rejected query a validation error
+// echoes into the response body and the request log.
+const maxEchoedErrorBytes = 2048
+
+// truncateQueryError shortens an error message that embeds query text to
+// maxEchoedErrorBytes, cutting on a UTF-8 boundary.
+func truncateQueryError(msg string) string {
+	if len(msg) <= maxEchoedErrorBytes {
+		return msg
+	}
+	cut := maxEchoedErrorBytes
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + "... (truncated)"
+}
+
+// lokiQueryParamError returns Loki's 400 message for an invalid selector
+// parameter on endpoint, or "" when Loki would accept the request.
+func lokiQueryParamError(rule lokiQueryParamRule, r *http.Request) string {
+	query := r.FormValue("query")
+	if rule == lokiSeriesMatchers {
+		// Loki reads both match and match[] (loghttp.ParseSeriesQuery).
+		groups := append(append([]string(nil), r.Form["match"]...), r.Form["match[]"]...)
+		for _, group := range groups {
+			if msg := queryLengthError(group); msg != "" {
+				return msg
+			}
+		}
+		return logqlpkg.ValidateSeriesMatchers(groups)
+	}
+	if msg := queryLengthError(query); msg != "" {
+		return msg
+	}
+	switch rule {
+	case lokiMatchersOptional:
+		if query == "" {
+			return ""
+		}
+		return cachedSelectorValidation("matchers", query, logqlpkg.ValidateMatchersQuery)
+	case lokiMatchersRequired, lokiVolumeMatchers:
+		if query == "" {
+			return lokiEmptyQueryError
+		}
+		if rule == lokiVolumeMatchers && query == "{}" {
+			return ""
+		}
+		return cachedSelectorValidation("matchers", query, logqlpkg.ValidateMatchersQuery)
+	case lokiLogSelectorRequired:
+		return cachedSelectorValidation("log_selector", query, logqlpkg.ValidateLogSelectorQuery)
+	case lokiTailQuery:
+		return validateLogQLSyntax(query)
+	}
+	return ""
+}
+
+// lokiQueryParamValidation rejects requests whose selector parameter Loki
+// answers with 400 bad_data (a non-selector expression, an empty-compatible
+// selector such as {app=""}, an oversized input or a parse error) before cache
+// lookup, tenant fan-out or any VictoriaLogs call. Endpoints without a rule
+// pass through.
+func (p *Proxy) lokiQueryParamValidation(endpoint string, next http.HandlerFunc) http.HandlerFunc {
+	rule, ok := lokiQueryParamRules[endpoint]
+	if !ok {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if msg := lokiQueryParamError(rule, r); msg != "" {
+			p.writeError(w, http.StatusBadRequest, truncateQueryError(msg))
+			p.metrics.RecordRequest(endpoint, http.StatusBadRequest, 0)
+			return
+		}
+		next(w, r)
+	}
 }

@@ -47,7 +47,7 @@ func (m LabelMatcher) String() string {
 	case MatchNotRe:
 		op = "!~"
 	}
-	return fmt.Sprintf(`%s%s"%s"`, m.Name, op, m.Value)
+	return m.Name + op + strconv.Quote(m.Value)
 }
 
 // StreamSelector is the {label="value",...} part of a log query.
@@ -82,6 +82,7 @@ const (
 type LineFilterStage struct {
 	Op    LineFilterOp
 	Value string
+	IP    bool // Distinguishes ip("address") from the literal "ip(address)".
 	// Or holds the alternatives of LogQL's OR-list form, `|= "a" or "b" or "c"`.
 	// The whole list shares ONE operator: a positive filter keeps a line matching
 	// ANY of them, a negative one drops a line matching any of them.
@@ -115,8 +116,9 @@ func (s *LineFilterStage) String() string {
 	case LineFilterExcludePat:
 		op = "!>"
 	}
-	// The scanner DECODES the literal, so a value carrying a quote or a backslash
-	// must be re-quoted on the way out or the emitted query stops parsing.
+	if s.IP {
+		return op + " ip(" + strconv.Quote(s.Value) + ")"
+	}
 	out := op + " " + strconv.Quote(s.Value)
 	for _, alt := range s.Or {
 		out += " or " + strconv.Quote(alt)
@@ -137,34 +139,32 @@ const (
 	ParserUnpack                    // unpack
 )
 
-// LabelExtraction is one `name="expression"` item of an explicit `| json` /
-// `| logfmt` field list (Loki: `| json status="response.code"`).
-type LabelExtraction struct {
-	Name string
-	Expr string
-}
-
 // ParserStage is a `| json` / `| logfmt` / `| regexp ...` stage.
 type ParserStage struct {
 	Type  ParserType
 	Param string
-	// Params holds the explicit field list, if any. String() deliberately omits
-	// it: the string translator has always seen the bare stage and VictoriaLogs
-	// extracts every field either way. The proxy-side pipeline evaluator uses it
-	// to reproduce Loki's "extract only these" semantics.
-	Params []LabelExtraction
+	// Fields holds the explicit `| json a="expr", b` / `| logfmt ...`
+	// extraction list; nil when the stage extracts every field.
+	Fields []ExtractionField
+}
+
+// ExtractionField is one `name="expression"` (or bare `name`) entry of an
+// explicit json/logfmt extraction list. Expression equals Name for the bare form.
+type ExtractionField struct {
+	Name       string
+	Expression string
 }
 
 func (s *ParserStage) String() string {
 	switch s.Type {
 	case ParserJSON:
-		return "| json"
+		return strings.TrimSpace("| json " + s.Param)
 	case ParserLogfmt:
-		return "| logfmt"
+		return strings.TrimSpace("| logfmt " + s.Param)
 	case ParserRegexp:
-		return fmt.Sprintf("| regexp `%s`", s.Param)
+		return "| regexp " + quoteParserArgument(s.Param)
 	case ParserPattern:
-		return fmt.Sprintf("| pattern `%s`", s.Param)
+		return "| pattern " + quoteParserArgument(s.Param)
 	case ParserUnpack:
 		return "| unpack"
 	}
@@ -172,6 +172,13 @@ func (s *ParserStage) String() string {
 }
 
 func (s *ParserStage) stage() {}
+
+func quoteParserArgument(value string) string {
+	if strconv.CanBackquote(value) {
+		return "`" + value + "`"
+	}
+	return strconv.Quote(value)
+}
 
 // LabelFilterStage is a `| level="error"` stage (raw expression).
 type LabelFilterStage struct {
@@ -192,7 +199,7 @@ type DropMatcher struct {
 }
 
 func (m DropMatcher) String() string {
-	return fmt.Sprintf(`%s%s"%s"`, m.Name, m.Op, m.Value)
+	return m.Name + m.Op + strconv.Quote(m.Value)
 }
 
 // DropStage is a `| drop label1, label2` or `| drop level="debug"` stage.
@@ -256,35 +263,22 @@ type LineFormatStage struct {
 }
 
 func (s *LineFormatStage) String() string {
-	// Re-escape control characters so the output is a valid quoted string
-	// (the scanner decoded \n → newline etc.; we must reverse that here).
-	escaped := strings.NewReplacer(
-		`\`, `\\`,
-		`"`, `\"`,
-		"\n", `\n`,
-		"\t", `\t`,
-	).Replace(s.Template)
-	return `| line_format "` + escaped + `"`
+	return "| line_format " + strconv.Quote(s.Template)
 }
 
 func (s *LineFormatStage) stage() {}
 
-// LabelFormatAssign is one `dst=<template>` or `dst=src` item of a
-// `| label_format` stage. Tmpl is set for a quoted template, Src for a bare
-// label rename (`| label_format new=old`).
-type LabelFormatAssign struct {
-	Dst  string
-	Tmpl string
-	Src  string
+// LabelFormatStage is a `| label_format ...` stage (raw expression).
+type LabelFormatStage struct {
+	Raw     string
+	Formats []LabelFormat
 }
 
-// LabelFormatStage is a `| label_format ...` stage.
-type LabelFormatStage struct {
-	Raw string
-	// Assignments is the structured form of Raw. Raw is kept because the string
-	// translator still consumes it; Assignments survives quoting that Raw's
-	// token re-serialisation cannot represent faithfully.
-	Assignments []LabelFormatAssign
+// LabelFormat is one `dst="template"` or `dst=src` (Rename) label_format entry.
+type LabelFormat struct {
+	Name   string
+	Value  string
+	Rename bool
 }
 
 func (s *LabelFormatStage) String() string {
@@ -318,9 +312,6 @@ type Grouping struct {
 }
 
 func (g *Grouping) String() string {
-	if len(g.Labels) == 0 {
-		return ""
-	}
 	kw := "by"
 	if g.Without {
 		kw = "without"
@@ -349,13 +340,12 @@ const (
 	RangeRateCounter      RangeOp = "rate_counter"
 )
 
-// RangeAggregation is e.g. `rate({app="api"}[5m])` or a subquery
-// `max_over_time(rate({app="api"}[5m])[1h:5m])`.
+// RangeAggregation is e.g. `rate({app="api"}[5m])`. LogQL has no subquery
+// grammar, so Inner is always the (possibly parenthesised) log query.
 type RangeAggregation struct {
 	Op       RangeOp
-	Inner    Expr    // *LogQuery for plain range; any Expr for subquery
-	Range    string  // outer range, e.g. "5m" or "1h"
-	Step     string  // subquery step (e.g. "5m" from [1h:5m]); empty for plain range
+	Inner    Expr    // *LogQuery
+	Range    string  // range, e.g. "5m" or "1h"
 	Offset   string  // optional offset modifier, e.g. "1h" from [5m] offset 1h
 	Param    float64 // for quantile_over_time
 	HasParam bool
@@ -364,9 +354,6 @@ type RangeAggregation struct {
 
 func (r *RangeAggregation) String() string {
 	rangeStr := "[" + r.Range + "]"
-	if r.Step != "" {
-		rangeStr = "[" + r.Range + ":" + r.Step + "]"
-	}
 	if r.Offset != "" {
 		rangeStr += " offset " + r.Offset
 	}
@@ -461,24 +448,28 @@ func (vm *VectorMatching) String() string {
 
 // BinOpExpr is a binary operation between two metric expressions.
 type BinOpExpr struct {
-	Left, Right Expr
-	Op          string
-	// ReturnBool is LogQL's `bool` modifier on a comparison: `> bool 5` scores
-	// every sample 1/0, while a bare `> 5` FILTERS — it keeps the sample's own
-	// value and drops the ones that do not match.
+	Left, Right    Expr
+	Op             string
 	ReturnBool     bool
 	VectorMatching *VectorMatching
 }
 
 func (b *BinOpExpr) String() string {
-	s := b.Left.String() + " " + b.Op
+	left, right := b.Left.String(), b.Right.String()
+	if _, ok := b.Left.(*BinOpExpr); ok {
+		left = "(" + left + ")"
+	}
+	if _, ok := b.Right.(*BinOpExpr); ok {
+		right = "(" + right + ")"
+	}
+	s := left + " " + b.Op
 	if b.ReturnBool {
 		s += " bool"
 	}
 	if vm := b.VectorMatching.String(); vm != "" {
 		s += " " + vm
 	}
-	s += " " + b.Right.String()
+	s += " " + right
 	return s
 }
 

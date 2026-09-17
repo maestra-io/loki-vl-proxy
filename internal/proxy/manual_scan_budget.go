@@ -30,7 +30,6 @@ const (
 	// defaultManualScanSeriesLimit caps DISTINCT series in one scan. Samples are
 	// not the only thing that grows: every new series adds a label map and a
 	// translated copy of it, which a high-cardinality group-by multiplies.
-	defaultManualScanSeriesLimit = 10_000
 )
 
 // manualScanBudget hands out sample slots to concurrent manual scans.

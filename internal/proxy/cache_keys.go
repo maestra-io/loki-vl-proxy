@@ -11,6 +11,39 @@ import (
 	"time"
 )
 
+// labelMetadataCacheKeyVersion versions the cache keys of /labels,
+// /label/{name}/values and the label-name inventory. The same key addresses the
+// memory, disk (L2) and peer (L3) tiers and the stale-on-error lookup, so
+// bumping it makes entries written by older binaries unreachable everywhere.
+// "@full-range-v2": older binaries cached answers covering only the most recent
+// minutes (names) or hours (values) of the requested range. '@' cannot appear
+// in a Loki label name or in an encoded query string, so versioned keys never
+// collide with unversioned ones.
+const labelMetadataCacheKeyVersion = "@full-range-v2"
+
+// volumeCacheKeyVersion: older binaries cached volumes as line counts stamped
+// at bucket starts; volumes are now bytes stamped like Loki.
+const volumeCacheKeyVersion = "@bytes-v1"
+
+// logLineCacheKeyVersion versions the cache keys of log query responses and
+// query_range windows, which the disk (L2) and peer (L3) tiers keep for up to
+// a day. "line-v3": older binaries wrapped _msg and the row's other fields into
+// a {"_msg":...} JSON line instead of returning the stored line, or returned
+// VictoriaLogs' missing-message placeholder as the line.
+const logLineCacheKeyVersion = "line-v3"
+
+// readCacheKeyVersion returns the key version segment for endpoint, if any.
+func readCacheKeyVersion(endpoint string) string {
+	switch endpoint {
+	case "labels", "label_values", "label_inventory":
+		return labelMetadataCacheKeyVersion
+	case "volume", "volume_range":
+		return volumeCacheKeyVersion
+	default:
+		return ""
+	}
+}
+
 func endpointForReadCacheKey(cacheKey string) string {
 	switch {
 	case strings.HasPrefix(cacheKey, "labels:"):
@@ -35,14 +68,13 @@ func endpointForReadCacheKey(cacheKey string) string {
 }
 
 func (p *Proxy) canonicalReadCacheKey(endpoint, orgID string, r *http.Request, extraParts ...string) string {
-	// Include the per-user auth fingerprint so requests with different forwarded
-	// credentials land in different cache namespaces.
+
+	var authScope string
 	if r != nil {
-		if fp := p.fingerprintFromCtx(r.Context(), r); fp != "" {
-			extraParts = append(extraParts, "auth:"+fp)
-		}
+		authScope = p.fingerprintFromCtx(r.Context(), r)
 	}
 	if memoKey, ok := buildCanonicalReadCacheMemoKey(endpoint, orgID, r, extraParts); ok && p != nil {
+		memoKey.authScope = authScope
 		p.readCacheKeyMemoMu.RLock()
 		if cached, hit := p.readCacheKeyMemo[memoKey]; hit {
 			p.readCacheKeyMemoMu.RUnlock()
@@ -50,6 +82,9 @@ func (p *Proxy) canonicalReadCacheKey(endpoint, orgID string, r *http.Request, e
 		}
 		p.readCacheKeyMemoMu.RUnlock()
 
+		if authScope != "" {
+			extraParts = append(extraParts, "auth:"+authScope)
+		}
 		computed := computeCanonicalReadCacheKey(endpoint, orgID, r, extraParts...)
 		p.readCacheKeyMemoMu.Lock()
 		if p.readCacheKeyMemo == nil || len(p.readCacheKeyMemo) >= maxReadCacheKeyMemoEntries {
@@ -58,6 +93,9 @@ func (p *Proxy) canonicalReadCacheKey(endpoint, orgID string, r *http.Request, e
 		p.readCacheKeyMemo[memoKey] = computed
 		p.readCacheKeyMemoMu.Unlock()
 		return computed
+	}
+	if authScope != "" {
+		extraParts = append(extraParts, "auth:"+authScope)
 	}
 	return computeCanonicalReadCacheKey(endpoint, orgID, r, extraParts...)
 }
@@ -84,25 +122,17 @@ func computeCanonicalReadCacheKey(endpoint, orgID string, r *http.Request, extra
 	case "detected_fields", "detected_field_values", "detected_labels":
 		params.Set("limit", strconv.Itoa(parseDetectedLineLimit(r)))
 	}
-	if endpoint == "volume" || endpoint == "volume_range" {
-		query := strings.TrimSpace(params.Get("query"))
-		if query == "" {
-			query = "*"
-		}
-		if strings.TrimSpace(params.Get("targetLabels")) == "" {
-			if inferred := inferPrimaryTargetLabel(query); inferred != "" {
-				params.Set("targetLabels", inferred)
-			}
-		}
-		if endpoint == "volume_range" {
-			if step := strings.TrimSpace(params.Get("step")); step != "" {
-				params.Set("step", formatVLStep(step))
-			}
+	if endpoint == "volume_range" {
+		if step := strings.TrimSpace(params.Get("step")); step != "" {
+			params.Set("step", formatVLStep(step))
 		}
 	}
 
-	parts := make([]string, 0, 3+len(extraParts))
+	parts := make([]string, 0, 4+len(extraParts))
 	parts = append(parts, endpoint, orgID)
+	if version := readCacheKeyVersion(endpoint); version != "" {
+		parts = append(parts, version)
+	}
 	for _, part := range extraParts {
 		part = strings.TrimSpace(part)
 		if part == "" {
@@ -278,17 +308,41 @@ func (p *Proxy) staleEndpointCacheEntry(endpoint, cacheKey string) ([]byte, time
 	if p == nil || p.cache == nil || strings.TrimSpace(cacheKey) == "" {
 		return nil, 0, "", false
 	}
+	// An expired empty label list is a negative entry, not a last known-good
+	// answer: skip it so disk (or the error) answers during a backend outage.
+	var usable func([]byte) bool
+	if endpoint == "labels" || endpoint == "label_values" {
+		usable = func(body []byte) bool { return !metadataListPayloadEmpty(body) }
+	}
 	if p.endpointUsesSharedReadCache(endpoint) {
-		return p.cache.GetRecoverableStaleWithTTL(cacheKey)
+		return p.cache.GetRecoverableStaleWithTTLMatching(cacheKey, usable)
 	}
 	body, ttl, ok := p.cache.GetStaleWithTTL(cacheKey)
-	if !ok {
+	if !ok || (usable != nil && !usable(body)) {
 		return nil, 0, "", false
 	}
 	return body, ttl, "l1_memory", true
 }
 
+// staleResponseHeader marks a response served from an expired cache entry after
+// a backend failure. The compatibility-edge cache and the multi-tenant merge
+// cache never store such responses, so the stale answer is not re-served as
+// fresh once the backend recovers.
+const staleResponseHeader = "X-Proxy-Stale-Response"
+
+// markStaleResponse sets staleResponseHeader and, like the Drilldown partial
+// response path, Cache-Control: no-store so HTTP caches in front of the proxy do
+// not keep the stale body either.
+func markStaleResponse(h http.Header) {
+	h.Set(staleResponseHeader, "true")
+	h.Set("Cache-Control", "no-store")
+}
+
 func (p *Proxy) serveStaleReadCacheOnError(w http.ResponseWriter, endpoint, cacheKey string, started time.Time, err error) bool {
+	// A rejected query is not a backend outage: answer it, never mask it.
+	if isUpstreamQueryRejected(err) {
+		return false
+	}
 	body, remaining, tier, ok := p.staleEndpointCacheEntry(endpoint, cacheKey)
 	if !ok || len(body) == 0 {
 		return false
@@ -296,6 +350,7 @@ func (p *Proxy) serveStaleReadCacheOnError(w http.ResponseWriter, endpoint, cach
 	if strings.TrimSpace(w.Header().Get("Content-Type")) == "" {
 		w.Header().Set("Content-Type", "application/json")
 	}
+	markStaleResponse(w.Header())
 	_, _ = w.Write(body)
 	if p.metrics != nil {
 		p.metrics.RecordRequest(endpoint, http.StatusOK, time.Since(started))
@@ -338,9 +393,10 @@ func (p *Proxy) refreshDetectedFieldsCacheAsync(orgID, cacheKey, query, start, e
 				"status": "success",
 				"data":   fields,
 				"fields": fields,
-				"limit":  lineLimit,
+				"limit":  1000, // same constant as handleDetectedFields (Loki always returns 1000)
 			}
-			p.setEndpointJSONCacheWithTTL("detected_fields", cacheKey, CacheTTLs["detected_fields"], payload)
+			// Window-scaled TTL, matching the handler's staleness comparison.
+			p.setEndpointJSONCacheWithTTL("detected_fields", cacheKey, metadataWindowTTL(start, end, CacheTTLs["detected_fields"]), payload)
 			return nil, nil
 		})
 		if err != nil {
@@ -371,7 +427,7 @@ func (p *Proxy) refreshDetectedLabelsCacheAsync(orgID, cacheKey, query, start, e
 				"detectedLabels": labels,
 				"limit":          lineLimit,
 			}
-			p.setEndpointJSONCacheWithTTL("detected_labels", cacheKey, CacheTTLs["detected_labels"], payload)
+			p.setEndpointJSONCacheWithTTL("detected_labels", cacheKey, metadataWindowTTL(start, end, CacheTTLs["detected_labels"]), payload)
 			return nil, nil
 		})
 		if err != nil {
@@ -406,7 +462,7 @@ func (p *Proxy) refreshDetectedFieldValuesCacheAsync(orgID, cacheKey, fieldName,
 				"values": values,
 				"limit":  lineLimit,
 			}
-			p.setEndpointJSONCacheWithTTL("detected_field_values", cacheKey, CacheTTLs["detected_field_values"], payload)
+			p.setEndpointJSONCacheWithTTL("detected_field_values", cacheKey, metadataWindowTTL(start, end, CacheTTLs["detected_field_values"]), payload)
 			return nil, nil
 		})
 		if err != nil {

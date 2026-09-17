@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"text/template/parse"
 	"time"
 	"unicode"
 )
@@ -45,6 +46,14 @@ func (e *UnknownFuncError) Error() string {
 
 func (e *UnknownFuncError) Unwrap() error { return e.Err }
 
+// TemplateBudgetError reports a template the proxy refuses to evaluate because
+// it would blow the per-line formatting budget. Unlike a plain syntax error
+// (which Loki answers 200 + __error__ for) this is fatal: the client gets a 400
+// naming the limit, as it does on every other budget in this proxy.
+type TemplateBudgetError struct{ Msg string }
+
+func (e *TemplateBudgetError) Error() string { return e.Msg }
+
 var unknownFuncRE = regexp.MustCompile(`function "([^"]+)" not defined`)
 
 // ParseTemplate compiles a LogQL template.
@@ -57,8 +66,130 @@ func ParseTemplate(src string) (*Template, error) {
 		}
 		return nil, fmt.Errorf("invalid template %q: %w", src, err)
 	}
+	// A constant printf width is rejected at compile time so the client gets a
+	// 400 naming the limit rather than a per-line __error__ it cannot act on.
+	if err := checkConstantPrintfBudget(tmpl); err != nil {
+		return nil, err
+	}
 	t.tmpl = tmpl
 	return t, nil
+}
+
+// MaxTemplateOutputBytes bounds one template's formatted output. A LogQL
+// template runs once per log line, so an unbounded printf width is a memory
+// amplifier the client controls with a handful of query bytes.
+const MaxTemplateOutputBytes = 64 << 10
+
+// CheckPrintfFormatBudget rejects a printf format whose numeric width or
+// precision would blow the per-line output budget, before fmt allocates for it.
+func CheckPrintfFormatBudget(format string, max int) error {
+	number := 0
+	inDirective := false
+	for _, c := range format {
+		if !inDirective {
+			if c == '%' {
+				inDirective = true
+			}
+			continue
+		}
+		if c == '%' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			inDirective = false
+			number = 0
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			number = number*10 + int(c-'0')
+			if number > max {
+				return &TemplateBudgetError{Msg: "line_format printf width limit exceeded"}
+			}
+		} else {
+			number = 0
+		}
+	}
+	return nil
+}
+
+// boundedPrintf is Loki's `printf` with the width budget applied, so a
+// template built from a runtime value cannot escape it either.
+func boundedPrintf(format string, args ...any) (string, error) {
+	if len(format) > MaxTemplateOutputBytes {
+		return "", &TemplateBudgetError{Msg: "line_format printf limit exceeded"}
+	}
+	if err := CheckPrintfFormatBudget(format, MaxTemplateOutputBytes); err != nil {
+		return "", err
+	}
+	out := fmt.Sprintf(format, args...)
+	if len(out) > MaxTemplateOutputBytes {
+		return "", &TemplateBudgetError{Msg: "line_format printf output limit exceeded"}
+	}
+	return out, nil
+}
+
+// checkConstantPrintfBudget walks the compiled tree and applies the width
+// budget to every `printf` whose format is a string constant.
+func checkConstantPrintfBudget(tmpl *template.Template) error {
+	if tmpl.Tree == nil {
+		return nil
+	}
+	var walkList func(*parse.ListNode) error
+	walkPipe := func(pipe *parse.PipeNode) error {
+		if pipe == nil {
+			return nil
+		}
+		for _, cmd := range pipe.Cmds {
+			if len(cmd.Args) < 2 {
+				continue
+			}
+			ident, ok := cmd.Args[0].(*parse.IdentifierNode)
+			if !ok || ident.Ident != "printf" {
+				continue
+			}
+			str, ok := cmd.Args[1].(*parse.StringNode)
+			if !ok {
+				continue
+			}
+			if len(str.Text) > MaxTemplateOutputBytes {
+				return &TemplateBudgetError{Msg: "line_format printf limit exceeded"}
+			}
+			if err := CheckPrintfFormatBudget(str.Text, MaxTemplateOutputBytes); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	walkList = func(list *parse.ListNode) error {
+		if list == nil {
+			return nil
+		}
+		for _, node := range list.Nodes {
+			var branch *parse.BranchNode
+			switch n := node.(type) {
+			case *parse.ActionNode:
+				if err := walkPipe(n.Pipe); err != nil {
+					return err
+				}
+			case *parse.IfNode:
+				branch = &n.BranchNode
+			case *parse.RangeNode:
+				branch = &n.BranchNode
+			case *parse.WithNode:
+				branch = &n.BranchNode
+			}
+			if branch != nil {
+				if err := walkPipe(branch.Pipe); err != nil {
+					return err
+				}
+				if err := walkList(branch.List); err != nil {
+					return err
+				}
+				if err := walkList(branch.ElseList); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walkList(tmpl.Root)
 }
 
 // Clone returns an independent copy that can be evaluated on another goroutine.
@@ -84,6 +215,7 @@ func (t *Template) funcMap() template.FuncMap {
 	fm := template.FuncMap{
 		"__line__":      func() string { return t.line },
 		"__timestamp__": func() time.Time { return t.ts },
+		"printf":        boundedPrintf,
 	}
 	for k, v := range lokiFuncs {
 		fm[k] = v

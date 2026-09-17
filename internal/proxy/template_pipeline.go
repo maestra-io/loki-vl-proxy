@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	logqlpkg "github.com/ReliablyObserve/Loki-VL-proxy/internal/logql"
@@ -57,6 +58,11 @@ type templatePlan struct {
 	// (`| json message="message"`), which Loki adds to the identity while the
 	// collector-unpacked siblings stay out of it.
 	extractedNames []string
+	// pushedParser says the PUSHED-DOWN prefix carries a parser stage, so the
+	// row VictoriaLogs returns holds that parser's output as extra fields. They
+	// are the pipeline's own product, not the structured metadata Loki would
+	// attach to the entry — see templateEntryFields' caller.
+	pushedParser bool
 }
 
 // templatePlanFor builds a plan when logqlQuery's log pipeline contains a
@@ -76,7 +82,20 @@ func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templa
 
 	pipeline, err := logqlpkg.NewPipeline(lq.Pipeline)
 	if err != nil {
-		return nil, err
+		// Loki never compiles a line-rewriting stage the metric cannot observe,
+		// so the query it would have rejected is answered 200 — retry without
+		// that tail before surfacing the error.
+		trimmed := trimLineOnlyTailForLineCount(expr, lq.Pipeline)
+		if trimmed == nil {
+			return nil, err
+		}
+		if !logqlpkg.NeedsProxyEvaluation(trimmed) {
+			return nil, nil
+		}
+		lq = &logqlpkg.LogQuery{Selector: lq.Selector, Pipeline: trimmed}
+		if pipeline, err = logqlpkg.NewPipeline(lq.Pipeline); err != nil {
+			return nil, err
+		}
 	}
 	pipeline.LineFilterFields = p.lineFilterFields
 	pipeline.DerivedLevelFields = p.derivedLevelFields
@@ -104,6 +123,7 @@ func (p *Proxy) templatePlanFor(ctx context.Context, logqlQuery string) (*templa
 		baseLogsQL:      baseLogsQL,
 		fallbackLogsQL:  fallbackLogsQL,
 		suffixDropsRows: pipelineSuffixDropsRows(lq.Pipeline),
+		pushedParser:    pipelineHasParserStageOf(pushdownPrefix(lq.Pipeline), true, true),
 	}
 	plan.broadParser, plan.extractedNames = pipelineParserShape(lq.Pipeline)
 	return plan, nil
@@ -119,10 +139,10 @@ func pipelineParserShape(stages []logqlpkg.Stage) (broad bool, names []string) {
 		}
 		switch st.Type {
 		case logqlpkg.ParserJSON, logqlpkg.ParserLogfmt, logqlpkg.ParserUnpack:
-			if len(st.Params) == 0 {
+			if len(st.Fields) == 0 {
 				broad = true
 			}
-			for _, prm := range st.Params {
+			for _, prm := range st.Fields {
 				names = append(names, logqlpkg.SanitizeLabel(prm.Name))
 			}
 		}
@@ -153,14 +173,52 @@ func innermostLogQuery(expr logqlpkg.Expr) *logqlpkg.LogQuery {
 		case *logqlpkg.VectorAggregation:
 			expr = e.Inner
 		case *logqlpkg.RangeAggregation:
-			if e.Step != "" { // subquery: the inner expression is itself a metric
-				return nil
-			}
 			expr = e.Inner
 		default:
 			return nil
 		}
 	}
+}
+
+// trimLineOnlyTailForLineCount drops the run of line-REWRITING stages at the end
+// of a pipeline when the metric counts lines rather than reading them, and
+// returns the shortened pipeline (nil when nothing was dropped).
+//
+// Loki does this: `count_over_time({…} | line_format "{{bad" [5m])` and the same
+// under `rate` or a `sum by (…)` answer 200 on Loki 3.7.1, because the range
+// aggregation never looks at the line, so the stage is dropped before its
+// template is ever compiled. Every other shape compiles it and answers 400 —
+// verified against Loki 3.7.1 for bytes_over_time, for a line filter or a parser
+// AFTER the line_format, for an unwrapped max_over_time, and for the plain log
+// query.
+func trimLineOnlyTailForLineCount(expr logqlpkg.Expr, pipeline []logqlpkg.Stage) []logqlpkg.Stage {
+	for {
+		switch e := expr.(type) {
+		case *logqlpkg.VectorAggregation:
+			expr = e.Inner
+			continue
+		case *logqlpkg.RangeAggregation:
+			if e.Op != logqlpkg.RangeCountOverTime && e.Op != logqlpkg.RangeRate {
+				return nil
+			}
+		default:
+			return nil
+		}
+		break
+	}
+	end := len(pipeline)
+	for end > 0 {
+		switch pipeline[end-1].(type) {
+		case *logqlpkg.LineFormatStage, *logqlpkg.DecolorizeStage:
+			end--
+		default:
+			if end == len(pipeline) {
+				return nil
+			}
+			return pipeline[:end]
+		}
+	}
+	return pipeline[:0]
 }
 
 // pushdownPrefix returns the leading stages VictoriaLogs can evaluate: every
@@ -370,6 +428,9 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 			}
 			break
 		}
+		if plan.pushedParser {
+			undoPushdownExtractedSuffix(entry.Labels, smFields)
+		}
 		te := templateEntry{ts: ts, line: entry.Line, labels: entry.Labels, bytes: float64(len(entry.Line))}
 		// Loki's bytes_over_time measures the line AFTER the pipeline; a
 		// pipeline that left it alone measured the stored record.
@@ -383,6 +444,35 @@ func (p *Proxy) fetchTemplatePipelineEntriesQuery(ctx context.Context, plan *tem
 		return nil, rowsScanned, fmt.Errorf("scanning VL response: %w", scanErr)
 	}
 	return out, rowsScanned, nil
+}
+
+// undoPushdownExtractedSuffix repairs the one collision the PUSHDOWN invents.
+//
+// The pushed-down prefix ends in `| unpack_json` / `| unpack_logfmt`, so the row
+// VictoriaLogs returns already carries the parser's output as fields. Those
+// fields reach the pipeline as the entry's structured metadata, the local parser
+// extracts the same keys from the same line, and Loki's collision rule then
+// renames every one of them to `<key>_extracted` — where Loki, whose entry never
+// had that metadata, reports `<key>`.
+//
+// A key is the pushdown's own echo only when the row field and the parsed value
+// are IDENTICAL; genuine structured metadata that happens to share a name with a
+// body key has a different value and keeps Loki's suffix. The echoed field also
+// leaves the metadata set, so categorize-labels reports it under `parsed`.
+func undoPushdownExtractedSuffix(labels, smFields map[string]string) {
+	const suffix = "_extracted"
+	for key, value := range labels {
+		name, found := strings.CutSuffix(key, suffix)
+		if !found {
+			continue
+		}
+		if stored, ok := smFields[name]; !ok || stored != value {
+			continue
+		}
+		delete(labels, key)
+		delete(smFields, name)
+		labels[name] = value
+	}
 }
 
 // rowIsSplitJSON reports whether the collector split the line's JSON into
@@ -521,7 +611,7 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 			limit = n
 		}
 	}
-	entries, err := p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false, !backward, limit)
+	entries, err := p.fetchTemplatePipelineEntriesSplit(r, plan, start, end, backward, limit)
 	if err != nil {
 		p.writeError(w, templateFetchErrorStatus(err), err.Error())
 		return true
@@ -543,6 +633,72 @@ func (p *Proxy) proxyTemplateLogQuery(w http.ResponseWriter, r *http.Request, lo
 	emitStructuredMetadata := p.shouldEmitStructuredMetadata(r)
 	writeLokiStreamQueryResponse(w, groupTemplateEntriesIntoStreams(entries, categorizedLabels, emitStructuredMetadata), categorizedLabels)
 	return true
+}
+
+// fetchTemplatePipelineEntriesSplit reads the range the way proxyLogQueryWindowed
+// does when query-range windowing is configured: one bounded read per split
+// window, in the request's direction, stopping as soon as the limit is filled.
+// A template pipeline is claimed by this path INSTEAD of the windowed one (
+// VictoriaLogs would emit the template text as the log line), so without this
+// the whole range would be a single unsplit read — no window-level cache reuse
+// and the memory of the full range in one scan.
+//
+// Windows are disjoint and inclusive on both ends, and the caller sorts and
+// truncates afterwards, so merging is a concatenation: entries from a later
+// window are all older (backward) or newer (forward) than the limit already
+// collected.
+func (p *Proxy) fetchTemplatePipelineEntriesSplit(r *http.Request, plan *templatePlan, start, end time.Time, backward bool, limit int) ([]templateEntry, error) {
+	forward := !backward
+	var windows []queryRangeWindow
+	if p.queryRangeWindowing && !p.streamResponse {
+		windows = splitQueryRangeWindowsWithOptions(
+			start.UnixNano(), end.UnixNano(),
+			p.queryRangeSplitInterval, r.FormValue("direction"), p.queryRangeAlignWindows,
+		)
+	}
+	if len(windows) <= 1 {
+		return p.fetchTemplatePipelineEntries(r.Context(), plan, start, end, false, forward, limit)
+	}
+	parallel := max(p.queryRangeMaxParallel, 1)
+	collected := make([]templateEntry, 0, queryRangeCollectedInitialCap)
+	remaining := limit
+	for i := 0; i < len(windows) && remaining > 0; i += parallel {
+		batch := windows[i:min(i+parallel, len(windows))]
+		results := make([][]templateEntry, len(batch))
+		errs := make([]error, len(batch))
+		var wg sync.WaitGroup
+		for j, window := range batch {
+			// A Pipeline is single-goroutine (per-entry template state and a
+			// reused buffer), so every parallel window evaluates its own.
+			windowPlan := plan
+			if j > 0 {
+				cloned, err := plan.pipeline.Clone()
+				if err != nil {
+					return nil, err
+				}
+				copied := *plan
+				copied.pipeline = cloned
+				windowPlan = &copied
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[j], errs[j] = p.fetchTemplatePipelineEntries(r.Context(), windowPlan,
+					time.Unix(0, window.startNs), time.Unix(0, window.endNs), false, forward, remaining)
+			}()
+		}
+		wg.Wait()
+		for j := range batch {
+			if errs[j] != nil {
+				return nil, errs[j]
+			}
+			collected = append(collected, results[j]...)
+		}
+		if limit > 0 {
+			remaining = limit - len(collected)
+		}
+	}
+	return collected, nil
 }
 
 // groupTemplateEntriesIntoStreams collapses entries sharing a label set into one
@@ -883,7 +1039,7 @@ func (p *Proxy) templateMetricRangeBody(r *http.Request, mp *templateMetricPlan)
 	}
 	// The template pipeline yields RAW log entries.
 	body := buildManualRangeMetricMatrix(mp.manualFunc, mp.quantile, series,
-		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries(), false)
+		startTS, endTS, step, mp.origSpec.Window, p.resolvedMaxStatsQuerySeries())
 	if mp.spec.OuterAggAcrossSeries != "" {
 		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy, mp.spec.OuterAggWithout)
 	}
@@ -913,7 +1069,7 @@ func (p *Proxy) templateMetricInstantBody(r *http.Request, mp *templateMetricPla
 		series = capSeriesByTotalCount(series, p.resolvedMaxStatsQuerySeries())
 	}
 	// The template pipeline yields RAW log entries.
-	body := buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window, false)
+	body := buildManualRangeMetricVector(mp.manualFunc, mp.quantile, series, evalTS, mp.origSpec.Window)
 	if mp.spec.OuterAggAcrossSeries != "" {
 		body = reduceLokiSeriesAcrossSeries(body, mp.spec.OuterAggAcrossSeries, mp.spec.OuterAggBy, mp.spec.OuterAggWithout)
 	}

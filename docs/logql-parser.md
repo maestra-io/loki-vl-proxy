@@ -11,12 +11,12 @@ The `internal/logql` package provides a typed LogQL parser that powers query val
 
 The old approach used regular expressions layered on top of the raw query string. This worked for simple cases but broke on:
 
-- Nested expressions (subqueries, vector matching with `on()`/`group_left()`)
+- Nested expressions (vector matching with `on()`/`group_left()`)
 - Embedded regex inside label matchers (e.g. `{app=~"api|web"}`)
 - Ambiguous operator sequences (`!=` inside a string vs. between labels)
 - `rate_counter` requiring `| unwrap` — impossible to validate structurally without an AST
 
-The typed AST makes these cases explicit. Each node type is a Go struct with typed fields, so routing logic (is this a range aggregation? a binary expression? a subquery?) becomes a type switch rather than a regex match.
+The typed AST makes these cases explicit. Each node type is a Go struct with typed fields, so routing logic (is this a range aggregation? a binary expression?) becomes a type switch rather than a regex match.
 
 ## Package Structure
 
@@ -62,7 +62,7 @@ flowchart TD
         subgraph STR["String Translator — TranslateLogQLWithCapabilities"]
             T1["Tier 1: string ops\nstream selectors · line filters\nlabel format · json/logfmt"]
             T2["Tier 2: AST-driven\nbuildStatsQuery → logsql.PipeStats\nipv4_range via logsql.Builder"]
-            UNSUP["UnsupportedError\n→ 501 or fallback"]
+            UNSUP["UnsupportedError\n→ 400 bad_data"]
         end
     end
 
@@ -102,7 +102,7 @@ flowchart TD
 
 1. **Validation** (`ValidateLogQL`) — called on every inbound query before any work is done. Returns a Loki-shaped error string (`"parse error at line 1, col 1: ..."`) or `""` if valid.
 
-2. **Routing** (`proxy.go`) — calls `logql.Parse()` on the validated query and type-switches to dispatch subqueries, binary expressions, and range aggregations to separate execution paths.
+2. **Routing** (`proxy.go`) — calls `logql.Parse()` on the validated query and type-switches to dispatch binary expressions and range aggregations to separate execution paths.
 
 3. **Translation** (`TranslateLogQLWithCapabilities` and `logql.Translate`) — two paths described in detail below.
 
@@ -120,12 +120,13 @@ Expr (interface)
 │       │                            (+ Params: the explicit field list, | json a="b.c")
 │       ├── *LabelFilterStage        | level="error" (raw, opaque)
 │       ├── *LineFormatStage         | line_format "{{.msg}}"
+│       ├── *LabelFormatStage        | label_format dst=src, tmpl="{{.x}}" (parsed entries + raw)
 │       ├── *LabelFormatStage        | label_format dst=src (raw + parsed Assignments)
 │       ├── *UnwrapStage             | unwrap bytes(label)
 │       ├── *DropStage               | drop a, b, c=~"re"
 │       ├── *KeepStage               | keep a, b
 │       └── *DecolorizeStage         | decolorize
-├── *RangeAggregation        rate({...}[5m]) / max_over_time(...[1h:5m]) subquery
+├── *RangeAggregation        rate({...}[5m]) — argument is always a log query (no subqueries)
 ├── *VectorAggregation       sum by (label) (rate(...)) / topk(5, ...)
 ├── *BinOpExpr               left op right, optional VectorMatching
 ├── *LiteralExpr             scalar 3.14
@@ -217,7 +218,14 @@ All error strings are formatted to match Loki 3.x responses so Grafana datasourc
 
 ### ip() filter validation
 
-The `ip("value")` line filter extension validates the inner value as a valid IP address, CIDR block, or IP range (`a.b.c.d-e.f.g.h`) at parse time using `net.ParseIP` and `net.ParseCIDR`. Invalid values like `ip("999.999.999.999")` produce a parse error matching what Loki returns, rather than silently passing to VictoriaLogs and returning unexpected results.
+The `ip("value")` line filter extension (parsed in `internal/logql/parser.go`, matched in `internal/logql/ip_filter.go`) validates the inner value at parse time with `net/netip`, following Loki's matcher rules: a single address (`netip.ParseAddr`), a prefix (`netip.ParsePrefix`), or an ordered same-family range (`a.b.c.d-e.f.g.h`, zones stripped). Validation is eager: the query is rejected with HTTP 400 even when the time range contains no data.
+
+| Input | Parse error contains |
+|---|---|
+| Invalid address, prefix or range, e.g. `\|= ip("999.999.999.999")` | `ip: invalid pattern: "999.999.999.999"` |
+| `ip()` with a line filter operator other than `\|=` or `!=`, e.g. `\|~ ip("10.0.0.1")` | `ip: invalid operation` |
+
+Validation does not make matching exact: the translator still approximates IPv6, non-octet CIDR and range forms with regular expressions (see [translation reference](translation-reference.md#proxy-side-stages)).
 
 ## ValidateLogQL API
 
@@ -293,7 +301,7 @@ proxy-side route. See `docs/configuration.md` →
 | `quantile_over_time` φ < 0 | Rejected at semantic pass: 400 |
 | Unknown function (`label_replace`, custom) | `OpaqueMetricExpr`: raw text forwarded to VL unchanged |
 | VL version < required capability | `Capabilities` gating downgrades construct (e.g. `BestIPv4Range` → regexp fallback) |
-| No LogsQL equivalent for valid LogQL | `UnsupportedError` — handler decides: 501, partial result, or silent drop |
+| No LogsQL equivalent for valid LogQL | `UnsupportedError` — the query handler returns HTTP 400 with `errorType: bad_data` and the translator message (for example `count_values is not translatable to LogsQL`) |
 | `| line_format` unclosed template | Rejected at semantic pass: 400 with template parse error |
 | `| pattern` parser stage | Mapped to VL `seq()` word-match filter if caps allow, else regexp |
 
@@ -304,14 +312,11 @@ proxy-side route. See `docs/configuration.md` →
 ```mermaid
 flowchart TD
     P["logql.Parse(query)"]
-    RA{"*RangeAggregation\nwith Step?"}
     BE{"*BinOpExpr?"}
     ST{"isStatsQuery?"}
     LQ["Default: log stream\nor instant metric proxy"]
 
-    P --> RA
-    RA -- yes --> SQ["proxySubqueryRange\n(subquery execution)"]
-    RA -- no --> BE
+    P --> BE
     BE -- yes --> BM["proxyBinaryMetricQueryRangeVM\n(left + right translated separately)"]
     BE -- no --> ST
     ST -- yes --> SP["proxyStatsQueryRange"]

@@ -122,7 +122,7 @@ func HasTemplateStage(stages []Stage) bool {
 				return true
 			}
 		case *LabelFormatStage:
-			if len(st.Assignments) == 0 {
+			if len(st.Formats) == 0 {
 				// Unparsed expression: assume it needs evaluation only when the
 				// raw text carries an action.
 				if strings.Contains(st.Raw, "{{") {
@@ -151,15 +151,15 @@ var pureFieldRefRE = regexp.MustCompile(`^\s*\{\{\s*\.([\w.]+)\s*\}\}\s*$`)
 // lf=`{{ .level }}`)` was routed through the proxy-side raw-row read for a
 // stage VictoriaLogs evaluates natively.
 func labelFormatPushable(st *LabelFormatStage) bool {
-	dsts := make(map[string]struct{}, len(st.Assignments))
-	for _, a := range st.Assignments {
-		dsts[a.Dst] = struct{}{}
+	dsts := make(map[string]struct{}, len(st.Formats))
+	for _, a := range st.Formats {
+		dsts[a.Name] = struct{}{}
 	}
-	for _, a := range st.Assignments {
-		if !strings.Contains(a.Tmpl, "{{") {
+	for _, a := range st.Formats {
+		if a.Rename || !strings.Contains(a.Value, "{{") {
 			continue
 		}
-		m := pureFieldRefRE.FindStringSubmatch(a.Tmpl)
+		m := pureFieldRefRE.FindStringSubmatch(a.Value)
 		if m == nil {
 			return false
 		}
@@ -186,15 +186,15 @@ func NewPipeline(stages []Stage) (*Pipeline, error) {
 				p.tmpls[s] = t
 			}
 		case *LabelFormatStage:
-			if len(st.Assignments) == 0 && strings.TrimSpace(st.Raw) != "" {
+			if len(st.Formats) == 0 && strings.TrimSpace(st.Raw) != "" {
 				return nil, fmt.Errorf("unsupported label_format expression: %s", strings.TrimSpace(st.Raw))
 			}
-			for i := range st.Assignments {
-				a := &st.Assignments[i]
-				if a.Tmpl == "" {
+			for i := range st.Formats {
+				a := &st.Formats[i]
+				if a.Rename {
 					continue
 				}
-				t, err := compileStageTemplate(a.Tmpl)
+				t, err := compileStageTemplate(a.Value)
 				if err != nil {
 					return nil, err
 				}
@@ -224,6 +224,19 @@ func NewPipeline(stages []Stage) (*Pipeline, error) {
 	return p, nil
 }
 
+// Clone returns an independent Pipeline over the same stages, safe to evaluate
+// on another goroutine: a Pipeline holds per-entry state (the format buffer and
+// its templates' __line__/__timestamp__) and so is single-goroutine by design.
+func (p *Pipeline) Clone() (*Pipeline, error) {
+	c, err := NewPipeline(p.stages)
+	if err != nil {
+		return nil, err
+	}
+	c.LineFilterFields = p.LineFilterFields
+	c.DerivedLevelFields = p.DerivedLevelFields
+	return c, nil
+}
+
 // compileStageTemplate compiles a format stage's template, distinguishing the
 // two failure modes Loki treats differently:
 //
@@ -240,6 +253,12 @@ func compileStageTemplate(src string) (*Template, error) {
 	}
 	var unknown *UnknownFuncError
 	if errors.As(err, &unknown) {
+		return nil, err
+	}
+	//   - a BUDGET overflow is fatal too: evaluating it per line is the denial
+	//     of service the budget exists to refuse, so it becomes a 400.
+	var budget *TemplateBudgetError
+	if errors.As(err, &budget) {
 		return nil, err
 	}
 	return nil, nil //nolint:nilnil // a malformed template is a runtime no-op, not a query error
@@ -323,16 +342,16 @@ func (p *Pipeline) apply(s Stage, e *Entry) bool { //nolint:gocyclo // one branc
 func (p *Pipeline) applyLabelFormat(st *LabelFormatStage, e *Entry) {
 	// Loki evaluates every assignment against the labels as they were BEFORE
 	// the stage, so `label_format a=b, b=a` swaps rather than aliases.
-	out := make(map[string]string, len(st.Assignments))
-	for i := range st.Assignments {
-		a := &st.Assignments[i]
-		if a.Src != "" {
-			out[a.Dst] = e.Labels[a.Src]
+	out := make(map[string]string, len(st.Formats))
+	for i := range st.Formats {
+		a := &st.Formats[i]
+		if a.Rename {
+			out[a.Name] = e.Labels[a.Value]
 			continue
 		}
 		t := p.tmpls[assignKey{st, i}]
 		if t == nil {
-			setError(e.Labels, "TemplateFormatErr", "invalid template: "+a.Tmpl)
+			setError(e.Labels, "TemplateFormatErr", "invalid template: "+a.Value)
 			continue
 		}
 		v, err := t.Exec(e.Labels, e.Line, e.TS, &p.buf)
@@ -340,7 +359,7 @@ func (p *Pipeline) applyLabelFormat(st *LabelFormatStage, e *Entry) {
 			setError(e.Labels, "TemplateFormatErr", err.Error())
 			continue
 		}
-		out[a.Dst] = v
+		out[a.Name] = v
 	}
 	for k, v := range out {
 		e.Labels[k] = v
@@ -364,9 +383,9 @@ func (p *Pipeline) applyParser(st *ParserStage, e *Entry) {
 	}
 	switch st.Type {
 	case ParserJSON:
-		parseJSONInto(e, st.Params, p.parsed)
+		parseJSONInto(e, st.Fields, p.parsed)
 	case ParserLogfmt:
-		parseLogfmtInto(e, st.Params, p.parsed)
+		parseLogfmtInto(e, st.Fields, p.parsed)
 	case ParserUnpack:
 		parseUnpackInto(e, p.parsed)
 	case ParserPattern:
@@ -412,7 +431,7 @@ func setError(labels map[string]string, kind, details string) {
 	labels[errorDetailsLabel] = details
 }
 
-func parseJSONInto(e *Entry, params []LabelExtraction, out map[string]string) {
+func parseJSONInto(e *Entry, params []ExtractionField, out map[string]string) {
 	var v interface{}
 	if err := json.Unmarshal([]byte(e.Line), &v); err != nil {
 		if !e.SplitJSON {
@@ -425,7 +444,7 @@ func parseJSONInto(e *Entry, params []LabelExtraction, out map[string]string) {
 		return
 	}
 	for _, prm := range params {
-		path := prm.Expr
+		path := prm.Expression
 		if path == "" {
 			path = prm.Name
 		}
@@ -547,7 +566,7 @@ func splitJSONPath(path string) []string {
 	return segs
 }
 
-func parseLogfmtInto(e *Entry, params []LabelExtraction, out map[string]string) {
+func parseLogfmtInto(e *Entry, params []ExtractionField, out map[string]string) {
 	fields := parseLogfmt(e.Line)
 	if len(params) == 0 {
 		for k, v := range fields {
@@ -556,7 +575,7 @@ func parseLogfmtInto(e *Entry, params []LabelExtraction, out map[string]string) 
 		return
 	}
 	for _, prm := range params {
-		src := prm.Expr
+		src := prm.Expression
 		if src == "" {
 			src = prm.Name
 		}

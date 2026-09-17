@@ -122,9 +122,17 @@ func TestRound14_DedupeExactDuplicates(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("logs path: got %d lines, want 2 (one exact duplicate collapsed): %q", len(lines), lines)
 	}
+	// The dedup is an ingester-side emulation with no LogsQL expression, so it
+	// applies on the paths that READ ROWS and cannot apply to a VictoriaLogs
+	// bucket count. A max_line_size the pushdown cannot carry (a bare stream
+	// count skips the pack_json cost) is what routes a bare aggregation back to
+	// the row evaluator; the limit here is far above every fixture row, so it
+	// selects the path without dropping anything.
+	p.lokiMaxLineSize = 1 << 20
 	if got := maxValue(metricValues(t, queryRange(t, p, `count_over_time({namespace="flux-system"}[1h])`, 1699996500, 1700003600, 900).Body.Bytes())); got != 2 {
 		t.Fatalf("raw count path: peak %v, want 2 (the duplicate collapsed, the other line kept)", got)
 	}
+	p.lokiMaxLineSize = 0
 
 	off := newMaestraProxy(t, srv.URL) // a fresh instance: the first answer sits in p's query-range cache
 	off.dedupeExactDuplicates = false
@@ -227,7 +235,10 @@ func TestRound14_BareJSONIdentityUsesLokiNames(t *testing.T) {
 	srv, _ := rowsVL(t, row)
 	defer srv.Close()
 	p := newMaestraProxy(t, srv.URL)
-	series := seriesLabels(t, queryRange(t, p, `count_over_time({namespace="operations-bulk-api"} | json | State_ElapsedMilliseconds > 10000 [1h])`, 1700000000, 1700000000, 60).Body.Bytes())
+	// The range must CONTAIN the row: a LogQL window is (t-range, t], so a
+	// start == end == 1700000000 evaluates one point whose window ends 11s
+	// before the row's own timestamp.
+	series := seriesLabels(t, queryRange(t, p, `count_over_time({namespace="operations-bulk-api"} | json | State_ElapsedMilliseconds > 10000 [1h])`, 1699996500, 1700003600, 900).Body.Bytes())
 	if len(series) != 1 {
 		t.Fatalf("want one series, got %v", series)
 	}

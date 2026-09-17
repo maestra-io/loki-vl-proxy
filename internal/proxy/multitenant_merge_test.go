@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -626,58 +625,40 @@ func TestIsMultiTenantQueryPathCoverage(t *testing.T) {
 	}
 }
 
-func TestInjectMultiTenantWarnings(t *testing.T) {
-	tests := []struct {
-		name          string
-		body          []byte
-		failedTenants []string
-		wantWarnings  bool
-		wantSubstr    string
-	}{
-		{
-			name:          "injects warnings into JSON object",
-			body:          []byte(`{"status":"success","data":{"resultType":"streams","result":[]}}`),
-			failedTenants: []string{"tenant-a"},
-			wantWarnings:  true,
-			wantSubstr:    `"warnings":["partial multi-tenant response: tenants [tenant-a] unavailable"]`,
-		},
-		{
-			name:          "multiple failed tenants joined",
-			body:          []byte(`{"status":"success","data":[]}`),
-			failedTenants: []string{"t1", "t2"},
-			wantWarnings:  true,
-			wantSubstr:    `tenants [t1,t2] unavailable`,
-		},
-		{
-			name:          "does not double-inject warnings",
-			body:          []byte(`{"status":"success","warnings":["existing"],"data":[]}`),
-			failedTenants: []string{"t1"},
-			wantWarnings:  true,
-			wantSubstr:    `"warnings":["existing"]`,
-		},
-		{
-			name:          "non-JSON body left unchanged",
-			body:          []byte(`not json`),
-			failedTenants: []string{"t1"},
-			wantWarnings:  false,
-		},
-		{
-			name:          "NDJSON body left unchanged",
-			body:          []byte(`{"ts":"1","line":"x"}` + "\n" + `{"ts":"2","line":"y"}`),
-			failedTenants: []string{"t1"},
-			wantWarnings:  false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := injectMultiTenantWarnings(tt.body, tt.failedTenants)
-			hasWarnings := bytes.Contains(got, []byte(`"warnings"`))
-			if hasWarnings != tt.wantWarnings {
-				t.Fatalf("wantWarnings=%v but got body: %s", tt.wantWarnings, got)
-			}
-			if tt.wantSubstr != "" && !bytes.Contains(got, []byte(tt.wantSubstr)) {
-				t.Fatalf("expected %q in body, got: %s", tt.wantSubstr, got)
-			}
+// Loki answers volume_range with a vector when every series has one sample, so
+// tenants can return different result types; no tenant's samples may be lost.
+func TestMergeMultiTenantResponsesVolumeRangeMixedVectorAndMatrix(t *testing.T) {
+	for _, order := range [][]string{{"vector", "matrix"}, {"matrix", "vector"}} {
+		bodies := map[string]string{
+			"vector": `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"app":"a"},"value":[60,"5"]}]}}`,
+			"matrix": `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"app":"b"},"values":[[60,"7"],[120,"9"]]}]}}`,
+		}
+		body, _, err := mergeMultiTenantResponses("volume_range", []string{"tenant-a", "tenant-b"}, []*httptest.ResponseRecorder{
+			recorderWithJSON(bodies[order[0]]),
+			recorderWithJSON(bodies[order[1]]),
 		})
+		if err != nil {
+			t.Fatalf("merge failed: %v", err)
+		}
+		var resp struct {
+			Data struct {
+				ResultType string `json:"resultType"`
+				Result     []struct {
+					Metric map[string]string `json:"metric"`
+					Values [][]interface{}   `json:"values"`
+				} `json:"result"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(body, &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Data.ResultType != "matrix" || len(resp.Data.Result) != 2 {
+			t.Fatalf("order %v: want both tenants in a matrix, got %s", order, body)
+		}
+		for _, r := range resp.Data.Result {
+			if len(r.Values) == 0 {
+				t.Fatalf("order %v: series without samples: %s", order, body)
+			}
+		}
 	}
 }

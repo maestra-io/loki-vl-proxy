@@ -145,18 +145,6 @@ func TestCombineMetricResults(t *testing.T) {
 }
 
 func TestDrilldownHelpers(t *testing.T) {
-	if _, ok := parseVolumeBoundary(""); ok {
-		t.Fatal("expected empty boundary to fail")
-	}
-	// parseVolumeBoundary normalises numeric timestamps to Unix seconds, so a
-	// nanosecond-precision input loses sub-second precision but the seconds
-	// component must be correct.
-	if got, ok := parseVolumeBoundary("1712434882123456789"); !ok || got.Unix() != 1712434882 {
-		t.Fatalf("unexpected absolute boundary: %v %v", got, ok)
-	}
-	if got, ok := parseVolumeBoundary("now-1m"); !ok || time.Since(got) < 50*time.Second || time.Since(got) > 70*time.Second {
-		t.Fatalf("unexpected relative boundary: %v %v", got, ok)
-	}
 	if got, ok := parseEntryTime("2026-04-06T20:21:22Z"); !ok || got.UTC().Format(time.RFC3339) != "2026-04-06T20:21:22Z" {
 		t.Fatalf("unexpected parsed entry time: %v %v", got, ok)
 	}
@@ -654,19 +642,20 @@ func TestNormalizeMetadataPairTuples_AndCategorizedDetection(t *testing.T) {
 }
 
 func TestVLErrorHelpers(t *testing.T) {
-	blank := (&vlAPIError{status: http.StatusBadGateway, body: "   "}).Error()
-	if blank != "victorialogs api error: status 502" {
+	p := newTestProxy(t, "http://unused")
+	blank := p.redactedBackendStatusError("", http.StatusBadGateway, []byte("   ")).Error()
+	if blank != "VL backend returned 502" {
 		t.Fatalf("unexpected blank-body error text: %q", blank)
 	}
-	trimmed := (&vlAPIError{status: http.StatusBadGateway, body: " backend overloaded  "}).Error()
+	trimmed := p.redactedBackendStatusError("", http.StatusBadGateway, []byte(" backend overloaded  ")).Error()
 	if trimmed != "backend overloaded" {
 		t.Fatalf("unexpected trimmed-body error text: %q", trimmed)
 	}
 
-	if !shouldFallbackToGenericMetadata(&vlAPIError{status: http.StatusNotFound}) {
+	if !shouldFallbackToGenericMetadata(&upstreamStatusError{status: http.StatusNotFound}) {
 		t.Fatalf("expected 4xx vl api error to trigger generic metadata fallback")
 	}
-	if shouldFallbackToGenericMetadata(&vlAPIError{status: http.StatusInternalServerError}) {
+	if shouldFallbackToGenericMetadata(&upstreamStatusError{status: http.StatusInternalServerError}) {
 		t.Fatalf("expected 5xx vl api error to skip generic metadata fallback")
 	}
 	if shouldFallbackToGenericMetadata(errors.New("plain error")) {
@@ -722,7 +711,7 @@ func TestCompatCacheResponseAllowedAndBreakerFailure(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldRecordBreakerFailure(tc.err); got != tc.want {
+			if got := shouldRecordBreakerFailure(context.Background(), tc.err); got != tc.want {
 				t.Fatalf("shouldRecordBreakerFailure(%v)=%v want %v", tc.err, got, tc.want)
 			}
 		})
@@ -847,8 +836,8 @@ func TestFetchVLFieldValues_ErrorPaths(t *testing.T) {
 
 	if _, err := p.fetchVLFieldValues(ctx, "/bad", url.Values{}); err == nil {
 		t.Fatalf("expected API status error from /bad")
-	} else if _, ok := err.(*vlAPIError); !ok {
-		t.Fatalf("expected vlAPIError from /bad, got %T", err)
+	} else if _, ok := err.(*upstreamStatusError); !ok {
+		t.Fatalf("expected upstreamStatusError from /bad, got %T", err)
 	}
 
 	if _, err := p.fetchVLFieldValues(ctx, "/invalid", url.Values{}); err == nil {

@@ -9,23 +9,29 @@ description: Complete list of Loki-compatible HTTP endpoints exposed by loki-vl-
 
 | Loki Endpoint | Status | VL Backend | Cached | Tests |
 |---|---|---|---|---|
-| `GET/POST /loki/api/v1/query_range` (logs) | Implemented | `/select/logsql/query` | 10s | 6+ (1) |
-| `GET/POST /loki/api/v1/query_range` (metrics) | Implemented | `/select/logsql/stats_query_range` | 10s | 1+ (1) |
-| `GET/POST /loki/api/v1/query` | Implemented | `/select/logsql/query` or `stats_query` | 10s | 1+ (1) |
-| `GET /loki/api/v1/labels` | Implemented | `/select/logsql/stream_field_names` with fallback to `/select/logsql/field_names` | 60s | 3 |
-| `GET /loki/api/v1/label/{name}/values` | Implemented | `field_names` (candidate resolution, capped to 1h) → `stream_field_names` (endpoint gate) → `stream_field_values` if stream-indexed, else `field_values` | 60s | 3 |
+| `GET/POST /loki/api/v1/query_range` (logs) | Implemented | `/select/logsql/query` | 5m (2) | 6+ (1) |
+| `GET/POST /loki/api/v1/query_range` (metrics) | Implemented | `/select/logsql/stats_query_range` | 5m (2) | 1+ (1) |
+| `GET/POST /loki/api/v1/query` | Implemented | `/select/logsql/query` or `stats_query` | 5m (2) | 1+ (1) |
+| `GET /loki/api/v1/labels` | Implemented | `/select/logsql/stream_field_names` with fallback to `/select/logsql/field_names` | 5m (3) | 3 |
+| `GET /loki/api/v1/label/{name}/values` | Implemented | `field_names` (label alias resolution) → `stream_field_values` when the backend supports stream metadata endpoints, else `field_values` (also used when `stream_field_values` returns a 4xx) | 5m (3) | 3 |
 | `GET /loki/api/v1/series` | Implemented | `/select/logsql/streams` | 30s | 2 |
 | `GET /loki/api/v1/index/stats` | Implemented | `/select/logsql/hits` | 10s | 2 |
-| `GET /loki/api/v1/index/volume` | Implemented | `/select/logsql/hits` (field grouping) | 10s | 2 |
-| `GET /loki/api/v1/index/volume_range` | Implemented | `/select/logsql/hits` (step) | 10s | 2 |
-| `GET /loki/api/v1/detected_fields` | Implemented | `/select/logsql/field_names` | 30s | 1 |
-| `GET /loki/api/v1/detected_field/{name}/values` | Implemented | `/select/logsql/field_values` | 30s | 1 |
-| `GET /loki/api/v1/detected_labels` | Implemented | `/select/logsql/field_names` | 30s | 1 |
-| `GET /loki/api/v1/patterns` | Implemented (toggleable) | `/select/logsql/query` + Drain-like token clustering | `100y` (effectively persistent) | 4 |
+| `GET /loki/api/v1/index/volume` | Implemented (4) | `/select/logsql/stats_query` with `sum_len(_msg)` | 10s | 2 |
+| `GET /loki/api/v1/index/volume_range` | Implemented (4) | `/select/logsql/stats_query_range` with `sum_len(_msg)` | 10s | 2 |
+| `GET /loki/api/v1/detected_fields` | Implemented | `/select/logsql/field_names` | 90s (3) | 1 |
+| `GET /loki/api/v1/detected_field/{name}/values` | Implemented | `/select/logsql/field_values` | 90s (3) | 1 |
+| `GET /loki/api/v1/detected_labels` | Implemented | `stream_field_names` + `field_values` on VictoriaLogs v1.50+, otherwise `/select/logsql/streams`; bounded log scan fallback | 90s (3) | 1 |
+| `GET /loki/api/v1/patterns` | Implemented (toggleable; empty `data` when `-patterns-enabled=false`) | `/select/logsql/query` + Drain-like token clustering | `100y` (effectively persistent) | 4 |
 | `GET /loki/api/v1/format_query` | Implemented | - (passthrough) | - | 1 |
 | `WS /loki/api/v1/tail` | Implemented | `/select/logsql/tail` (WebSocket->NDJSON) | - | 2 |
 
 **(1)** Test counts shown are baseline per-endpoint counts. Additional coverage from `missing_ops_compat_test.go` adds cross-cutting e2e compatibility tests for `unpack`, `unwrap duration()/bytes()`, `offset`, `label_replace()`, and pattern match line filters across query and query_range endpoints.
+
+**(2)** Final-response cache. Requests ending within `-recent-tail-refresh-window` (default `2m`) of now are refetched once the cached entry is older than `-recent-tail-refresh-max-staleness` (default `2s`).
+
+**(3)** Base TTL for request windows up to 1h (`-labels-cache-ttl` for labels and label values); longer windows scale it up, capped at 1h. Like Loki, `/labels` and `/label/{name}/values` return every label name or value with data anywhere in the requested `start`–`end` range on the first response: every backend call, including background refreshes, covers the full range. A window without data returns an empty list (no synthetic `service_name`); empty answers are cached for only 30 seconds (or the higher of `-disk-cache-min-ttl` and `-peer-write-through-min-ttl`), through the same memory, disk and peer write paths as other answers, so they replace an earlier non-empty answer for the same request. If VictoriaLogs fails, the last cached answer for the same request is served when one exists, marked with the `X-Proxy-Stale-Response: true` and `Cache-Control: no-store` headers and never stored in the compatibility-edge or multi-tenant merge caches (an expired empty list is never used as that answer); otherwise the error is returned, never a partial list. When a client omits both `start` and `end` on `/labels`, `/label/{name}/values` or `/series`, the proxy bounds the backend lookup to `-metadata-default-lookback` (default `12h`).
+
+**(4)** Volume is reported in bytes, as in Loki. The proxy sums the length of the matching log lines (`sum_len(_msg)` in VictoriaLogs), so its values are exact line bytes; Loki adds structured-metadata bytes on top (see [Known Issues](KNOWN_ISSUES.md)). The rest follows Loki: `aggregateBy=series` (default) names a result by the `targetLabels`, or by the selector's label names when `targetLabels` is empty; `aggregateBy=labels` returns one `{label=""}` result per label name; every `targetLabels` entry must be present on a stream (a stream without a service label counts as `service_name="unknown_service"`); `limit` (default `100`) keeps the largest volumes of each bucket, ties broken by name. An instant volume is stamped at `end`. A `volume_range` bucket is stamped at its end minus 1ms, the last bucket at `end`, and only buckets with data are returned. `volume_range` answers a `vector` when every series has a single sample. Invalid `aggregateBy` or `limit` values return HTTP 400. VictoriaLogs reads the log lines to measure them, so a volume request costs more than a `count()` over the same window. See Known Issues for `detected_level` volumes and multi-tenant merging.
 
 ### Drilldown Field Shaping
 
@@ -45,8 +51,9 @@ For Grafana Logs Drilldown and Explore compatibility:
 - On stale/missing disk snapshot, startup can warm from peer cache before serving (`-label-values-index-startup-stale-threshold`, `-label-values-index-startup-peer-warm-timeout`).
 - Peer cache payload fetches (`/_cache/get`) support `zstd` or `gzip` response compression for lower network latency/cost on large cache objects.
 - `GET /_cache/has?keys=k1,k2,...` is a lightweight batch peer endpoint that returns key presence and remaining TTL without transferring values. Used during startup warmup so instances can discover which peer has the freshest copy of each label window before fetching.
+- `/loki/api/v1/tail` accepts at most 4 KiB per client WebSocket message and closes with code `1009` when exceeded; server log frames are not limited by this.
 - Parsed fields and structured metadata are surfaced through `detected_fields` and `detected_field/{name}/values`.
-- With `-metadata-field-mode=hybrid` (the default), field-oriented APIs expose both native VictoriaLogs dotted names and translated Loki aliases when they differ, for example `service.name` and `service_name`.
+- With `-metadata-field-mode=translated` (the default), field-oriented APIs expose Loki-style aliases only. With `-metadata-field-mode=hybrid`, they expose both native VictoriaLogs dotted names and translated Loki aliases when they differ, for example `service.name` and `service_name`.
 - Synthetic compatibility labels such as `service_name` and `detected_level` stay available on the stream and label APIs.
 ## Delete Endpoint (Exception)
 
@@ -54,7 +61,9 @@ For Grafana Logs Drilldown and Explore compatibility:
 |---|---|---|
 | `/loki/api/v1/delete` | POST | `/select/logsql/delete` |
 
-The delete endpoint is the only write operation exposed. It includes strict safeguards:
+The delete endpoint is the only write route registered. It is **not functional against current VictoriaLogs**: the handler forwards to `/select/logsql/delete`, which VictoriaLogs rejects as an unsupported path (observed on v1.52.0; VictoriaLogs deletion uses the asynchronous `/delete/run_task` API), and the proxy returns the backend's error status. Do not rely on it for deletion; see [Security hardening migration](security-hardening-migration.md#remaining-delete-api-gap).
+
+Requests are still validated before forwarding:
 
 - **Confirmation header**: Requires `X-Delete-Confirmation: true`
 - **Query required**: Must target specific streams (no wildcards `{}` or `*`)
@@ -129,17 +138,31 @@ All error responses from the proxy use the standard Loki JSON error envelope:
 {"status": "error", "errorType": "<type>", "error": "<message>"}
 ```
 
-| `errorType` | HTTP Status | Source | When |
-|---|---|---|---|
-| `"parse error"` | 400 | `translator.ParseError` | Invalid LogQL syntax that cannot be parsed |
-| `"bad_data"` | 400 | `translator.UnsupportedError` | Valid LogQL with no LogsQL equivalent (e.g. unsupported function) |
-| `"execution"` | 500 | Backend or proxy runtime error | VictoriaLogs error, fanout failure, or unexpected proxy failure |
+`errorType` is derived from the HTTP status, following Loki's Prometheus-style API handler:
 
-**`parse error`** is returned when the query string cannot be parsed at all. Grafana and LogQL clients display this as a syntax error.
+| HTTP Status | `errorType` | Typical causes |
+|---|---|---|
+| 400 | `bad_data` | LogQL parse errors, unsupported constructs, invalid parameters, query-length violations (`query length X exceeds limit Y`), `line_format` / binary-expression evaluation limits, multi-tenant fanout above 64 tenants, a multi-tenant request whose query a tenant rejected |
+| 401, 403, 413 and other 4xx | `bad_data` | missing `X-Scope-OrgID` with `-auth.enabled` or `-require-tenant-header` (401), unknown tenant or unmapped wildcard `X-Scope-OrgID: *` without `-tenant.allow-global` (403), merged multi-tenant response above 32 MiB (413) |
+| 404 | `not_found` | rules lookups with no matching rule group |
+| 406 / 422 | `not_acceptable` / `execution` | Loki status mapping (for example a backend returning that status) |
+| 499 | `canceled` | client canceled the request |
+| 500 | `internal` | proxy evaluation errors, including implicit many-to-one / multiple-match vector joins; a multi-tenant request where a tenant's backend request failed |
+| 502 | `unavailable` | backend request failures, `manual range metric row limit exceeded`, `maximum metric series exceeded` while collecting raw samples |
+| 503 | `timeout` | circuit breaker open, `manual metric series limit exceeded` |
+| 504 | `timeout` | backend or window timeouts, including a timeout on one tenant of a multi-tenant request |
 
-**`bad_data`** is returned when the query is syntactically valid LogQL but uses a construct the proxy cannot translate to a VictoriaLogs equivalent. The `error` field includes the unsupported function or operator name where applicable.
+See [Fixed Execution Limits](configuration.md#fixed-execution-limits) for the limit values.
 
-**Query-length violations** return HTTP 400 with a plain `error` field (no `errorType`): `"query length X exceeds limit Y"`.
+Backend error messages are redacted before they are returned: potential secrets, label selectors, long quoted literals and long hex strings are replaced, and the message is truncated to 500 characters. `-debug-log-raw-queries=true` disables this redaction.
+
+A few responses are produced before the Loki error writer and carry no `errorType`: per-client rate limiting (`429`, `{"status":"error","error":"rate limit exceeded"}`), the `-max-concurrent` admission cap (`503`, `too many concurrent queries`), and blocked writes (`405`).
+
+### Partial Results
+
+Some responses are `200` with incomplete data:
+
+- With `-query-range-partial-responses=true`, log `query_range` responses may stop at the first failed window after retryable backend errors and set `X-Loki-VL-Partial-Response: true`.
 
 ## Infrastructure Endpoints
 
@@ -149,22 +172,25 @@ All error responses from the proxy use the standard Loki JSON error envelope:
 | `GET /health`, `GET /healthz` | Health probe — returns 200 when healthy |
 | `GET /ready` | Readiness probe (checks VL `/health` + circuit breaker) |
 | `GET /loki/api/v1/status/buildinfo` | Returns Loki `3.7.1` build info — version ≥ 3.0.0 is required for Grafana to send `X-Loki-Response-Encoding-Flags: categorize-labels`, which enables `structuredMetadata` in `query_range` responses |
-| `GET /metrics` | Prometheus text exposition (`-server.register-instrumentation`); low-cardinality by default unless `-metrics.export-sensitive-labels=true` |
-| `POST /admin/cache/flush` | Flush all caches (requires `-admin-auth-token`) |
+| `GET /metrics` | Prometheus text exposition. Off by default: requires `-server.register-instrumentation=true`; served on `--metrics-listen` when set (the Helm chart uses `:9091`), otherwise on the main listener. Low-cardinality by default unless `-metrics.export-sensitive-labels=true` |
+| `POST /admin/cache/flush` | Flush this instance's caches (Tier0, L0 hot index, L1 memory and L2 disk); `?peers=1` also purges every peer in the ring. Registered when `-server.register-instrumentation=true` |
 | `GET /debug/queries` | Query analytics, disabled by default (`-server.enable-query-analytics`) |
-| `GET /debug/pprof/` | Go profiling, disabled by default (`-server.enable-pprof`) |
+| `GET /debug/pprof/` | Go profiling, disabled by default (`-server.enable-pprof`; also requires `-server.register-instrumentation=true`) |
+
+Admin and debug routes are served on the loopback `--admin-listen` address (default `127.0.0.1:3101`) when `-server.admin-auth-token` is empty. When the token is set they are served on the main listener and require it as `X-Admin-Token: <token>` or `Authorization: Bearer <token>`.
 
 ### Peer Cache Endpoints
 
-These endpoints are registered when peer cache is enabled. Protected by `-peer-auth-token` or source-IP peer membership.
+These endpoints are registered on the main listener when peer cache is enabled. They require the shared `-peer-auth-token` in the `X-Peer-Token` header; source-IP peer membership is accepted instead only with `-peer-insecure-ip-allowlist=true`.
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /_cache/get?key=…` | Fetch a cached entry from this peer |
 | `POST /_cache/set?key=…&ttl_ms=…` | Push a cache entry to this peer (write-through) |
 | `GET /_cache/hot?limit=…` | Return top-N hot cache keys for read-ahead |
-| `GET /_cache/has?key=…` | Check whether a key exists in this peer's cache |
+| `GET /_cache/has?keys=k1,k2,…` | Batch check which keys exist in this peer's cache, with remaining TTL |
 | `GET /_cache/peers` | Return the current peer list |
+| `POST /_cache/purge` | Purge this peer's local caches (fanout target of `/admin/cache/flush?peers=1`; peers do not re-fan-out) |
 
 ## Observability
 

@@ -337,9 +337,9 @@ func TestQueryRangeWindow_WarmQueryRangeWindowsAsync_PrimesCache(t *testing.T) {
 	if err := req.ParseForm(); err != nil {
 		t.Fatalf("parse form: %v", err)
 	}
-	cacheKey := p.queryRangeWindowCacheKey(req, `{app="nginx"}`, "100", window, false, false)
+	cacheKey := p.queryRangeWindowCacheKey(req, `{app="nginx"}`, "100", window, newLogQueryShape(req.FormValue("query")), false, false)
 
-	p.warmQueryRangeWindowsAsync(req, `{app="nginx"}`, "100", []queryRangeWindow{window}, false, false)
+	p.warmQueryRangeWindowsAsync(req, `{app="nginx"}`, "100", []queryRangeWindow{window}, newLogQueryShape(req.FormValue("query")), false, false)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, ok := p.cache.Get(cacheKey); ok {
@@ -429,7 +429,7 @@ func TestQueryRangeWindow_FetchStoresCacheLocallyWhenPeerWriteThroughEnabled(t *
 	if err := req.ParseForm(); err != nil {
 		t.Fatalf("parse form: %v", err)
 	}
-	cacheKey := (&Proxy{}).queryRangeWindowCacheKey(req, `{app="api"}`, "100", window, false, false)
+	cacheKey := (&Proxy{}).queryRangeWindowCacheKey(req, `{app="api"}`, "100", window, newLogQueryShape(req.FormValue("query")), false, false)
 
 	pc := newNonOwnerPeerCacheForKey(t, ownerURL.Host, cacheKey)
 	defer pc.Close()
@@ -451,7 +451,8 @@ func TestQueryRangeWindow_FetchStoresCacheLocallyWhenPeerWriteThroughEnabled(t *
 		t.Fatalf("create proxy: %v", err)
 	}
 
-	if _, err := p.fetchQueryRangeWindow(context.Background(), req, `{app="api"}`, "100", 100, window, false, false); err != nil {
+	cacheKey = p.queryRangeWindowCacheKey(req, `{app="api"}`, "100", window, newLogQueryShape(req.FormValue("query")), false, false)
+	if _, err := p.fetchQueryRangeWindow(context.Background(), req, `{app="api"}`, "100", 100, window, newLogQueryShape(req.FormValue("query")), false, false); err != nil {
 		t.Fatalf("fetchQueryRangeWindow returned error: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)
@@ -523,6 +524,7 @@ func TestQueryRangeWindowHitEstimate_CachesLocallyWhenPeerWriteThroughEnabled(t 
 		t.Fatalf("create proxy: %v", err)
 	}
 
+	cacheKey = p.queryRangeWindowHasHitsCacheKey(req, `{app="api"}`, window)
 	got, err := p.queryRangeWindowHitEstimate(context.Background(), req, `{app="api"}`, window)
 	if err != nil {
 		t.Fatalf("queryRangeWindowHitEstimate returned error: %v", err)
@@ -1599,7 +1601,7 @@ func TestQueryRangeWindow_RetryHelpers(t *testing.T) {
 	if !shouldRetryQueryRangeWindow(nerr) {
 		t.Fatal("expected timeout net error to be retryable")
 	}
-	if !shouldRetryQueryRangeWindow(&queryRangeWindowHTTPError{status: http.StatusBadGateway, msg: "bad gateway"}) {
+	if !shouldRetryQueryRangeWindow(&upstreamStatusError{status: http.StatusBadGateway, msg: "bad gateway"}) {
 		t.Fatal("expected 502 to be retryable")
 	}
 	if !shouldRetryQueryRangeWindow(errors.New("all the 1 backends for the user \"\" are unavailable for proxying the request")) {
@@ -1609,7 +1611,7 @@ func TestQueryRangeWindow_RetryHelpers(t *testing.T) {
 		t.Fatal("expected generic validation error to be non-retryable")
 	}
 
-	if got := statusFromQueryRangeWindowErr(&queryRangeWindowHTTPError{status: http.StatusServiceUnavailable, msg: "down"}); got != http.StatusServiceUnavailable {
+	if got := statusFromBackendErr(&upstreamStatusError{status: http.StatusServiceUnavailable, msg: "down"}); got != http.StatusServiceUnavailable {
 		t.Fatalf("expected http status passthrough, got=%d", got)
 	}
 

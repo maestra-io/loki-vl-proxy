@@ -70,6 +70,29 @@ func allFiltersAreExistenceChecks(vlQuery string) bool {
 	return !strings.Contains(drilldownFieldFilterRE.ReplaceAllString(vlQuery, ""), "| filter ")
 }
 
+// stripDrilldownExistenceFilters removes the pipe-style existence filters
+// matched by drilldownFieldFilterRE. When the removed | filter stage carried
+// more terms (an implicit AND such as `| filter level:!"" ~"y"`), the rest keeps
+// its own | filter prefix: a bare `~"y"` after `| unpack_logfmt` or `| format`
+// is not a valid LogsQL pipe on any VictoriaLogs version.
+func stripDrilldownExistenceFilters(query string) string {
+	matches := drilldownFieldFilterRE.FindAllStringIndex(query, -1)
+	if len(matches) == 0 {
+		return query
+	}
+	var b strings.Builder
+	last := 0
+	for _, m := range matches {
+		b.WriteString(query[last:m[0]])
+		if rest := strings.TrimLeft(query[m[1]:], " "); rest != "" && rest[0] != '|' {
+			b.WriteString("| filter")
+		}
+		last = m[1]
+	}
+	b.WriteString(query[last:])
+	return b.String()
+}
+
 // fieldHasExistenceFilter returns true if field appears as an existence check
 // (field:!"" or field!="") in baseQuery — either as a | filter pipe stage or
 // directly in the stream selector (stream-label existence checks are written
@@ -108,8 +131,8 @@ func fieldHasExistenceFilter(baseQuery, field string) bool {
 // Returns ("", "", false) when the query does not match the Drilldown single-field
 // count pattern.
 func detectDrilldownSingleFieldWithParser(effectiveQuery string) (cleanBase, field string, ok bool) {
-	spec, specOK := parseStatsCompatSpec(effectiveQuery)
-	if !specOK || len(spec.GroupBy) != 1 || spec.Func != "count" || isRateMathPipeline(effectiveQuery) {
+	spec, specOK := parseSingleFieldCountSpec(effectiveQuery)
+	if !specOK {
 		return "", "", false
 	}
 	// Unlike detectDrilldownSingleField, we do NOT reject queries with parser stages —
@@ -122,7 +145,7 @@ func detectDrilldownSingleFieldWithParser(effectiveQuery string) (cleanBase, fie
 		return "", "", false
 	}
 	// Strip existence filters and delete pipes; preserve parser stages.
-	base := drilldownFieldFilterRE.ReplaceAllString(spec.BaseQuery, "")
+	base := stripDrilldownExistenceFilters(spec.BaseQuery)
 	base = drilldownDeletePipeRE.ReplaceAllString(base, "")
 	return strings.TrimSpace(base), f, true
 }
@@ -136,8 +159,8 @@ func detectDrilldownSingleFieldWithParser(effectiveQuery string) (cleanBase, fie
 // Used to identify queries that are safe to fall back to count() if (field:*)
 // when stats by (field) count() exceeds the per-request 16 MB response cap.
 func detectDrilldownSingleField(effectiveQuery string) (cleanBase, field string, ok bool) {
-	spec, specOK := parseStatsCompatSpec(effectiveQuery)
-	if !specOK || len(spec.GroupBy) != 1 || spec.Func != "count" || isRateMathPipeline(effectiveQuery) {
+	spec, specOK := parseSingleFieldCountSpec(effectiveQuery)
+	if !specOK {
 		return "", "", false
 	}
 	// count() if (field:*) works on column-indexed fields only; reject queries
@@ -164,7 +187,7 @@ func detectDrilldownSingleField(effectiveQuery string) (cleanBase, field string,
 	// Strip pipe-style existence filters and delete pipes. Stream-selector
 	// existence filters (level:!"") remain in cleanBase — they are valid VL
 	// selector predicates that the batcher query passes through unchanged.
-	base := drilldownFieldFilterRE.ReplaceAllString(spec.BaseQuery, "")
+	base := stripDrilldownExistenceFilters(spec.BaseQuery)
 	base = drilldownDeletePipeRE.ReplaceAllString(base, "")
 	return strings.TrimSpace(base), f, true
 }
@@ -197,11 +220,12 @@ func extractCommonBase(baseQuery string) (base, field string, ok bool) {
 }
 
 type burstKey struct {
-	orgID    string
-	base     string
-	startSec int64
-	endSec   int64
-	stepNs   int64
+	scope   string
+	orgID   string
+	base    string
+	startNs int64 // bucket grid anchor (evaluation start minus window)
+	endNs   int64
+	stepNs  int64 // bucket width
 }
 
 type fieldResult struct {
@@ -210,6 +234,7 @@ type fieldResult struct {
 }
 
 type burstGroup struct {
+	ctx    context.Context
 	fields []string
 	chans  []chan fieldResult
 }
@@ -256,6 +281,7 @@ func (c *DrilldownBurstCoalescer) Submit(
 	}
 	if g == nil {
 		g = &burstGroup{
+			ctx:    context.WithoutCancel(ctx),
 			fields: []string{field},
 			chans:  []chan fieldResult{ch},
 		}
@@ -287,7 +313,7 @@ func (c *DrilldownBurstCoalescer) fire(
 	}
 	c.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(g.ctx, 30*time.Second)
 	defer cancel()
 
 	results, err := fireFn(ctx, g.fields)
@@ -354,9 +380,7 @@ func (p *Proxy) fusedFieldHits(
 
 		params := url.Values{}
 		params.Set("query", fusedQuery)
-		params.Set("start", strconv.FormatInt(start.Unix(), 10))
-		params.Set("end", strconv.FormatInt(end.Unix(), 10))
-		params.Set("step", strconv.FormatFloat(step.Seconds(), 'f', 0, 64)+"s")
+		p.setSlidingStatsRangeParams(params, start, end, step)
 
 		// Acquire the same concurrency slot used by individual stats_query_range calls
 		// so burst-fused calls don't bypass the back-pressure contract.
@@ -408,8 +432,8 @@ func (p *Proxy) fusedFieldHits(
 				if len(arr) < 2 {
 					continue
 				}
-				tsUnix, tsErr := arr[0].Int64()
-				if tsErr != nil {
+				ts, tsOK := snapSlidingBucketTimestamp(arr[0], start, step)
+				if !tsOK {
 					continue
 				}
 				val, parseFloatErr := strconv.ParseFloat(string(arr[1].GetStringBytes()), 64)
@@ -417,7 +441,7 @@ func (p *Proxy) fusedFieldHits(
 					continue
 				}
 				samples = append(samples, rangeMetricSample{
-					ts:    tsUnix * int64(time.Second), // nanoseconds, exact integer arithmetic
+					ts:    ts,
 					value: val,
 				})
 			}

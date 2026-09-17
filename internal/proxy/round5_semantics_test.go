@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -190,45 +189,6 @@ func TestReduceLokiSeriesAcrossSeries_TrimsLabelsOfASingleSeries(t *testing.T) {
 	}
 }
 
-// A quantile is computed here for exactness, but the raw-row scan it needs has a
-// cap. Hitting the cap must hand the query back to VictoriaLogs' own quantile —
-// a small numeric difference beats failing the panel with a 400.
-func TestQuantileFallsBackToBackend(t *testing.T) {
-	truncated := &rawRowScanTruncatedError{limit: 10000}
-	if !quantileFallsBackToBackend("quantile", truncated) {
-		t.Fatal("a truncated quantile scan must fall back to the backend")
-	}
-	if quantileFallsBackToBackend("count_over_time", truncated) {
-		t.Fatal("only a quantile falls back")
-	}
-	if quantileFallsBackToBackend("quantile", errors.New("backend returned 500")) {
-		t.Fatal("only a TRUNCATED scan falls back")
-	}
-}
-
-// `now`/`now±d` resolve against time.Now() on every parse, so the request and
-// the response filter were built from two different instants — and the filter,
-// being later, dropped the first point the request had gone back to fetch.
-func TestFreezeRelativeRangeBound(t *testing.T) {
-	frozen := freezeRelativeRangeBound("now-1h")
-	if frozen == "now-1h" {
-		t.Fatal("a relative bound must resolve to an absolute timestamp")
-	}
-	first, ok := parseLokiTimeToUnixNano(frozen)
-	if !ok {
-		t.Fatalf("frozen bound %q does not parse", frozen)
-	}
-	time.Sleep(2 * time.Millisecond)
-	second, _ := parseLokiTimeToUnixNano(frozen)
-	if first != second {
-		t.Fatalf("frozen bound still moves: %d vs %d", first, second)
-	}
-	// Absolute bounds are untouched.
-	if got := freezeRelativeRangeBound("1700000040"); got != "1700000040" {
-		t.Fatalf("absolute bound rewritten to %q", got)
-	}
-}
-
 // Measured on Loki 3.7.1: a stream carrying BOTH `foo` and `foo_extracted`,
 // parsed with `| json` over a body holding `foo`, answers
 // foo=<stream>, foo_extracted=<body>. Loki overwrites the existing
@@ -290,10 +250,18 @@ func TestGuardExtractedLabelShadowing_RestoresAfterTheLastParser(t *testing.T) {
 	}
 }
 
-// Both operands of a binary range expression must be fetched on the CLIENT's
-// bucket grid. Without the offset VictoriaLogs answers on the epoch grid, and
-// relabelling those buckets onto a `:05` grid only renames them — the operands
-// then carry `:00–:60` contents under `:05` labels.
+// Both operands of a binary range expression must be fetched with the SAME
+// anchored window parameters a standalone range metric gets. Without them
+// VictoriaLogs answers on the epoch grid, and relabelling those buckets onto a
+// `:05` grid only renames them — the operands then carry `:00–:60` contents
+// under `:05` labels.
+//
+// The anchoring is setSlidingStatsRangeParams': buckets of the window width
+// anchored at the aligned start, shifted by the 1ns that turns VictoriaLogs'
+// `[T, T+step)` into Loki's `(T, T+step]`, and an exclusive end one step past
+// the last point. It needs the stats_query_range offset arg (VictoriaLogs
+// v1.45+), so the proxy must know the backend version — hence the sliding test
+// proxy rather than the bare one.
 func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
 	// The client asks from 25 minutes past the hour; Loki truncates that to the
 	// step grid, so both operands must be built from the SAME aligned start —
@@ -319,7 +287,7 @@ func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
 	}))
 	defer vlBackend.Close()
 
-	p := newGapTestProxy(t, vlBackend.URL)
+	p := newSlidingTestProxy(t, vlBackend.URL)
 	params := url.Values{}
 	params.Set("query", `sum(count_over_time({app="a"}[1h])) / sum(count_over_time({app="b"}[1h]))`)
 	params.Set("start", strconv.FormatInt(base.Unix(), 10))
@@ -339,14 +307,17 @@ func TestQueryRange_BinaryOperandsUseTheLokiGrid(t *testing.T) {
 	// The aligned start IS a multiple of the step, so the only offset left is the
 	// microsecond that makes the bucket right-closed — and every operand must
 	// carry it.
+	// The fetch start IS a multiple of the window, so the only shift left is the
+	// nanosecond that makes the bucket right-closed — and every operand must
+	// carry it.
 	for i, off := range gotOffsets {
-		if off != "-0.000001s" {
-			t.Fatalf("operand %d fetched without the client-grid offset: offset=%q start=%q", i, off, gotStarts[i])
+		if off != "-1ns" {
+			t.Fatalf("operand %d fetched without the anchored bucket shift: offset=%q start=%q", i, off, gotStarts[i])
 		}
 	}
 	// And both operands must open one step before the ALIGNED start.
 	for i, start := range gotStarts {
-		if want := strconv.FormatInt(alignedBase.Unix()-step, 10); start != want {
+		if want := time.Unix(alignedBase.Unix()-step, 0).UTC().Format(time.RFC3339Nano); start != want {
 			t.Fatalf("operand %d start = %q, want %q", i, start, want)
 		}
 	}
