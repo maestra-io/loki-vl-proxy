@@ -131,14 +131,27 @@ func TestStatsLabels_EmptyGroupValueIsNoLabel(t *testing.T) {
 	}
 }
 
-// Round 12 (c), grouping: `sum by (ExceptionDetails_Topic)` after `| json`
-// groups by the dotted VictoriaLogs spelling too, and the response coalesces
-// the pair into the Loki label.
+// Round 12 (c), grouping: `sum by (ExceptionDetails_Topic)` after `| json` must
+// answer with the Loki label even though VictoriaLogs stores the field under the
+// dotted spelling.
+//
+// Mechanism under the upstream engine: the ordered-JSON evaluator claims a
+// `| json` metric, and setStatsPushdown refuses to push an underscore-bearing
+// group-by down (unpack_json would group by the dotted field, which no VL
+// group-by can coalesce), so it reads the rows and groups locally — the
+// label-translator resolution happens in the proxy, not in the pushed query.
+// Upstream locks that route in TestOrderedJSONDrilldownKeepsTranslatedFieldGrouping.
+// The outcome is what it always was: ONE series named by the Loki label.
 func TestStatsRange_UnderscoreGroupingAfterParserGroupsByDottedToo(t *testing.T) {
 	const start, end, step = int64(1700000000), int64(1700007200), int64(3600)
-	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, statsMatrixBody([]string{`{"ExceptionDetails_Topic":"","ExceptionDetails.Topic":"orders"}`}, start, start+step))
+	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, r *http.Request, _ string) {
+		if strings.Contains(r.URL.Path, "stats_query") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"status":"success","data":{"resultType":"matrix","result":[]}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		fmt.Fprint(w, "{\"_time\":\"2023-11-14T22:14:00Z\",\"_msg\":\"{\\\"ExceptionDetails.Topic\\\":\\\"orders\\\"}\",\"_stream\":\"{a=\\\"b\\\"}\",\"a\":\"b\"}\n")
 	})
 	p, err := New(Config{BackendURL: vl.URL, Cache: cache.New(60, 100), LogLevel: "error", LabelStyle: LabelStyleUnderscores})
 	if err != nil {
@@ -151,12 +164,10 @@ func TestStatsRange_UnderscoreGroupingAfterParserGroupsByDottedToo(t *testing.T)
 	if got := metricNames(t, rec.Body.Bytes()); rec.Code != http.StatusOK || len(got) != 1 || got[0] != `{"ExceptionDetails_Topic":"orders"}` {
 		t.Fatalf("HTTP %d metrics %v (%.300s)", rec.Code, got, rec.Body.String())
 	}
-	grouped := false
 	for _, q := range seen() {
-		grouped = grouped || strings.Contains(q, "stats by (ExceptionDetails_Topic, `ExceptionDetails.Topic`)")
-	}
-	if !grouped {
-		t.Fatalf("dotted grouping missing: %v", seen())
+		if strings.Contains(q, "stats by (ExceptionDetails_Topic)") {
+			t.Fatalf("an underscore group-by must not be pushed down alone — VictoriaLogs stores the dotted field: %v", seen())
+		}
 	}
 
 	// The manual (raw-row) instant path groups by the same field: a row VL

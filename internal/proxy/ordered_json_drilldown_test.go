@@ -81,7 +81,11 @@ func TestOrderedJSONExactHistogramLimitStillFailsClosed(t *testing.T) {
 		return w
 	}
 	w := request()
-	if w.Code < 400 || !strings.Contains(w.Body.String(), "maximum metric series") || strings.Contains(w.Body.String(), `"result"`) {
+	// Loki's own wording (pkg/util/server/error.go / limits): the fork asserts it
+	// verbatim in TestSeriesCap_RefusesInsteadOfTrimming, and the cap error here
+	// is now the same *maxSeriesError, so Drilldown gets a partial + Warning
+	// while every other client gets this 400.
+	if w.Code < 400 || !strings.Contains(w.Body.String(), "maximum of series (2) reached for a single query") || strings.Contains(w.Body.String(), `"result"`) {
 		t.Fatalf("overflow returned partial result: %d %s", w.Code, w.Body)
 	}
 	rows = 2

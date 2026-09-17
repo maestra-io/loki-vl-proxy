@@ -116,19 +116,41 @@ func (p *Proxy) handleOrderedJSONMetric(w http.ResponseWriter, r *http.Request, 
 	if err == nil && !served {
 		var series map[string]manualSeriesSamples
 		series, err = p.collectOrderedJSONMetric(r.Context(), plan, start, end, step)
-		if err == nil {
-			body, err = buildOrderedJSONMetric(r.Context(), plan, series, start, end, step, isRange, p.orderedJSONMetricMaxBytes())
+		// A cap refusal still carries the bounded set it had collected, so a
+		// Drilldown request can be served a partial below.
+		if err == nil || seriesCapOnly(err) != nil {
+			partial, buildErr := buildOrderedJSONMetric(r.Context(), plan, series, start, end, step, isRange, p.orderedJSONMetricMaxBytes())
+			body = partial
+			if err == nil {
+				err = buildErr
+			}
 		}
 	}
 	status := http.StatusOK
-	if err != nil {
+	written := false
+	if capErr := seriesCapOnly(err); capErr != nil {
+		// Loki refuses a query over the cap with a 400 and gives Drilldown the
+		// bounded set plus a Warning header; serveSeriesCapPartial writes the
+		// 400 itself and reports false.
+		if p.serveSeriesCapPartial(w, r, capErr) {
+			err = nil
+			if body == nil {
+				body = emptyLokiMatrix
+			}
+		} else {
+			status, written = http.StatusBadRequest, true
+		}
+	}
+	if err != nil && !written {
 		status = statusFromUpstreamErr(err)
 		var pipelineErr *orderedJSONPipelineError
 		if errors.As(err, &pipelineErr) {
 			status = http.StatusBadRequest
 		}
 		p.writeError(w, status, err.Error())
-	} else {
+		written = true
+	}
+	if !written {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(body)
 	}
@@ -472,9 +494,9 @@ func (p *Proxy) orderedJSONStatsBuckets(ctx context.Context, plan *orderedJSONMe
 	if err != nil {
 		return nil, false, err
 	}
-	if maxSeries := p.resolvedMaxStatsQuerySeries(); len(series) >= maxSeries {
+	if capErr := p.seriesCapError(len(series), "ordered_json_stats"); capErr != nil {
 		// The bucket collector keeps the busiest series; Loki fails instead.
-		return nil, false, fmt.Errorf("maximum metric series exceeded (%d)", maxSeries)
+		return nil, false, capErr
 	}
 	merged := make(map[string]manualSeriesSamples, len(series))
 	for _, entry := range series {
@@ -1059,8 +1081,8 @@ func (p *Proxy) collectOrderedJSONMetric(ctx context.Context, plan *orderedJSONM
 		key := canonicalLabelsKey(labels)
 		entry, exists := series[key]
 		if !exists {
-			if len(series) >= p.resolvedMaxStatsQuerySeries() {
-				return nil, fmt.Errorf("maximum metric series exceeded (%d)", p.resolvedMaxStatsQuerySeries())
+			if capErr := p.seriesCapError(len(series)+1, "ordered_json_scan"); capErr != nil {
+				return series, capErr
 			}
 			entry.Metric = labels
 		}

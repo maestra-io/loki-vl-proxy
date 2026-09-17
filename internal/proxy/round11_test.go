@@ -155,23 +155,47 @@ func statsQRWithSeries(n int) []byte {
 	return []byte(sb.String())
 }
 
+// bareJSONRowsWithSeries writes NDJSON rows whose parsed `pod` gives n distinct
+// Loki series. A bare `| json` aggregation is keyed by every parsed label, which
+// no stats-by-_stream pushdown can reproduce, so the ordered-JSON raw evaluator
+// answers it — the series cap is enforced as it scans.
+func bareJSONRowsWithSeries(w http.ResponseWriter, n int) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(w, "{\"_time\":\"2023-11-14T22:14:00Z\",\"_msg\":\"{\\\"pod\\\":\\\"p%d\\\"}\",\"_stream\":\"{app=\\\"a\\\"}\",\"app\":\"a\"}\n", i)
+	}
+}
+
 func TestSeriesCap_RefusesInsteadOfTrimming(t *testing.T) {
+	statsBackend := func(w http.ResponseWriter, _ *http.Request, _ string) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(statsQRWithSeries(501))
+	}
+	// The bare `| json` count is served by the ordered-JSON raw evaluator, so
+	// its backend answers rows, not a stats matrix. The cap contract is the
+	// same on both engines.
+	rowBackend := func(w http.ResponseWriter, r *http.Request, _ string) {
+		if strings.Contains(r.URL.Path, "stats_query") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+			return
+		}
+		bareJSONRowsWithSeries(w, 501)
+	}
 	for _, tc := range []struct {
-		name  string
-		query string
-		step  string
+		name    string
+		query   string
+		step    string
+		backend func(http.ResponseWriter, *http.Request, string)
 	}{
-		{"direct stats path", `sum by (pod) (count_over_time({app="a"}[60s]))`, "60"},
-		{"sliding-window stats path", `sum by (pod) (count_over_time({app="a"}[5m]))`, "60"},
-		// CodeRabbit on PR 22: the bare-parser stats path must not fall back to
-		// the full-fetch scan on a cap error either.
-		{"bare-parser stats path", `count_over_time({app="a"} | json [5m])`, "60"},
+		{"direct stats path", `sum by (pod) (count_over_time({app="a"}[60s]))`, "60", statsBackend},
+		{"sliding-window stats path", `sum by (pod) (count_over_time({app="a"}[5m]))`, "60", statsBackend},
+		// CodeRabbit on PR 22: the bare `| json` path must not fall back to the
+		// full-fetch scan on a cap error either.
+		{"bare-parser raw path", `count_over_time({app="a"} | json [5m])`, "60", rowBackend},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			vl, _ := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write(statsQRWithSeries(501))
-			})
+			vl, _ := newRecordingVL(t, tc.backend)
 			// A fresh proxy per phase: the response caches would otherwise answer
 			// a later phase with an earlier phase's body.
 			p := newSlidingTestProxy(t, vl.URL)
@@ -335,12 +359,18 @@ func TestBareUnwrapOverTemplate_KeepsParsedLabelsDropsUnwrapField(t *testing.T) 
 	}
 }
 
-// CodeRabbit on PR 22: a cap error on the bare-parser stats path was treated
-// as a failed optimisation and started the full-fetch raw scan.
+// CodeRabbit on PR 22: a cap error was treated as a failed optimisation and
+// started the full-fetch raw scan a second time. A bare `| json` aggregation is
+// keyed by every parsed label, so the raw evaluator IS its path — the refusal
+// must end the request there rather than re-reading the rows.
 func TestSeriesCap_BareParserPathNeverFallsBackToRawScan(t *testing.T) {
-	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, _ *http.Request, _ string) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(statsQRWithSeries(501))
+	vl, seen := newRecordingVL(t, func(w http.ResponseWriter, r *http.Request, _ string) {
+		if strings.Contains(r.URL.Path, "stats_query") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
+			return
+		}
+		bareJSONRowsWithSeries(w, 501)
 	})
 	p := newSlidingTestProxy(t, vl.URL)
 	rec := httptest.NewRecorder()
@@ -349,10 +379,14 @@ func TestSeriesCap_BareParserPathNeverFallsBackToRawScan(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body.String())
 	}
+	scans := 0
 	for _, q := range seen() {
 		if strings.Contains(q, "/select/logsql/query ") {
-			t.Fatalf("the cap error must not start the raw scan: %q", seen())
+			scans++
 		}
+	}
+	if scans != 1 {
+		t.Fatalf("the cap error must not restart the raw scan: %q", seen())
 	}
 }
 
