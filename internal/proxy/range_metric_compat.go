@@ -2521,10 +2521,16 @@ func marshalManualMetricResponse(resultType string, result []map[string]interfac
 	return payload
 }
 
-func manualWindowValues(samples []rangeMetricSample, windowStart, windowEnd int64, excludeStart bool) []float64 {
+// manualWindowValues collects the samples inside the LogQL range vector
+// (windowStart, windowEnd]. The lower bound is exclusive for EVERY range
+// function, not just the log-line ones: Loki's range_vector.go skips
+// `sample.Timestamp <= start` in both batchRangeVectorIterator.load and
+// streamRangeVectorIterator.load, and newRangeVectorIterator picks between
+// them on window overlap (selRange >= step), never on the function.
+func manualWindowValues(samples []rangeMetricSample, windowStart, windowEnd int64) []float64 {
 	values := make([]float64, 0, len(samples))
 	for _, sample := range samples {
-		if sample.ts < windowStart || sample.ts > windowEnd || (excludeStart && sample.ts == windowStart) {
+		if sample.ts <= windowStart || sample.ts > windowEnd {
 			continue
 		}
 		values = append(values, sample.value)
@@ -2536,9 +2542,7 @@ func aggregateManualWindow(functionName string, quantile float64, samples []rang
 	// Slice-dependent functions: build filtered slice, then aggregate.
 	switch functionName {
 	case "quantile", "stddev", "stdvar", "rate_counter":
-		// A LogQL range vector is (start, end] for every function (Loki's
-		// batchRangeVectorIterator.load skips `ts <= start`).
-		values := manualWindowValues(samples, windowStart, windowEnd, true)
+		values := manualWindowValues(samples, windowStart, windowEnd)
 		if len(values) == 0 {
 			return 0, false
 		}
@@ -2571,10 +2575,9 @@ func aggregateManualWindow(functionName string, quantile float64, samples []rang
 		lastVal  float64
 		hasFirst bool
 	)
-	// Every range vector is (start, end], as the bucket path evaluates them.
-	const excludeStart = true
+	// Every range vector is (start, end] — see manualWindowValues.
 	for _, sample := range samples {
-		if sample.ts < windowStart || sample.ts > windowEnd || (excludeStart && sample.ts == windowStart) {
+		if sample.ts <= windowStart || sample.ts > windowEnd {
 			continue
 		}
 		v := sample.value
