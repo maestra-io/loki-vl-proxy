@@ -1066,7 +1066,14 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 		return nil, p.redactedBackendStatusError("", resp.StatusCode, body)
 	}
 
-	limited := &io.LimitedReader{R: resp.Body, N: maxBufferedBackendBodyBytes + 1}
+	// The rows STREAM through line by line and what is retained is bounded by
+	// the manual-scan sample budget, so this read follows the configurable
+	// -ordered-json-metric-max-bytes (the other raw-row evaluator's cap) and
+	// not the 64 MiB ceiling on the response we build. A wide scan whose rows
+	// carry no unwrap field retains nothing and must not be refused for the
+	// bytes it walked past (issues-maestra#1031, omicron traefik quantile).
+	rawRowsMaxBytes := p.orderedJSONMetricMaxBytes()
+	limited := &io.LimitedReader{R: resp.Body, N: rawRowsMaxBytes + 1}
 	scanner := bufio.NewScanner(limited)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	seriesByKey := make(map[string]*bareParserMetricSeries, 16)
@@ -1083,7 +1090,7 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 	rows := 0
 	dedup := p.newRowDedup()
 	for scanner.Scan() {
-		if err := checkManualMetricRead(ctx, limited); err != nil {
+		if err := checkManualMetricRead(ctx, limited, rawRowsMaxBytes); err != nil {
 			return nil, err
 		}
 		line := bytes.TrimSpace(scanner.Bytes())
@@ -1152,7 +1159,7 @@ func (p *Proxy) fetchBareParserMetricSeries(ctx context.Context, originalQuery s
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	if err := checkManualMetricRead(ctx, limited); err != nil {
+	if err := checkManualMetricRead(ctx, limited, rawRowsMaxBytes); err != nil {
 		return nil, err
 	}
 

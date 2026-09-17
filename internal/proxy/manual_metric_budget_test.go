@@ -101,7 +101,7 @@ func TestBoundedBareParserMetricOutput(t *testing.T) {
 	if body, err := buildBoundedBareParserMetric(ctx, series, stamp, stamp*2, stamp, spec, true); err == nil || body != nil {
 		t.Fatalf("cancelled response returned output: %s %v", body, err)
 	}
-	if err := checkManualMetricRead(t.Context(), &io.LimitedReader{N: 0}); err == nil {
+	if err := checkManualMetricRead(t.Context(), &io.LimitedReader{N: 0}, maxBufferedBackendBodyBytes); err == nil {
 		t.Fatal("exhausted input byte budget accepted")
 	}
 }

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- fix(range): the manual raw-row scan reads under `-ordered-json-metric-max-bytes`
+  (1 GiB by default) instead of the 64 MiB ceiling on the response the proxy
+  builds. The rows stream line by line and what is retained is bounded by the
+  manual-scan sample budget, so a wide scan whose rows carry no unwrap field
+  retains nothing and must not be refused for the bytes it walked past. Bit on
+  omicron: `quantile_over_time(0.95, {namespace=~"traefik-.*"} | json | unwrap
+  Duration [5m])` answered 502 where Loki answered an empty 200.
+
 ## [1.81.0-maestra.1] - 2026-09-16 (fork)
 
 Fork of [ReliablyObserve/loki-vl-proxy](https://github.com/ReliablyObserve/loki-vl-proxy) rebased onto upstream v1.81.0. Fork rounds, one line each (details in the PRs at `maestra-io/loki-vl-proxy`):
