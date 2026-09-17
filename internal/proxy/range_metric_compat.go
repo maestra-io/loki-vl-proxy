@@ -796,7 +796,7 @@ func shouldUseManualRangeMetricCompat(baseQuery, manualFunc string, rangeEqualsS
 // it emits a sample only for steps whose window (t-range, t] holds log lines,
 // for every client: absent steps stay absent (no zero-fill), which also keeps
 // absent series out of topk/bottomk ranking.
-func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Request, spec statsCompatSpec, origSpec originalRangeMetricSpec, manualFunc string) bool {
+func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Request, spec statsCompatSpec, origSpec originalRangeMetricSpec, manualFunc string) bool { //nolint:gocyclo // one branch per bucket/raw fast path, in the order they are tried
 	// The first translated stats clause may group by stream before the outer
 	// sum. For additive log metrics, combine the raw counts/bytes before window
 	// evaluation and keep the native stats fast path for aggregate-all queries.
@@ -1332,7 +1332,7 @@ func snapSlidingBucketNanos(ts int64, start time.Time, hitStep time.Duration) in
 //
 // Only applicable when the output label set is fully determined by groupBy, i.e.
 // len(groupBy) > 0 or byExplicit == true (so we don't need _stream expansion).
-func (p *Proxy) collectRangeMetricHits(
+func (p *Proxy) collectRangeMetricHits( //nolint:gocyclo // one branch per VictoriaLogs response shape
 	ctx context.Context,
 	baseQuery string,
 	groupBy, origGroupBy []string,
@@ -1585,7 +1585,7 @@ func (e *rawRowScanTruncatedError) Error() string {
 		e.limit)
 }
 
-func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string, groupBy, origGroupBy []string, byExplicit bool, field, unwrapConv string, start, end time.Time) (map[string]manualSeriesSamples, error) {
+func (p *Proxy) collectRangeMetricSamples(ctx context.Context, baseQuery string, groupBy, origGroupBy []string, byExplicit bool, field, unwrapConv string, start, end time.Time) (map[string]manualSeriesSamples, error) { //nolint:gocyclo // one branch per row-level emulation and field shape
 	params := url.Values{}
 	params.Set("start", formatVLTimestamp(start.UTC().Format(time.RFC3339Nano)))
 	params.Set("end", formatVLTimestamp(end.UTC().Format(time.RFC3339Nano)))

@@ -189,7 +189,7 @@ func checkConstantPrintfBudget(tmpl *template.Template) error {
 		}
 		return nil
 	}
-	return walkList(tmpl.Tree.Root)
+	return walkList(tmpl.Root)
 }
 
 // Clone returns an independent copy that can be evaluated on another goroutine.

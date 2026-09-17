@@ -210,7 +210,7 @@ type dropKeepResult struct {
 // cannot reach this walker through the query handlers or rules-migrate: both validate
 // queries with the typed LogQL AST validator (logql.ValidateLogQL) first, which
 // rejects them with a Loki-style parse error.
-func walkDropKeepStages(logqlQuery string) dropKeepResult {
+func walkDropKeepStages(logqlQuery string) dropKeepResult { //nolint:gocyclo // one branch per LogQL stage kind
 	var res dropKeepResult
 	remaining := strings.TrimSpace(logqlQuery)
 	if strings.HasPrefix(remaining, "{") {
@@ -2291,7 +2291,6 @@ var rangeByClauseRE = regexp.MustCompile(`^by\s*\(([^)]*)\)`)
 
 // Package-level compiled regexes — compiled once at program start, not per-request.
 var (
-	boolModifierRE  = regexp.MustCompile(`\s+bool\s+`)
 	withoutMarkerRE = regexp.MustCompile(`\bwithout\s*\(([^)]+)\)`)
 	goTemplateRE    = regexp.MustCompile(`\{\{\s*\.([\w.]+)\s*\}\}`)
 	vectorMatchRE   = regexp.MustCompile(`\s+(on|ignoring|group_left|group_right)\s*\(([^)]*)\)`)

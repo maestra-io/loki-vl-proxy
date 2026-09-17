@@ -2600,19 +2600,6 @@ func stripQuotedSpans(s string) string {
 	return string(out)
 }
 
-// groupsByRawLevelLabel reports whether the query's grouping names `level`
-// itself rather than the synthetic `detected_level`. Loki returns exactly the
-// label the client asked for; VL groups by its `level` column for both, so the
-// distinction has to come from the query text.
-func groupsByRawLevelLabel(logql string) bool {
-	for _, label := range logqlGroupingLabels(logql) {
-		if label == "level" {
-			return true
-		}
-	}
-	return false
-}
-
 // logqlGroupingLabels returns the labels named in the query's by()/without()
 // clauses. Quoted spans are blanked first so a line filter containing the same
 // characters is not read as a grouping clause.

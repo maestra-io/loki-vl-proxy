@@ -441,9 +441,6 @@ func tumblingKeys(m map[string]map[int64]string) []string {
 	return keys
 }
 
-// drilldownHeaders marks a request as Grafana Logs Drilldown's.
-var drilldownHeaders = map[string]string{"X-Query-Tags": "Source=grafana-lokiexplore-app"}
-
 func tumblingRangeParams(query string, start, end time.Time, step time.Duration) url.Values {
 	return url.Values{
 		"query": {query},

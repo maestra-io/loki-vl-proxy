@@ -897,52 +897,6 @@ func (p *Proxy) logQueryStreamDescriptor(rawStream, level string, streamLabelCac
 	return p.logQueryStreamDescriptorMiss(rawStream, strings.TrimSpace(level), cacheKey, streamLabelCache, descriptorCache)
 }
 
-// classifyEntryMetadataFields fills smBuf and pfBuf with structured metadata
-// and parsed fields for the given log entry. Both buffers must be pre-allocated
-// and are cleared before use; callers must copy or consume content before the
-// next call (metadataFieldMap makes the required copy inside buildStreamValue).
-func (p *Proxy) classifyEntryMetadataFields(entry map[string]interface{}, streamLabels map[string]string, classifyAsParsed bool, exposureCache map[string][]metadataFieldExposure, smBuf, pfBuf map[string]string) (map[string]string, map[string]string) {
-	for k := range smBuf {
-		delete(smBuf, k)
-	}
-	for k := range pfBuf {
-		delete(pfBuf, k)
-	}
-
-	for key, value := range entry {
-		if isVLInternalField(key) || key == "_stream_id" || key == "level" {
-			continue
-		}
-		if _, exists := streamLabels[key]; exists {
-			continue
-		}
-		stringValue, ok := stringifyEntryValue(value)
-		if !ok || strings.TrimSpace(stringValue) == "" {
-			continue
-		}
-		exposures := p.metadataFieldExposuresCached(key, exposureCache)
-		for _, exposure := range exposures {
-			if _, exists := streamLabels[exposure.name]; exists && !exposure.isAlias {
-				continue
-			}
-			if classifyAsParsed {
-				pfBuf[exposure.name] = stringValue
-				continue
-			}
-			smBuf[exposure.name] = stringValue
-		}
-	}
-
-	var sm, pf map[string]string
-	if len(smBuf) > 0 {
-		sm = smBuf
-	}
-	if len(pfBuf) > 0 {
-		pf = pfBuf
-	}
-	return sm, pf
-}
-
 // classifyEntryMetadataFieldsFJ is the fastjson variant of classifyEntryMetadataFields.
 // It uses fj.Object.Visit to iterate fields without allocating a map[string]interface{}.
 //
