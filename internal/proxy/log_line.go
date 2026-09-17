@@ -48,6 +48,15 @@ func isVLMissingMsgBytes(msg []byte, defaultMsgValue string) bool {
 	return len(msg) == 0 || string(msg) == vlDefaultMsgValue || (defaultMsgValue != "" && string(msg) == defaultMsgValue)
 }
 
+// lineWrittenByPipeline marks a pipeline that SETS the log line (| line_format,
+// | decolorize). An empty _msg is then the pipeline's own output — Loki answers
+// `| line_format ""` with blank lines — and must not be mistaken for a row
+// VictoriaLogs stored without a message, which is what the rebuild is for. It
+// rides in pipelineFields because every rebuild already receives that map; the
+// key is a VictoriaLogs internal, so it can never collide with a row field and
+// skipLogLineField drops it anyway.
+const lineWrittenByPipeline = "_msg"
+
 // skipLogLineField reports whether a row field stays out of a rebuilt line.
 // Conversions inside comparisons and map lookups do not allocate.
 func skipLogLineField[T string | []byte](key T, streamLabels map[string]string, pipelineFields map[string]bool) bool {
@@ -74,7 +83,7 @@ var (
 
 // storedLogLineFromEntry returns the Loki line for a decoded VictoriaLogs row.
 func storedLogLineFromEntry(msg string, entry map[string]interface{}, streamLabels map[string]string, pipelineFields map[string]bool, defaultMsgValue string) string {
-	if !isVLMissingMsg(msg, defaultMsgValue) {
+	if !isVLMissingMsg(msg, defaultMsgValue) || pipelineFields[lineWrittenByPipeline] {
 		return msg
 	}
 	fieldsPtr := logLineStringFieldsPool.Get().(*[]logLineField[string])
@@ -99,7 +108,7 @@ func storedLogLineFromEntry(msg string, entry map[string]interface{}, streamLabe
 // Keys and values are filtered and encoded from the parser's bytes.
 func storedLogLineFromFJ(row *fj.Value, streamLabels map[string]string, pipelineFields map[string]bool, defaultMsgValue string) string {
 	msg := row.GetStringBytes("_msg")
-	if !isVLMissingMsgBytes(msg, defaultMsgValue) {
+	if !isVLMissingMsgBytes(msg, defaultMsgValue) || pipelineFields[lineWrittenByPipeline] {
 		return string(msg)
 	}
 	obj, err := row.Object()
@@ -215,6 +224,8 @@ func pipelineLineFields(pipeline []logqlpkg.Stage) map[string]bool {
 	}
 	for _, stage := range pipeline {
 		switch s := stage.(type) {
+		case *logqlpkg.LineFormatStage, *logqlpkg.DecolorizeStage:
+			add(lineWrittenByPipeline)
 		case *logqlpkg.ParserStage:
 			if s.Type == logqlpkg.ParserPattern {
 				for _, match := range patternCaptureRE.FindAllStringSubmatch(s.Param, -1) {
