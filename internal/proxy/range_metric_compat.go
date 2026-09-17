@@ -867,8 +867,9 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 	// non-parser fast path only: the drilldown parser-stage route strips the
 	// query down to existence checks and counts, where neither applies.
 	statsSpec, statsAggFuncRecord := spec, statsAggFunc
-	if pipes, bytesField := p.recordStatsPipes(field == "__bytes__", origSpec.BaseQuery); pipes != "" {
-		statsSpec.BaseQuery += " " + pipes
+	recordPipes, bytesField := p.recordStatsPipes(field == "__bytes__", origSpec.BaseQuery)
+	if recordPipes != "" {
+		statsSpec.BaseQuery += " " + recordPipes
 		if bytesField {
 			statsAggFuncRecord = "sum(" + translator.RecordBytesField + ") as c, count() as __sample_count"
 		}
@@ -901,7 +902,7 @@ func (p *Proxy) proxyManualRangeMetricRange(w http.ResponseWriter, r *http.Reque
 	// are, so per-stream series (range != step) and parser stages use them too.
 	// With parser stages the stats query keeps them: VictoriaLogs groups by the
 	// parsed fields and counts every line, as the raw evaluator does.
-	streamBuckets := origSpec.Window != step
+	streamBuckets := origSpec.Window != step && !p.ingestEmulationNeedsRows(recordPipes)
 	if series, ok, capErr := p.collectStatsFastPathHits(r.Context(), statsSpec, statsAggFuncRecord, fetchStart, endTS, bucket, streamBuckets, false); ok {
 		if capErr != nil && !p.serveSeriesCapPartial(w, r, capErr) {
 			return true

@@ -142,6 +142,28 @@ func (p *Proxy) recordStatsPipes(isBytes bool, logql string) (string, bool) {
 	return opts.RecordPipes(isBytes, logql)
 }
 
+// ingestEmulationNeedsRows reports whether -loki-max-line-size, the drop Loki
+// applied at ingest, is configured but absent from the query pushed to
+// VictoriaLogs: recordPipes adds the size filter only for a query VictoriaLogs
+// already evaluates per row, because a bare stream count deliberately skips the
+// pack_json cost. Counting from buckets would then include the lines Loki
+// rejected, so the per-stream (bare aggregation) bucket route gives way to the
+// raw evaluator, which applies the drop in Go. A grouped `sum by (...)` is
+// unaffected; pushedPipes is what recordStatsPipes returned for this query.
+//
+// -dedupe-exact-duplicates deliberately does NOT gate the route. It has no
+// LogsQL expression at all and is on by default, so treating it as a routing
+// input would turn every sliding-window count into a raw scan; like Loki's own
+// ingester-side dedup it is emulated on the paths that read rows (the log path,
+// the ordered-JSON scan, the bare-parser and manual range scans, the template
+// pipeline) and cannot apply to a pushdown.
+func (p *Proxy) ingestEmulationNeedsRows(pushedPipes string) bool {
+	if p == nil {
+		return false
+	}
+	return p.lokiMaxLineSize > 0 && !strings.Contains(pushedPipes, "| filter "+translator.RecordBytesField+":<=")
+}
+
 // rowLineBytesFJ is the sample value of bytes_over_time / bytes_rate for a
 // row: the stored line under -bytes-over-time-source=record, else len(_msg).
 func (p *Proxy) rowLineBytesFJ(v *fj.Value) float64 {
