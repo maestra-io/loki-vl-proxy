@@ -11,7 +11,8 @@ on:
   pull_request:
     branches: [main]
     # ready_for_review is not in the default set; PR jobs skip drafts.
-    types: [opened, synchronize, reopened, ready_for_review]
+    # labeled: adding `full-ci` to an open PR must start the heavy tier.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
 
 permissions:
