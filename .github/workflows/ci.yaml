@@ -10,14 +10,26 @@ on:
       - "README.md"
   pull_request:
     branches: [main]
+    # ready_for_review is not in the default set; PR jobs skip drafts.
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# Two tiers. Measured Sept 2026: one run of every job here is ~85 billed
+# minutes (27 jobs), and it ran on every push to every PR — 101 runs, 9k
+# minutes, the single largest Actions bill in the org.
+#   PR tier (every non-draft push): test, tuple-contract, tuple-smoke, lint,
+#     docker, helm, e2e-compat, e2e-fleet.
+#   Heavy tier (push to main, workflow_dispatch, or a PR labelled `full-ci`):
+#     bench, fuzz-smoke, race-stress, stress-tests, memory-leak-tests, e2e-ui.
+# The heavy `if:` is repeated verbatim on each heavy job — Actions has no
+# YAML anchors and job-level `if:` cannot read `env`.
 jobs:
   test:
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -112,6 +124,7 @@ jobs:
   fuzz-smoke:
     runs-on: ubuntu-latest
     needs: [test]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -204,6 +217,7 @@ jobs:
     # derivedFields + autodetect combination.
     runs-on: ubuntu-latest
     needs: [test]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -285,6 +299,7 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -613,6 +628,7 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -732,7 +748,9 @@ jobs:
   e2e-compat:
     runs-on: ubuntu-latest
     needs: [e2e-compat-group]
-    if: always()
+    # `always()` alone would also run this on a draft PR, where the group is
+    # skipped, and fail it on the "skipped" result.
+    if: always() && needs.e2e-compat-group.result != 'skipped'
     steps:
       - name: Aggregate grouped compat result
         run: |
@@ -781,7 +799,10 @@ jobs:
 
   e2e-ui:
     runs-on: ubuntu-latest
-    needs: [test]
+    # 9 shards x ~3.3 min per run; also waits for e2e-compat so a broken
+    # proxy fails once in the cheap tier instead of nine more times here.
+    needs: [test, e2e-compat]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     env:
       PROXY_IMAGE: loki-vl-proxy:e2e-ui
     strategy:
@@ -888,6 +909,7 @@ jobs:
   stress-tests:
     runs-on: ubuntu-latest
     needs: [test]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -912,6 +934,7 @@ jobs:
   memory-leak-tests:
     runs-on: ubuntu-latest
     needs: [test]
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'full-ci')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
@@ -934,6 +957,7 @@ jobs:
 
   helm:
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
