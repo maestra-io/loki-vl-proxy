@@ -123,6 +123,8 @@ jobs:
           SHA_TAG="${GITHUB_SHA::12}"
 
           docker build \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --label org.opencontainers.image.source="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --build-arg VERSION="${{ env.IMAGE_VERSION }}" \
             --build-arg REVISION="$GITHUB_SHA" \
             --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
