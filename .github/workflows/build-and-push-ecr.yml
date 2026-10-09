@@ -103,8 +103,14 @@ jobs:
           # Image-build ECR repositories are not terraform-managed (aws-infra
           # ecr-eu-forget.tf: "the rest were only ever created by CI pushes");
           # the registry-wide scanning config already covers them.
+          # IMAGE_VERSION and the sha tag are immutable: a release tag must never be
+          # silently overwritten (2026-10-09: GitLab re-minted release numbers after a
+          # restore and CI overwrote released images), so a change pushed without an
+          # IMAGE_VERSION bump fails the push. `latest` is moving, so it is excluded.
           aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
-          aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }}
+          aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} \
+            --image-tag-mutability IMMUTABLE_WITH_EXCLUSION \
+            --image-tag-mutability-exclusion-filters 'filterType=WILDCARD,filter=latest'
 
           # Org-wide pull policy, the same one push-to-aws-ecr-repository and
           # the aws-infra pull-through templates apply. Without it the
