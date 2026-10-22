@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- build: Go 1.27.3 (go.mod, bench/go.mod, CI `go-version`, `golang:1.27.3-alpine3.24`
+  builder) for GO-2026-6809 (crypto/x509) and the 1.27.2 net/http, crypto/tls,
+  net/textproto fixes GO-2026-6603..6617; `govulncheck` on main was red since 09.10.
+
 - fix(translator): `| json alias="field"` now reaches templates and keeps its
   filter off the stream labels. VL has no alias — `| unpack_json` extracts under
   the field's own name — so `| line_format "{{.alias}}"` rendered an EMPTY line,
