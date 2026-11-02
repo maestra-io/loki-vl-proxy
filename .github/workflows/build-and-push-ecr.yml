@@ -150,6 +150,7 @@ jobs:
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_VERSION }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
             ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          # Same scope as the ci.yaml e2e builds of this Dockerfile: a PR run warms the release.
+          # Same scope as the ci.yaml builds of this Dockerfile. Caches written on main
+          # (ci.yaml on push and this release) are shared; a PR's cache stays with that PR.
           cache-from: type=gha,scope=e2e-proxy
           cache-to: type=gha,mode=max,scope=e2e-proxy
