@@ -153,4 +153,4 @@ jobs:
           # Same scope as the ci.yaml builds of this Dockerfile. Caches written on main
           # (ci.yaml on push and this release) are shared; a PR's cache stays with that PR.
           cache-from: type=gha,scope=e2e-proxy
-          cache-to: type=gha,mode=max,scope=e2e-proxy
+          cache-to: type=gha,mode=max,scope=e2e-proxy,ignore-error=true
