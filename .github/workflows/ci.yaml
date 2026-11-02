@@ -269,7 +269,7 @@ jobs:
           tags: ${{ env.PROXY_IMAGE }}
           load: true
           cache-from: type=gha,scope=e2e-proxy
-          cache-to: type=gha,mode=max,scope=e2e-proxy
+          cache-to: type=gha,mode=max,scope=e2e-proxy,ignore-error=true
 
       - name: Start e2e stack
         working-directory: test/e2e-compat
@@ -671,7 +671,7 @@ jobs:
           tags: loki-vl-proxy:test
           load: true
           cache-from: type=gha,scope=e2e-proxy
-          cache-to: type=gha,mode=max,scope=e2e-proxy
+          cache-to: type=gha,mode=max,scope=e2e-proxy,ignore-error=true
 
       - name: Verify binary runs
         run: |
@@ -714,7 +714,7 @@ jobs:
           tags: ${{ env.PROXY_IMAGE }}
           load: true
           cache-from: type=gha,scope=e2e-proxy
-          cache-to: type=gha,mode=max,scope=e2e-proxy
+          cache-to: type=gha,mode=max,scope=e2e-proxy,ignore-error=true
 
       - name: Start e2e stack
         working-directory: test/e2e-compat
@@ -793,7 +793,7 @@ jobs:
           tags: ${{ env.PROXY_IMAGE }}
           load: true
           cache-from: type=gha,scope=fleet-proxy
-          cache-to: type=gha,mode=max,scope=fleet-proxy
+          cache-to: type=gha,mode=max,scope=fleet-proxy,ignore-error=true
 
       - name: Start 3-proxy fleet
         working-directory: test/e2e-fleet
@@ -870,7 +870,7 @@ jobs:
           tags: ${{ env.PROXY_IMAGE }}
           load: true
           cache-from: type=gha,scope=e2e-proxy
-          cache-to: type=gha,mode=max,scope=e2e-proxy
+          cache-to: type=gha,mode=max,scope=e2e-proxy,ignore-error=true
 
       - name: Start e2e stack (with log generator for UI tests)
         working-directory: test/e2e-compat
