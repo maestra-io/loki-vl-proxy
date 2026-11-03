@@ -120,8 +120,8 @@ fault injection, and a canary watching rejected queries, queue wait, backend
 calls, cache misses, memory and query latency. Remaining test priorities are
 strict parsed-field filter interactions, multi-stage formatting order,
 alerting behavior on partial backend failure, and tenant-scoped peer/persisted
-cache restarts under configuration reload. Retain the local image-size patch
-only until a verified upstream fix can replace it; see `website/SECURITY.md`.
+cache restarts under configuration reload. The local image-size patch was retired
+with image-size 2.0.4 (upstream fix); `npm run test:security` keeps the regressions.
 
 Upstream contracts checked: [Loki HTTP API](https://grafana.com/docs/loki/latest/reference/loki-http-api/),
 [Loki template functions](https://grafana.com/docs/loki/latest/query/template_functions/),
