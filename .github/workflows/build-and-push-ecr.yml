@@ -33,7 +33,7 @@ env:
   # <upstream tag without the v>-maestra.<fork revision>. Bump the left half on
   # every rebase onto a new upstream tag, the right half on every fork-only
   # change. Quoted: an unquoted version scalar is a YAML float trap.
-  IMAGE_VERSION: "1.81.0-maestra.4"
+  IMAGE_VERSION: "1.81.0-maestra.5"
 
 jobs:
   build-and-push:
@@ -134,6 +134,7 @@ jobs:
       # BuildKit pushes only the layers ECR is missing; `docker push` from a
       # fresh daemon re-uploaded every layer of every release.
       - name: Build and push
+        id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -154,3 +155,13 @@ jobs:
           # (ci.yaml on push and this release) are shared; a PR's cache stays with that PR.
           cache-from: type=gha,scope=e2e-proxy
           cache-to: type=gha,mode=max,scope=e2e-proxy,ignore-error=true
+
+      # The ECR login step's AWS exports die with it; the tbot JWT file stays.
+      - name: Sign image + attest SBOM
+        uses: maestra-io/github-actions/sign-image@a0e5143b4ba2e0119de2bf32b55ee79e68b71c06 # v1.61.2
+        env:
+          AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/tbot-output/jwt_svid
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        with:
+          image: ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          digest: ${{ steps.push.outputs.digest }}
