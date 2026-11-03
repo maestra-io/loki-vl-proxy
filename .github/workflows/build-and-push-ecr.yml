@@ -125,6 +125,11 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # Right before the build: the Docker secret carries a token minted here.
+      - name: go modules through nora
+        id: nora
+        uses: maestra-io/github-actions/go-nora@be3edebf65de183a5a0c3b02bcc0cd064198cdf5 # v1.62.4
+
       - name: Build metadata
         id: meta
         run: |
@@ -155,6 +160,8 @@ jobs:
           # (ci.yaml on push and this release) are shared; a PR's cache stays with that PR.
           cache-from: type=gha,scope=e2e-proxy
           cache-to: type=gha,mode=max,scope=e2e-proxy,ignore-error=true
+          secrets: |
+            PRIVATE_PACKAGES_TOKEN=${{ steps.nora.outputs.token }}
 
       # The ECR login step's AWS exports die with it; the tbot JWT file stays.
       - name: Sign image + attest SBOM
