@@ -129,7 +129,8 @@ jobs:
       # IMAGE_VERSION is immutable in ECR. A push that changes nothing in the image
       # (website/, docs, this workflow) ends here instead of failing on the existing
       # tag. A push that changes the image without a bump still fails, with that
-      # message. Inputs: everything the two binaries are built from.
+      # message. Inputs: what the two binaries are built from (go build skips *_test.go)
+      # and .dockerignore, which shapes the COPY . . context.
       - name: Check IMAGE_VERSION against ECR
         id: version
         env:
@@ -145,7 +146,7 @@ jobs:
           }
           published=$(tr '\t' '\n' <<< "$tags" | grep -xE '[0-9a-f]{12}' | head -1 || true)
           if [ -n "$published" ] && git rev-parse -q --verify "$published^{commit}" >/dev/null &&
-            git diff --quiet "$published" HEAD -- Dockerfile go.mod go.sum '*.go'; then
+            git diff --quiet "$published" HEAD -- Dockerfile .dockerignore go.mod go.sum '*.go' ':!*_test.go'; then
             echo "::notice::$IMAGE_VERSION is already in ECR from $published and the image inputs are unchanged: nothing to publish"
             echo "publish=false" >> "$GITHUB_OUTPUT"
             exit 0
