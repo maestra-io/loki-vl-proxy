@@ -46,6 +46,9 @@ jobs:
           # No git operations downstream — don't leave a `GITHUB_TOKEN`
           # in `.git/config` for the rest of the job to find.
           persist-credentials: false
+          # History for the check below: it diffs against the commit that
+          # published IMAGE_VERSION.
+          fetch-depth: 0
 
       - name: Get Teleport version
         id: tp-version
@@ -123,14 +126,44 @@ jobs:
           aws ecr set-repository-policy --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} \
             --policy-text file://.github/ecr-policy.json >/dev/null
 
+      # IMAGE_VERSION is immutable in ECR. A push that changes nothing in the image
+      # (website/, docs, this workflow) ends here instead of failing on the existing
+      # tag. A push that changes the image without a bump still fails, with that
+      # message. Inputs: everything the two binaries are built from.
+      - name: Check IMAGE_VERSION against ECR
+        id: version
+        env:
+          AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/tbot-output/jwt_svid
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          tags=$(aws ecr describe-images --repository-name "$IMAGE_NAME" \
+            --image-ids imageTag="$IMAGE_VERSION" --query 'imageDetails[0].imageTags' \
+            --output text 2>/tmp/describe.err) || {
+            grep -q ImageNotFoundException /tmp/describe.err || { cat /tmp/describe.err; exit 1; }
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          published=$(tr '\t' '\n' <<< "$tags" | grep -xE '[0-9a-f]{12}' | head -1 || true)
+          if [ -n "$published" ] && git rev-parse -q --verify "$published^{commit}" >/dev/null &&
+            git diff --quiet "$published" HEAD -- Dockerfile go.mod go.sum '*.go'; then
+            echo "::notice::$IMAGE_VERSION is already in ECR from $published and the image inputs are unchanged: nothing to publish"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::error::$IMAGE_VERSION is already in ECR (from ${published:-an unknown commit}) and the image inputs changed since: bump IMAGE_VERSION"
+          exit 1
+
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.version.outputs.publish == 'true'
 
       # Right before the build: the Docker secret carries a token minted here.
       - name: go modules through nora
+        if: steps.version.outputs.publish == 'true'
         id: nora
         uses: maestra-io/github-actions/go-nora@be3edebf65de183a5a0c3b02bcc0cd064198cdf5 # v1.62.4
 
       - name: Build metadata
+        if: steps.version.outputs.publish == 'true'
         id: meta
         run: |
           echo "sha_tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
@@ -139,6 +172,7 @@ jobs:
       # BuildKit pushes only the layers ECR is missing; `docker push` from a
       # fresh daemon re-uploaded every layer of every release.
       - name: Build and push
+        if: steps.version.outputs.publish == 'true'
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -166,11 +200,13 @@ jobs:
       # Re-mint the tbot JWT (5 min TTL): a cold-cache build can outlive the one
       # from the ECR login step. Best-effort, like the signing itself.
       - name: Refresh workload identity JWT
+        if: steps.version.outputs.publish == 'true'
         continue-on-error: true
         run: tbot start -c /tmp/tbot.yaml
 
       # The ECR login step's AWS exports die with it; the tbot JWT file stays.
       - name: Sign image + attest SBOM
+        if: steps.version.outputs.publish == 'true'
         uses: maestra-io/github-actions/sign-image@bdfea43a7d47149012fa1a488c91e5d6a49b2744 # v1.62.2
         env:
           AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/tbot-output/jwt_svid
