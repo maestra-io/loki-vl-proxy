@@ -1059,10 +1059,21 @@ jobs:
             echo "No system Chrome/Chromium binary found; falling back to Playwright browser download"
           fi
 
+      # npm packages through nora (packages.maestra.io, 3-day hold, issues-maestra#1649): registry and
+      # token in a step-only userconfig; npm maps the lockfile's registry.npmjs.org URLs onto it.
+      - name: nora session token
+        id: nora
+        uses: maestra-io/github-actions/nora-session@b23cf64c53b689f5ae98b08bac884cf1ffc1b3c1 # v1.78.1
+
       - name: Install UI test dependencies
         working-directory: test/e2e-ui
+        env:
+          NORA_TOKEN: ${{ steps.nora.outputs.token }}
         run: |
-          npm ci
+          # npm expands ${NORA_TOKEN} at run time; the token is never written to disk.
+          # shellcheck disable=SC2016
+          printf '%s\n' 'registry=https://packages.maestra.io/npm/' '//packages.maestra.io/npm/:_authToken=${NORA_TOKEN}' > "$RUNNER_TEMP/nora.npmrc"
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/nora.npmrc" npm ci
           if [ -z "${PLAYWRIGHT_EXECUTABLE_PATH:-}" ]; then
             npx playwright install chromium
           fi
