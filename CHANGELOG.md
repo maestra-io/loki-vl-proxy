@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- build: Go 1.27.4 (go.mod, bench/go.mod, CI `go-version`, `golang:1.27.4-alpine3.24`
+  builder) for GO-2026-6859 (net/http, fixed in go1.27.4); `govulncheck` went red on it.
+
 - build: Go 1.27.3 (go.mod, bench/go.mod, CI `go-version`, `golang:1.27.3-alpine3.24`
   builder) for GO-2026-6809 (crypto/x509) and the 1.27.2 net/http, crypto/tls,
   net/textproto fixes GO-2026-6603..6617; `govulncheck` on main was red since 09.10.
