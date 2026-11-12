@@ -295,7 +295,7 @@ Optional overrides:
 - `VL_INSERT_URL` (default `http://127.0.0.1:9428/insert/jsonline?_stream_fields=app,service_name,level,detected_level`; compose VictoriaLogs is on port `19428`)
 - `PLAYWRIGHT_EXECUTABLE_PATH` (optional system Chrome/Chromium binary)
 
-CI prefers the runner's existing Chrome/Chromium binary for these shards and falls back to `npx playwright install chromium` only when no system browser is available. That removes the repeated `apt` dependency install from the common GitHub-hosted path.
+CI uses the runner's existing Chrome/Chromium binary for these shards and fails if there is none: no browser download from cdn.playwright.dev, which bypasses nora (packages.maestra.io, issues-maestra#1649). That also removes the repeated `apt` dependency install.
 
 ### CI Shards
 
