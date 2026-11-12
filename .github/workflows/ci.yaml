@@ -1056,7 +1056,10 @@ jobs:
             echo "PLAYWRIGHT_EXECUTABLE_PATH=$CHROME_BIN" >> "$GITHUB_ENV"
             echo "Using runner browser at $CHROME_BIN"
           else
-            echo "No system Chrome/Chromium binary found; falling back to Playwright browser download"
+            # No browser download from cdn.playwright.dev: it bypasses nora (packages.maestra.io,
+            # issues-maestra#1649). The runner image ships Chrome; a runner without one fails here.
+            echo "::error::No system Chrome/Chromium binary on the runner"
+            exit 1
           fi
 
       # npm packages through nora (packages.maestra.io, 3-day hold, issues-maestra#1649): registry and
@@ -1074,9 +1077,6 @@ jobs:
           # shellcheck disable=SC2016
           printf '%s\n' 'registry=https://packages.maestra.io/npm/' '//packages.maestra.io/npm/:_authToken=${NORA_TOKEN}' > "$RUNNER_TEMP/nora.npmrc"
           NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/nora.npmrc" npm ci
-          if [ -z "${PLAYWRIGHT_EXECUTABLE_PATH:-}" ]; then
-            npx playwright install chromium
-          fi
 
       - name: Run Grafana UI e2e tests
         working-directory: test/e2e-ui

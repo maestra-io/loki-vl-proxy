@@ -146,7 +146,7 @@ The GitHub Actions `e2e-ui` job runs as nine shards:
 
 `@click-interactions`, `@performance`, `@compare`, and the `@drilldown-cache` groups without `@drilldown-core` are not selected by any shard.
 
-Each shard starts the stack with `docker compose --profile ui up -d --no-build`. CI prefers the runner's existing Chrome/Chromium binary and only falls back to `npx playwright install chromium` if no system browser is present. That avoids repeated `apt` dependency downloads on normal GitHub-hosted runners while keeping a safe fallback path.
+Each shard starts the stack with `docker compose --profile ui up -d --no-build`. CI uses the runner's existing Chrome/Chromium binary and fails if there is none: no browser download from cdn.playwright.dev, which bypasses nora (packages.maestra.io, issues-maestra#1649). That also avoids repeated `apt` dependency downloads on GitHub-hosted runners.
 
 The CI jobs also prebuild the proxy image once per job and then start the compose stack with `--no-build`, so the nine browser shards keep their parallelism without redoing the proxy Docker build inside the same job.
 
