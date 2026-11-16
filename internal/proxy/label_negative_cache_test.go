@@ -122,15 +122,13 @@ func TestMultiTenantFanout_EmptyMergeOverwritesOwnerPeerCopy(t *testing.T) {
 
 	ownerCache, ownerDisk := newDiskBackedCache(t)
 	var ownerPeer atomic.Pointer[cache.PeerCache]
-	ownerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ownerHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if pc := ownerPeer.Load(); pc != nil {
 			pc.ServeHTTP(w, r, ownerCache)
 			return
 		}
 		http.NotFound(w, r)
-	}))
-	t.Cleanup(ownerSrv.Close)
-	ownerAddr := strings.TrimPrefix(ownerSrv.URL, "http://")
+	})
 
 	c, _ := newDiskBackedCache(t)
 	p, err := New(Config{
@@ -165,17 +163,25 @@ func TestMultiTenantFanout_EmptyMergeOverwritesOwnerPeerCopy(t *testing.T) {
 			WriteThroughMinTTL: 30 * time.Second,
 		}
 	}
+	// The owner's ring arc depends on its OS-assigned port: for ~0.1% of ports
+	// no requester address leaves the key to the owner, so such a port is
+	// replaced by a new owner server.
 	var requester *cache.PeerCache
-	var members string
-	for i := 0; i < 1024 && requester == nil; i++ {
-		self := fmt.Sprintf("127.0.0.1:%d", 20000+i)
-		members = self + "," + ownerAddr
-		candidate := cache.NewPeerCache(peerConfig(self, members))
-		if candidate.IsOwner(key) {
-			candidate.Close()
-			continue
+	var members, ownerAddr string
+	for attempt := 0; attempt < 8 && requester == nil; attempt++ {
+		ownerSrv := httptest.NewServer(ownerHandler)
+		t.Cleanup(ownerSrv.Close)
+		ownerAddr = strings.TrimPrefix(ownerSrv.URL, "http://")
+		for i := 0; i < 1024 && requester == nil; i++ {
+			self := fmt.Sprintf("127.0.0.1:%d", 20000+i)
+			members = self + "," + ownerAddr
+			candidate := cache.NewPeerCache(peerConfig(self, members))
+			if candidate.IsOwner(key) {
+				candidate.Close()
+				continue
+			}
+			requester = candidate
 		}
-		requester = candidate
 	}
 	if requester == nil {
 		t.Fatal("no ring layout where the owner server owns the key")
