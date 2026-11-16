@@ -1,7 +1,7 @@
 {
   "stack": {
     "loki": {
-      "image_repo": "grafana/loki",
+      "image_repo": "packages.maestra.io/docker-hub/grafana/loki",
       "pinned_version": "3.7.1",
       "support_window": {
         "policy": "current_minor_plus_previous_minor",
@@ -27,7 +27,7 @@
       "role": "reference implementation"
     },
     "victorialogs": {
-      "image_repo": "victoriametrics/victoria-logs",
+      "image_repo": "packages.maestra.io/docker-hub/victoriametrics/victoria-logs",
       "pinned_version": "v1.52.0",
       "support_window": {
         "policy": "v1_3x_to_v1_5x_transition",
@@ -98,7 +98,7 @@
       "role": "backend under translation"
     },
     "grafana": {
-      "image_repo": "grafana/grafana",
+      "image_repo": "packages.maestra.io/docker-hub/grafana/grafana",
       "pinned_version": "13.0.1",
       "role": "runtime hosting the Loki datasource and bundled Drilldown app",
       "support_window": {
