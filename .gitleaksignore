@@ -1,0 +1,5 @@
+# Upstream lines only (identical on the upstream default branch, or written by an upstream
+# commit): upstream test fixtures / docs / vendored code, not our credentials. issues-maestra#1649
+internal/proxy/redact_test.go:generic-api-key:116
+internal/proxy/redact_test.go:generic-api-key:27
+internal/proxy/redact_test.go:jwt:12
